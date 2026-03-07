@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import asyncio
 from datetime import datetime
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,11 +13,15 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+import gspread
+from google.oauth2.service_account import Credentials
 
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-PORT        = int(os.environ.get("PORT", 10000))
-DATA_FILE   = "budget_data.json"
+# ===================== SOZLAMALAR =====================
+BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")
+PORT             = int(os.environ.get("PORT", 10000))
+SPREADSHEET_ID   = os.environ.get("SPREADSHEET_ID", "")
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,28 +36,71 @@ INCOME_CATEGORIES = [
     "🏦 Bank foizi", "🛒 Sotish", "📦 Boshqa daromad"
 ]
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+# ===================== GOOGLE SHEETS =====================
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def get_sheets_client():
+    creds_json = json.loads(GOOGLE_CREDS_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
+    return gspread.authorize(creds)
 
-def get_user_data(user_id):
-    data = load_data()
-    uid = str(user_id)
-    if uid not in data:
-        data[uid] = {"budget": 0, "transactions": [], "name": ""}
-        save_data(data)
-    return data[uid]
+def get_worksheet(user_id: int):
+    client = get_sheets_client()
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    sheet_name = f"user_{user_id}"
+    try:
+        ws = spreadsheet.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
+        ws.append_row(["type", "amount", "category", "note", "date", "budget"])
+    return ws
 
-def update_user_data(user_id, user_data):
-    data = load_data()
-    data[str(user_id)] = user_data
-    save_data(data)
+def load_user_data(user_id: int) -> dict:
+    try:
+        ws = get_worksheet(user_id)
+        rows = ws.get_all_records()
+        transactions = []
+        budget = 0
+        for row in rows:
+            if row.get("type") == "__budget__":
+                budget = float(row.get("amount", 0))
+            elif row.get("type") in ("income", "expense"):
+                transactions.append({
+                    "type": row["type"],
+                    "amount": float(row["amount"]),
+                    "category": row.get("category", ""),
+                    "note": row.get("note", ""),
+                    "date": row.get("date", ""),
+                })
+        return {"budget": budget, "transactions": transactions}
+    except Exception as e:
+        logger.error(f"load_user_data error: {e}")
+        return {"budget": 0, "transactions": []}
+
+def save_transaction(user_id: int, txn: dict):
+    try:
+        ws = get_worksheet(user_id)
+        ws.append_row([
+            txn["type"], txn["amount"], txn["category"],
+            txn.get("note", ""), txn["date"], ""
+        ])
+    except Exception as e:
+        logger.error(f"save_transaction error: {e}")
+
+def save_budget(user_id: int, budget: float):
+    try:
+        ws = get_worksheet(user_id)
+        # Eski budget qatorini yangilash yoki yangi qo'shish
+        rows = ws.get_all_records()
+        for i, row in enumerate(rows, start=2):
+            if row.get("type") == "__budget__":
+                ws.update_cell(i, 2, budget)
+                return
+        ws.append_row(["__budget__", budget, "", "", "", ""])
+    except Exception as e:
+        logger.error(f"save_budget error: {e}")
+
+# ===================== YORDAMCHI FUNKSIYALAR =====================
 
 def get_month_key():
     return datetime.now().strftime("%Y-%m")
@@ -73,6 +121,8 @@ def get_month_stats(transactions):
 
 def format_money(amount):
     return f"{amount:,.0f} so'm"
+
+# ===================== KLAVIATURALAR =====================
 
 def main_keyboard():
     return InlineKeyboardMarkup([
@@ -95,12 +145,12 @@ def category_keyboard(categories, txn_type):
     buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
+# ===================== HANDLERLAR =====================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ud = get_user_data(user.id)
-    ud["name"] = user.first_name
-    update_user_data(user.id, ud)
-    stats = get_month_stats(ud["transactions"])
+    ud = await asyncio.get_event_loop().run_in_executor(None, load_user_data, user.id)
+    stats  = get_month_stats(ud["transactions"])
     budget = ud.get("budget", 0)
     text = (
         f"👋 Xush kelibsiz, <b>{user.first_name}</b>!\n\n"
@@ -133,7 +183,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data    = query.data
     user_id = query.from_user.id
 
     if data == "add_income":
@@ -157,8 +207,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML")
 
     elif data == "stats":
-        ud = get_user_data(user_id)
-        stats = get_month_stats(ud["transactions"])
+        await query.edit_message_text("⏳ Yuklanmoqda...", parse_mode="HTML")
+        ud     = await asyncio.get_event_loop().run_in_executor(None, load_user_data, user_id)
+        stats  = get_month_stats(ud["transactions"])
         budget = ud.get("budget", 0)
         cat_stats = {}
         for t in stats["transactions"]:
@@ -173,7 +224,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if budget > 0:
             used = int(stats['expenses']/budget*100) if budget else 0
-            rem = budget - stats['expenses']
+            rem  = budget - stats['expenses']
             msg += (f"\n🎯 <b>Budget holati:</b>\n"
                     f"  Belgilangan : {format_money(budget)}\n"
                     f"  Sarflangan  : {format_money(stats['expenses'])} ({used}%)\n"
@@ -189,7 +240,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]]))
 
     elif data == "history":
-        ud = get_user_data(user_id)
+        await query.edit_message_text("⏳ Yuklanmoqda...", parse_mode="HTML")
+        ud     = await asyncio.get_event_loop().run_in_executor(None, load_user_data, user_id)
         recent = get_month_stats(ud["transactions"])["transactions"][-10:][::-1]
         if not recent:
             msg = "📋 <b>Bu oyda tranzaksiyalar yo'q.</b>"
@@ -197,9 +249,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"📋 <b>Oxirgi {len(recent)} ta tranzaksiya:</b>\n\n"
             for t in recent:
                 emoji = "📥" if t["type"] == "income" else "📤"
-                date = t["date"][8:10] + "." + t["date"][5:7]
-                note = f" — {t['note']}" if t.get("note") else ""
-                msg += f"{emoji} <b>{format_money(t['amount'])}</b>\n  📁 {t.get('category','Boshqa')} | 📅 {date}{note}\n\n"
+                date  = t["date"][8:10] + "." + t["date"][5:7]
+                note  = f" — {t['note']}" if t.get("note") else ""
+                msg  += f"{emoji} <b>{format_money(t['amount'])}</b>\n  📁 {t.get('category','Boshqa')} | 📅 {date}{note}\n\n"
         await query.edit_message_text(msg, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]]))
 
@@ -218,17 +270,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("❌ Yo'q", callback_data="back_main")]]))
 
     elif data == "confirm_clear":
-        ud = get_user_data(user_id)
+        await query.edit_message_text("⏳ O'chirilmoqda...", parse_mode="HTML")
+        ud    = await asyncio.get_event_loop().run_in_executor(None, load_user_data, user_id)
         month = get_month_key()
-        ud["transactions"] = [t for t in ud["transactions"] if not t.get("date","").startswith(month)]
-        update_user_data(user_id, ud)
+        # Sheets dan bu oyning qatorlarini o'chirish
+        try:
+            ws   = await asyncio.get_event_loop().run_in_executor(None, get_worksheet, user_id)
+            rows = await asyncio.get_event_loop().run_in_executor(None, ws.get_all_records)
+            to_delete = []
+            for i, row in enumerate(rows, start=2):
+                if row.get("type") in ("income","expense") and row.get("date","").startswith(month):
+                    to_delete.append(i)
+            for i in reversed(to_delete):
+                ws.delete_rows(i)
+        except Exception as e:
+            logger.error(f"clear_month error: {e}")
         await query.edit_message_text("🗑️ Bu oyning ma'lumotlari o'chirildi.\n\n/start")
 
     elif data == "skip_note":
         await _save_transaction(query.from_user.id, context, note="", via_query=query)
 
     elif data == "back_main":
-        ud = get_user_data(user_id)
+        ud    = await asyncio.get_event_loop().run_in_executor(None, load_user_data, user_id)
         stats = get_month_stats(ud["transactions"])
         await query.edit_message_text(
             f"🏠 <b>Bosh menyu</b>\n\n"
@@ -240,7 +303,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.strip()
+    text    = update.message.text.strip()
 
     if context.user_data.get("awaiting_amount"):
         try:
@@ -262,9 +325,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             budget = float(text.replace(" ","").replace(",",""))
             if budget <= 0: raise ValueError
-            ud = get_user_data(user_id)
-            ud["budget"] = budget
-            update_user_data(user_id, ud)
+            await asyncio.get_event_loop().run_in_executor(None, save_budget, user_id, budget)
             context.user_data.pop("awaiting_budget", None)
             await update.message.reply_text(
                 f"✅ <b>Oylik budget belgilandi!</b>\n\n🎯 Budget: <b>{format_money(budget)}</b>\n\n/start",
@@ -282,12 +343,13 @@ async def _save_transaction(user_id, context, note="", reply_fn=None, via_query=
         context.user_data.pop(k, None)
     if not amount:
         return
-    ud = get_user_data(user_id)
-    ud["transactions"].append({
+
+    txn = {
         "type": txn_type, "amount": amount, "category": category,
         "note": note, "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-    })
-    update_user_data(user_id, ud)
+    }
+    await asyncio.get_event_loop().run_in_executor(None, save_transaction, user_id, txn)
+    ud     = await asyncio.get_event_loop().run_in_executor(None, load_user_data, user_id)
     stats  = get_month_stats(ud["transactions"])
     budget = ud.get("budget", 0)
     emoji  = "📥" if txn_type == "income" else "📤"
@@ -311,6 +373,8 @@ async def _save_transaction(user_id, context, note="", reply_fn=None, via_query=
     elif reply_fn:
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
 
+# ===================== WEBHOOK SERVER =====================
+
 async def health(request):
     return web.Response(text="OK", status=200)
 
@@ -332,7 +396,7 @@ async def main():
 
     webhook_path = f"/webhook/{BOT_TOKEN}"
     await application.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
-    logger.info(f"✅ Webhook set: {WEBHOOK_URL}{webhook_path}")
+    logger.info(f"✅ Webhook: {WEBHOOK_URL}{webhook_path}")
 
     web_app = web.Application()
     web_app.router.add_get("/",           health)
@@ -345,9 +409,7 @@ async def main():
     await site.start()
     logger.info(f"🚀 Server started on port {PORT}")
 
-    import asyncio
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
