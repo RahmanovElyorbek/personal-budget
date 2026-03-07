@@ -74,7 +74,7 @@ def load_user_data(user_id: int) -> dict:
                 })
         return {"budget": budget, "transactions": transactions}
     except Exception as e:
-        logger.error(f"load_user_data error: {e}")
+        logger.error(f"load_user_data error: {e}", exc_info=True)
         return {"budget": 0, "transactions": []}
 
 def save_transaction(user_id: int, txn: dict):
@@ -85,7 +85,7 @@ def save_transaction(user_id: int, txn: dict):
             txn.get("note", ""), txn["date"], ""
         ])
     except Exception as e:
-        logger.error(f"save_transaction error: {e}")
+        logger.error(f"save_transaction error: {e}", exc_info=True)
 
 def save_budget(user_id: int, budget: float):
     try:
