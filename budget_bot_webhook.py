@@ -12,13 +12,12 @@ import asyncio
 import asyncpg
 from datetime import datetime, timedelta
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    PreCheckoutQueryHandler,
     filters,
     ContextTypes,
 )
@@ -28,11 +27,12 @@ BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "")
 PORT         = int(os.environ.get("PORT", 8080))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ADMIN_ID     = int(os.environ.get("ADMIN_ID", "8008645253"))
 
-# Telegram Stars narxlari
-PRICE_MONTHLY   = 250   # Stars
-PRICE_QUARTERLY = 600   # Stars
-PRICE_YEARLY    = 2000  # Stars
+# Narxlar (so'm)
+PRICE_MONTHLY   = 25000
+PRICE_QUARTERLY = 60000
+PRICE_YEARLY    = 199000
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -228,6 +228,36 @@ async def show_payment_screen(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.callback_query.edit_message_text(
             text, parse_mode="HTML", reply_markup=payment_keyboard())
 
+async def notify_admin_payment(context: ContextTypes.DEFAULT_TYPE,
+                               user_id: int, user_name: str, plan: str, price: int):
+    """Adminga bildirishnoma yuborish."""
+    days_map = {"Oylik": 30, "3 Oylik": 90, "Yillik": 365}
+    days = days_map.get(plan, 30)
+    text = (
+        f"💳 <b>Yangi to'lov so'rovi!</b>\n\n"
+        f"👤 Foydalanuvchi: <b>{user_name}</b>\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"📅 Tarif: <b>{plan}</b>\n"
+        f"💰 Summa: <b>{price:,} so'm</b>\n\n"
+        f"To'lovni qabul qiling va tasdiqlang:"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "✅ Tasdiqlash",
+            callback_data=f"adm_confirm_{user_id}_{days}"
+        )],
+        [InlineKeyboardButton(
+            "❌ Bekor qilish",
+            callback_data=f"adm_reject_{user_id}"
+        )],
+    ])
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+
 # ===================== HANDLERLAR =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -291,36 +321,79 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     # To'lov tugmalari — premium tekshiruvsiz
-    if data == "pay_monthly":
-        await context.bot.send_invoice(
-            chat_id=user_id,
-            title="💰 Oylik Premium",
-            description="Budget Bot — 30 kunlik to'liq kirish",
-            payload="premium_monthly",
-            currency="XTR",
-            prices=[LabeledPrice("Oylik", PRICE_MONTHLY)],
+    if data in ("pay_monthly", "pay_quarterly", "pay_yearly"):
+        plans = {
+            "pay_monthly":   ("Oylik",   PRICE_MONTHLY,   30),
+            "pay_quarterly": ("3 Oylik", PRICE_QUARTERLY, 90),
+            "pay_yearly":    ("Yillik",  PRICE_YEARLY,    365),
+        }
+        plan_name, price, days = plans[data]
+        user_name = query.from_user.full_name
+
+        # Foydalanuvchiga ko'rsatma
+        await query.edit_message_text(
+            f"💳 <b>{plan_name} — {price:,} so'm</b>\n\n"
+            f"Quyidagi rekvizitga to'lov qiling:\n\n"
+            f"🏦 <b>Karta:</b> <code>9860 1604 3098 1169</code>\n"
+            f"👤 <b>Egasi:</b> Rahmanov Elyorbek\n\n"
+            f"To'lov qilgach pastdagi tugmani bosing 👇",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ To'lov qildim",
+                    callback_data=f"paid_{data}"
+                )
+            ]])
         )
         return
 
-    elif data == "pay_quarterly":
-        await context.bot.send_invoice(
-            chat_id=user_id,
-            title="💰 3 Oylik Premium",
-            description="Budget Bot — 90 kunlik to'liq kirish",
-            payload="premium_quarterly",
-            currency="XTR",
-            prices=[LabeledPrice("3 Oylik", PRICE_QUARTERLY)],
+    elif data.startswith("paid_"):
+        plans = {
+            "paid_pay_monthly":   ("Oylik",   PRICE_MONTHLY),
+            "paid_pay_quarterly": ("3 Oylik", PRICE_QUARTERLY),
+            "paid_pay_yearly":    ("Yillik",  PRICE_YEARLY),
+        }
+        plan_name, price = plans.get(data, ("Oylik", PRICE_MONTHLY))
+        user_name = query.from_user.full_name
+
+        # Adminga bildirishnoma
+        await notify_admin_payment(context, user_id, user_name, plan_name, price)
+
+        # Foydalanuvchiga javob
+        await query.edit_message_text(
+            "⏳ <b>So'rovingiz yuborildi!</b>\n\n"
+            "Admin to'lovni tekshirib, tez orada faollashtiradi.\n"
+            "Odatda <b>5-15 daqiqa</b> ichida.",
+            parse_mode="HTML"
         )
         return
 
-    elif data == "pay_yearly":
-        await context.bot.send_invoice(
-            chat_id=user_id,
-            title="💰 Yillik Premium",
-            description="Budget Bot — 365 kunlik to'liq kirish",
-            payload="premium_yearly",
-            currency="XTR",
-            prices=[LabeledPrice("Yillik", PRICE_YEARLY)],
+    # Admin tasdiqlash/bekor qilish
+    elif data.startswith("adm_confirm_"):
+        parts = data.split("_")
+        target_id = int(parts[2])
+        days      = int(parts[3])
+        await activate_premium(target_id, days)
+        await query.edit_message_text(
+            f"✅ Premium faollashtirildi!\n🆔 {target_id} | 📅 {days} kun",
+            parse_mode="HTML"
+        )
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="🎉 <b>Premium faollashtirildi!</b>\n\n"
+                 "Endi botdan to'liq foydalanishingiz mumkin.\n/start",
+            parse_mode="HTML"
+        )
+        return
+
+    elif data.startswith("adm_reject_"):
+        target_id = int(data.split("_")[2])
+        await query.edit_message_text(f"❌ Bekor qilindi. 🆔 {target_id}")
+        await context.bot.send_message(
+            chat_id=target_id,
+            text="❌ <b>To'lov tasdiqlanmadi.</b>\n\n"
+                 "Muammo bo'lsa admin bilan bog'laning.",
+            parse_mode="HTML"
         )
         return
 
@@ -545,31 +618,6 @@ async def _save_transaction(user_id, context, note="",
     elif reply_fn:
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
 
-# ===================== TO'LOV HANDLERLARI =====================
-
-async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
-
-async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    payload = update.message.successful_payment.invoice_payload
-
-    if payload == "premium_monthly":
-        days, plan = 30, "Oylik"
-    elif payload == "premium_quarterly":
-        days, plan = 90, "3 Oylik"
-    else:
-        days, plan = 365, "Yillik"
-
-    await activate_premium(user_id, days)
-    await update.message.reply_text(
-        f"🎉 <b>To'lov qabul qilindi!</b>\n\n"
-        f"✅ {plan} premium faollashtirildi!\n"
-        f"📅 {days} kun davomida to'liq foydalanishingiz mumkin.\n\n"
-        f"/start — Bosh menyuga o'tish",
-        parse_mode="HTML"
-    )
-
 # ===================== WEBHOOK SERVER =====================
 
 async def health(request):
@@ -588,8 +636,6 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     await app.initialize()
