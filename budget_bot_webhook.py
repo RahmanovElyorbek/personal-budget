@@ -3,7 +3,7 @@
 =======================================================
 - Supabase PostgreSQL database
 - 7 kunlik bepul sinov
-- Telegram Stars orqali to'lov
+- To'lov tizimi
 """
 
 import logging
@@ -29,7 +29,6 @@ PORT         = int(os.environ.get("PORT", 8080))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "8008645253"))
 
-# Narxlar (so'm)
 PRICE_MONTHLY   = 25000
 PRICE_QUARTERLY = 60000
 PRICE_YEARLY    = 199000
@@ -50,6 +49,12 @@ INCOME_CATEGORIES = [
     "💼 Maosh", "💻 Freelance", "📈 Investitsiya", "🎁 Sovg'a",
     "🏦 Bank foizi", "🛒 Sotish", "📦 Boshqa daromad"
 ]
+
+MONTH_NAMES = {
+    1: "Yanvar", 2: "Fevral", 3: "Mart", 4: "Aprel",
+    5: "May", 6: "Iyun", 7: "Iyul", 8: "Avgust",
+    9: "Sentabr", 10: "Oktabr", 11: "Noyabr", 12: "Dekabr"
+}
 
 # ===================== DATABASE =====================
 db_pool = None
@@ -82,7 +87,6 @@ async def init_db():
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
-    """Foydalanuvchi bazada yo'q bo'lsa — yangi."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT telegram_id FROM users WHERE telegram_id = $1", telegram_id
@@ -114,8 +118,7 @@ async def is_user_premium(telegram_id: int) -> bool:
 async def get_trial_days_left(telegram_id: int) -> int:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT registered_at FROM users WHERE telegram_id = $1",
-            telegram_id
+            "SELECT registered_at FROM users WHERE telegram_id = $1", telegram_id
         )
         if not row:
             return 0
@@ -162,6 +165,31 @@ async def get_month_transactions(telegram_id: int) -> list:
             WHERE telegram_id = $1
               AND DATE_TRUNC('month', date) = DATE_TRUNC('month', NOW())
             ORDER BY date DESC
+        """, telegram_id)
+        return [dict(r) for r in rows]
+
+async def get_transactions_by_month(telegram_id: int, year: int, month: int) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT type, amount, category, note, date
+            FROM transactions
+            WHERE telegram_id = $1
+              AND EXTRACT(YEAR FROM date) = $2
+              AND EXTRACT(MONTH FROM date) = $3
+            ORDER BY date DESC
+        """, telegram_id, year, month)
+        return [dict(r) for r in rows]
+
+async def get_available_months(telegram_id: int) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT
+                EXTRACT(YEAR FROM date)::int AS year,
+                EXTRACT(MONTH FROM date)::int AS month
+            FROM transactions
+            WHERE telegram_id = $1
+              AND date >= NOW() - INTERVAL '6 months'
+            ORDER BY year DESC, month DESC
         """, telegram_id)
         return [dict(r) for r in rows]
 
@@ -218,6 +246,19 @@ def payment_keyboard():
         [InlineKeyboardButton("🗓 Yillik — 199,000 so'm", callback_data="pay_yearly")],
     ])
 
+def history_months_keyboard(months: list):
+    buttons, row = [], []
+    for m in months:
+        label = f"{MONTH_NAMES[m['month']]} {m['year']}"
+        cb    = f"history_{m['year']}_{m['month']}"
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
 # ===================== TO'LOV EKRANI =====================
 
 async def show_payment_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,7 +279,6 @@ async def show_payment_screen(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def notify_admin_payment(context: ContextTypes.DEFAULT_TYPE,
                                user_id: int, user_name: str, plan: str, price: int):
-    """Adminga bildirishnoma yuborish."""
     days_map = {"Oylik": 30, "3 Oylik": 90, "Yillik": 365}
     days = days_map.get(plan, 30)
     text = (
@@ -250,20 +290,11 @@ async def notify_admin_payment(context: ContextTypes.DEFAULT_TYPE,
         f"To'lovni qabul qiling va tasdiqlang:"
     )
     markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "✅ Tasdiqlash",
-            callback_data=f"adm_confirm_{user_id}_{days}"
-        )],
-        [InlineKeyboardButton(
-            "❌ Bekor qilish",
-            callback_data=f"adm_reject_{user_id}"
-        )],
+        [InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"adm_confirm_{user_id}_{days}")],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"adm_reject_{user_id}")],
     ])
     await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=text,
-        parse_mode="HTML",
-        reply_markup=markup
+        chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=markup
     )
 
 # ===================== HANDLERLAR =====================
@@ -273,7 +304,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_new = await is_new_user(user.id)
     await ensure_user(user.id, user.first_name)
 
-    # Yangi foydalanuvchi — xush kelibsiz ekrani
     if is_new:
         welcome_text = (
             f"👋 Salom, <b>{user.first_name}</b>! Xush kelibsiz!\n\n"
@@ -352,7 +382,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     user_id = query.from_user.id
 
-    # To'lov tugmalari — premium tekshiruvsiz
+    # To'lov tugmalari
     if data in ("pay_monthly", "pay_quarterly", "pay_yearly"):
         plans = {
             "pay_monthly":   ("Oylik",   PRICE_MONTHLY,   30),
@@ -360,21 +390,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "pay_yearly":    ("Yillik",  PRICE_YEARLY,    365),
         }
         plan_name, price, days = plans[data]
-        user_name = query.from_user.full_name
-
-        # Foydalanuvchiga ko'rsatma
         await query.edit_message_text(
             f"💳 <b>{plan_name} — {price:,} so'm</b>\n\n"
             f"Quyidagi rekvizitga to'lov qiling:\n\n"
-            f"🏦 <b>Karta:</b> <code>8600 1234 5678 9012</code>\n"
+            f"🏦 <b>Karta:</b> <code>9860 1604 3098 1169</code>\n"
             f"👤 <b>Egasi:</b> Rahmanov Elyorbek\n\n"
             f"To'lov qilgach pastdagi tugmani bosing 👇",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "✅ To'lov qildim",
-                    callback_data=f"paid_{data}"
-                )
+                InlineKeyboardButton("✅ To'lov qildim", callback_data=f"paid_{data}")
             ]])
         )
         return
@@ -387,11 +411,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         plan_name, price = plans.get(data, ("Oylik", PRICE_MONTHLY))
         user_name = query.from_user.full_name
-
-        # Adminga bildirishnoma
         await notify_admin_payment(context, user_id, user_name, plan_name, price)
-
-        # Foydalanuvchiga javob
         await query.edit_message_text(
             "⏳ <b>So'rovingiz yuborildi!</b>\n\n"
             "Admin to'lovni tekshirib, tez orada faollashtiradi.\n"
@@ -400,7 +420,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Admin tasdiqlash/bekor qilish
+    # Admin tugmalari
     elif data.startswith("adm_confirm_"):
         parts = data.split("_")
         target_id = int(parts[2])
@@ -429,7 +449,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Boshqa tugmalar uchun premium tekshiruv
+    # Premium tekshiruv
     premium = await is_user_premium(user_id)
     if not premium:
         await show_payment_screen(update, context)
@@ -502,21 +522,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]]))
 
     elif data == "history":
-        txns   = await get_month_transactions(user_id)
-        recent = txns[:10]
-        if not recent:
-            msg = "📋 <b>Bu oyda tranzaksiyalar yo'q.</b>"
+        months = await get_available_months(user_id)
+        if not months:
+            await query.edit_message_text(
+                "📋 <b>Hali tranzaksiyalar yo'q.</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]]))
+            return
+        await query.edit_message_text(
+            "📋 <b>Qaysi oyni ko'rmoqchisiz?</b>",
+            parse_mode="HTML",
+            reply_markup=history_months_keyboard(months))
+
+    elif data.startswith("history_"):
+        _, year, month = data.split("_")
+        year, month = int(year), int(month)
+        txns = await get_transactions_by_month(user_id, year, month)
+        if not txns:
+            msg = f"📋 <b>{MONTH_NAMES[month]} {year} — tranzaksiyalar yo'q.</b>"
         else:
-            msg = f"📋 <b>Oxirgi {len(recent)} ta tranzaksiya:</b>\n\n"
-            for t in recent:
+            income   = sum(float(t['amount']) for t in txns if t['type'] == 'income')
+            expenses = sum(float(t['amount']) for t in txns if t['type'] == 'expense')
+            msg = (
+                f"📋 <b>{MONTH_NAMES[month]} {year}</b>\n"
+                f"📥 Daromad: <b>{format_money(income)}</b>\n"
+                f"📤 Xarajat: <b>{format_money(expenses)}</b>\n"
+                f"💵 Balans: <b>{format_money(income - expenses)}</b>\n\n"
+            )
+            for t in txns:
                 emoji = "📥" if t["type"] == "income" else "📤"
                 date  = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
                 note  = f" — {t['note']}" if t.get("note") else ""
-                msg  += f"{emoji} <b>{format_money(float(t['amount']))}</b>\n  📁 {t.get('category','Boshqa')} | 📅 {date}{note}\n\n"
+                msg  += f"{emoji} <b>{format_money(float(t['amount']))}</b> | 📁 {t.get('category','Boshqa')} | 📅 {date}{note}\n"
 
-        await query.edit_message_text(msg, parse_mode="HTML",
+        await query.edit_message_text(
+            msg, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]]))
+                InlineKeyboardButton("🔙 Oylar", callback_data="history"),
+                InlineKeyboardButton("🏠 Menyu", callback_data="back_main")]]))
 
     elif data == "set_budget":
         context.user_data["awaiting_budget"] = True
@@ -554,7 +598,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text    = update.message.text.strip()
 
-    # Agar biror narsa kutilmayotgan bo'lsa — premium tekshiruv
     if not any([
         context.user_data.get("awaiting_amount"),
         context.user_data.get("awaiting_note"),
