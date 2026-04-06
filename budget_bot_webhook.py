@@ -81,6 +81,14 @@ async def init_db():
         """)
     logger.info("✅ Database tayyor!")
 
+async def is_new_user(telegram_id: int) -> bool:
+    """Foydalanuvchi bazada yo'q bo'lsa — yangi."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT telegram_id FROM users WHERE telegram_id = $1", telegram_id
+        )
+        return row is None
+
 async def ensure_user(telegram_id: int, name: str = ""):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -262,7 +270,31 @@ async def notify_admin_payment(context: ContextTypes.DEFAULT_TYPE,
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    is_new = await is_new_user(user.id)
     await ensure_user(user.id, user.first_name)
+
+    # Yangi foydalanuvchi — xush kelibsiz ekrani
+    if is_new:
+        welcome_text = (
+            f"👋 Salom, <b>{user.first_name}</b>! Xush kelibsiz!\n\n"
+            f"💰 <b>Oson Byudjet</b> — shaxsiy moliya yordamchingiz!\n\n"
+            f"Bu bot bilan:\n"
+            f"✅ Daromad va xarajatlarni yozing\n"
+            f"✅ Oylik statistikani ko'ring\n"
+            f"✅ Byudjet belgilang va nazorat qiling\n"
+            f"✅ Moliyangizni tartibga soling\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎁 <b>7 kun to'liq BEPUL!</b>\n"
+            f"Hech qanday to'lovsiz barcha imkoniyatlardan foydalaning!\n\n"
+            f"👇 Boshlash uchun quyidagi tugmani bosing!"
+        )
+        await update.message.reply_text(
+            welcome_text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚀 Boshlash!", callback_data="back_main")
+            ]])
+        )
+        return
 
     premium = await is_user_premium(user.id)
     if not premium:
@@ -334,7 +366,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"💳 <b>{plan_name} — {price:,} so'm</b>\n\n"
             f"Quyidagi rekvizitga to'lov qiling:\n\n"
-            f"🏦 <b>Karta:</b> <code>9860 1604 3098 1169</code>\n"
+            f"🏦 <b>Karta:</b> <code>8600 1234 5678 9012</code>\n"
             f"👤 <b>Egasi:</b> Rahmanov Elyorbek\n\n"
             f"To'lov qilgach pastdagi tugmani bosing 👇",
             parse_mode="HTML",
