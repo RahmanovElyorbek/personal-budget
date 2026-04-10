@@ -80,7 +80,7 @@ async def transcribe_voice(file_path: str) -> str:
                     "https://api.openai.com/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                     files={"file": ("voice.ogg", f, "audio/ogg")},
-                    data={"model": "whisper-1", "language": "uz"}
+                    data={"model": "whisper-1"}
                 )
             if response.status_code == 200:
                 return response.json().get("text", "")
