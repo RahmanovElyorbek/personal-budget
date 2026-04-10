@@ -80,7 +80,7 @@ async def transcribe_voice(file_path: str) -> str:
                     "https://api.openai.com/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                     files={"file": ("voice.ogg", f, "audio/ogg")},
-                    data={"model": "whisper-1"}
+                    data={"model": "whisper-1", "language": "uz"}
                 )
             if response.status_code == 200:
                 return response.json().get("text", "")
@@ -93,17 +93,54 @@ async def transcribe_voice(file_path: str) -> str:
 
 async def parse_voice_transaction(text: str) -> dict:
     """Matndan tranzaksiya ma'lumotlarini ajratish."""
+    import re
     text_lower = text.lower()
 
-    # Miqdorni topish
-    import re
+    # So'z bilan yozilgan raqamlarni aniqlash (o'zbek/turk/rus)
+    word_numbers = {
+        "bir": 1, "ikki": 2, "uch": 3, "to'rt": 4, "besh": 5,
+        "olti": 6, "yetti": 7, "sakkiz": 8, "to'qqiz": 9, "o'n": 10,
+        "yigirma": 20, "o'ttiz": 30, "qirq": 40, "ellik": 50,
+        "oltmish": 60, "yetmish": 70, "sakson": 80, "to'qson": 90,
+        "yuz": 100, "ming": 1000, "million": 1000000,
+        # Turk tili
+        "iki": 2, "üç": 3, "dört": 4, "beş": 5, "altı": 6,
+        "yedi": 7, "sekiz": 8, "dokuz": 9, "on": 10, "bin": 1000,
+        "milyon": 1000000, "milisom": 1000000,
+        # Rus tili
+        "одна": 1, "два": 2, "три": 3, "пять": 5, "десять": 10,
+        "тысяча": 1000, "миллион": 1000000,
+    }
+
+    # Avval raqamlarni topish
     numbers = re.findall(r'\d+(?:[.,]\d+)?', text.replace(" ", ""))
     amount = 0
     for n in numbers:
-        val = float(n.replace(",", "."))
-        if val > 100:
+        val = float(n.replace(",", ".").replace(".", ""))
+        if val >= 100:
             amount = val
             break
+        elif val > 0 and amount == 0:
+            amount = val
+
+    # Agar raqam topilmasa — so'zlardan topish
+    if amount == 0:
+        words = text_lower.split()
+        for i, word in enumerate(words):
+            clean_word = word.strip(".,!?")
+            if clean_word in word_numbers:
+                base = word_numbers[clean_word]
+                # Keyingi so'z multiplier bo'lishi mumkin
+                if i + 1 < len(words):
+                    next_word = words[i+1].strip(".,!?")
+                    if next_word in ("ming", "bin", "тысяча"):
+                        amount = base * 1000
+                        break
+                    elif next_word in ("million", "milyon", "миллион", "milisom"):
+                        amount = base * 1000000
+                        break
+                if amount == 0:
+                    amount = base
 
     # Tranzaksiya turini aniqlash
     income_words = ["maosh", "daromad", "oldim", "tushdi", "kirdi", "topdi", "solib", "berildi"]
