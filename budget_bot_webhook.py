@@ -6,12 +6,15 @@
 - To'lov tizimi
 - Qarzlar ro'yxati
 - Balanslar nazorati
+- Ovoz orqali kiritish (OpenAI Whisper)
 """
 
 import logging
 import os
 import asyncio
 import asyncpg
+import tempfile
+import httpx
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,11 +28,12 @@ from telegram.ext import (
 )
 
 # ===================== SOZLAMALAR =====================
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_URL  = os.environ.get("WEBHOOK_URL", "")
-PORT         = int(os.environ.get("PORT", 8080))
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-ADMIN_ID     = int(os.environ.get("ADMIN_ID", "8008645253"))
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_URL    = os.environ.get("WEBHOOK_URL", "")
+PORT           = int(os.environ.get("PORT", 8080))
+DATABASE_URL   = os.environ.get("DATABASE_URL", "")
+ADMIN_ID       = int(os.environ.get("ADMIN_ID", "8008645253"))
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 PRICE_MONTHLY   = 25000
 PRICE_QUARTERLY = 60000
@@ -64,6 +68,77 @@ MONTH_NAMES = {
     5: "May", 6: "Iyun", 7: "Iyul", 8: "Avgust",
     9: "Sentabr", 10: "Oktabr", 11: "Noyabr", 12: "Dekabr"
 }
+
+# ===================== OVOZ TANISH =====================
+
+async def transcribe_voice(file_path: str) -> str:
+    """OpenAI Whisper orqali ovozni matnga o'girish."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            with open(file_path, "rb") as f:
+                response = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    files={"file": ("voice.ogg", f, "audio/ogg")},
+                    data={"model": "whisper-1", "language": "uz"}
+                )
+            if response.status_code == 200:
+                return response.json().get("text", "")
+            else:
+                logger.error(f"Whisper error: {response.text}")
+                return ""
+    except Exception as e:
+        logger.error(f"Transcribe error: {e}")
+        return ""
+
+async def parse_voice_transaction(text: str) -> dict:
+    """Matndan tranzaksiya ma'lumotlarini ajratish."""
+    text_lower = text.lower()
+
+    # Miqdorni topish
+    import re
+    numbers = re.findall(r'\d+(?:[.,]\d+)?', text.replace(" ", ""))
+    amount = 0
+    for n in numbers:
+        val = float(n.replace(",", "."))
+        if val > 100:
+            amount = val
+            break
+
+    # Tranzaksiya turini aniqlash
+    income_words = ["maosh", "daromad", "oldim", "tushdi", "kirdi", "topdi", "solib", "berildi"]
+    expense_words = ["xarajat", "sarf", "berdim", "to'ladim", "harajat", "sotib", "oldim narx", "ketdi"]
+
+    txn_type = "expense"
+    for w in income_words:
+        if w in text_lower:
+            txn_type = "income"
+            break
+
+    # Kategoriyani aniqlash
+    category_map = {
+        "oziq": "🍔 Oziq-ovqat", "ovqat": "🍔 Oziq-ovqat", "non": "🍔 Oziq-ovqat",
+        "go'sht": "🍔 Oziq-ovqat", "sabzavot": "🍔 Oziq-ovqat", "bozor": "🍔 Oziq-ovqat",
+        "transport": "🚌 Transport", "taksi": "🚌 Transport", "avtobus": "🚌 Transport",
+        "benzin": "🚌 Transport", "mashina": "🚌 Transport",
+        "uy": "🏠 Uy-joy", "ijara": "🏠 Uy-joy", "kvartira": "🏠 Uy-joy",
+        "dori": "💊 Salomatlik", "shifokor": "💊 Salomatlik", "dorixona": "💊 Salomatlik",
+        "kiyim": "👗 Kiyim-kechak", "oyoq": "👗 Kiyim-kechak",
+        "telefon": "📱 Aloqa", "internet": "📱 Aloqa",
+        "kommunal": "💡 Kommunal", "gaz": "💡 Kommunal", "elektr": "💡 Kommunal",
+        "maosh": "💼 Maosh", "oylik": "💼 Maosh",
+        "freelance": "💻 Freelance",
+    }
+
+    category = "📦 Boshqa"
+    if txn_type == "income":
+        category = "📦 Boshqa daromad"
+    for key, cat in category_map.items():
+        if key in text_lower:
+            category = cat
+            break
+
+    return {"type": txn_type, "amount": amount, "category": category, "text": text}
 
 # ===================== DATABASE =====================
 db_pool = None
@@ -233,8 +308,6 @@ async def clear_month_transactions(telegram_id: int):
               AND DATE_TRUNC('month', date) = DATE_TRUNC('month', NOW())
         """, telegram_id)
 
-# ===================== QARZ FUNKSIYALARI =====================
-
 async def add_debt(telegram_id: int, person_name: str, amount: float,
                    direction: str, due_date=None, note: str = ""):
     async with db_pool.acquire() as conn:
@@ -269,8 +342,6 @@ async def check_due_debts(telegram_id: int) -> list:
               AND due_date = CURRENT_DATE
         """, telegram_id)
         return [dict(r) for r in rows]
-
-# ===================== BALANS FUNKSIYALARI =====================
 
 async def get_balances(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
@@ -375,6 +446,14 @@ def balance_type_keyboard():
         [InlineKeyboardButton("🔙 Orqaga", callback_data="balances")],
     ])
 
+def voice_confirm_keyboard(txn_type: str, amount: float, category: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ To'g'ri, saqlash", callback_data="voice_confirm")],
+        [InlineKeyboardButton("📥 Daromad qilib saqlash", callback_data="voice_save_income"),
+         InlineKeyboardButton("📤 Xarajat qilib saqlash", callback_data="voice_save_expense")],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="back_main")],
+    ])
+
 # ===================== TO'LOV EKRANI =====================
 
 async def show_payment_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -435,6 +514,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 <b>Oson Byudjet</b> — shaxsiy moliya yordamchingiz!\n\n"
             f"Bu bot bilan:\n"
             f"✅ Daromad va xarajatlarni yozing\n"
+            f"✅ Ovoz orqali kiritish 🎤\n"
             f"✅ Oylik statistikani ko'ring\n"
             f"✅ Byudjet belgilang va nazorat qiling\n"
             f"✅ Qarzlarni kuzating\n"
@@ -479,7 +559,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if bals:
         total = sum(float(b["amount"]) for b in bals)
-        text += f"\n💳 Jami balans: <b>{format_money(total)}</b>\n"
+        text += f"💳 Jami balans: <b>{format_money(total)}</b>\n"
     if budget > 0:
         pct = min(int(stats["expenses"] / budget * 10), 10)
         bar = "🟥" * pct + "⬜" * (10 - pct)
@@ -490,15 +570,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 {bar} {int(stats['expenses']/budget*100)}%\n"
             f"✅ Qolgan : <b>{format_money(max(remaining, 0))}</b>\n"
         )
-    text += "\n👇 Quyidagi tugmalardan birini tanlang:"
+    text += "\n🎤 Ovoz yuboring yoki tugma bosing:"
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_keyboard())
+
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    premium = await is_user_premium(user_id)
+    if not premium:
+        await show_payment_screen(update, context)
+        return
+
+    msg = await update.message.reply_text("🎤 Ovoz tanilmoqda...")
+
+    voice = update.message.voice
+    file  = await context.bot.get_file(voice.file_id)
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        text = await transcribe_voice(tmp.name)
+
+    if not text:
+        await msg.edit_text("❌ Ovozni tanib bo'lmadi. Qaytadan urinib ko'ring.")
+        return
+
+    parsed = await parse_voice_transaction(text)
+
+    if parsed["amount"] <= 0:
+        await msg.edit_text(
+            f"🎤 <b>Tanildi:</b> {text}\n\n"
+            f"❌ Miqdor aniqlanmadi. Qaytadan yuboring.\n"
+            f"<i>Masalan: 'Non uchun 5000 so'm xarjladim'</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    context.user_data["voice_parsed"] = parsed
+    emoji = "📥" if parsed["type"] == "income" else "📤"
+    type_text = "Daromad" if parsed["type"] == "income" else "Xarajat"
+
+    await msg.edit_text(
+        f"🎤 <b>Tanildi:</b> {text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} Tur: <b>{type_text}</b>\n"
+        f"💰 Miqdor: <b>{format_money(parsed['amount'])}</b>\n"
+        f"📁 Kategoriya: {parsed['category']}\n\n"
+        f"To'g'rimi?",
+        parse_mode="HTML",
+        reply_markup=voice_confirm_keyboard(
+            parsed["type"], parsed["amount"], parsed["category"]
+        )
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Yordam — Oson Byudjet</b>\n\n"
         "/start — Bosh menyu\n/help — Yordam\n\n"
         "➕ Daromad/Xarajat kiritish\n"
+        "🎤 Ovoz orqali kiritish\n"
         "📁 Kategoriyalar bo'yicha tasniflash\n"
         "🎯 Oylik budget belgilash\n"
         "📊 Statistika va tahlil\n"
@@ -578,6 +708,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="❌ <b>To'lov tasdiqlanmadi.</b>\n\n"
                  "Muammo bo'lsa admin bilan bog'laning.",
             parse_mode="HTML"
+        )
+        return
+
+    # Ovoz tasdiqlash
+    elif data in ("voice_confirm", "voice_save_income", "voice_save_expense"):
+        parsed = context.user_data.get("voice_parsed", {})
+        if not parsed:
+            await query.edit_message_text("❌ Ma'lumot topilmadi. Qaytadan yuboring.")
+            return
+
+        if data == "voice_save_income":
+            parsed["type"] = "income"
+            parsed["category"] = "📦 Boshqa daromad"
+        elif data == "voice_save_expense":
+            parsed["type"] = "expense"
+            parsed["category"] = "📦 Boshqa"
+
+        await add_transaction(user_id, parsed["type"], parsed["amount"],
+                              parsed["category"], parsed.get("text", ""))
+        context.user_data.pop("voice_parsed", None)
+
+        txns   = await get_month_transactions(user_id)
+        stats  = calc_stats(txns)
+        emoji  = "📥" if parsed["type"] == "income" else "📤"
+        type_t = "Daromad" if parsed["type"] == "income" else "Xarajat"
+
+        await query.edit_message_text(
+            f"✅ <b>{type_t} saqlandi!</b>\n\n"
+            f"{emoji} {format_money(parsed['amount'])}\n"
+            f"📁 {parsed['category']}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 {format_money(stats['income'])}  "
+            f"📤 {format_money(stats['expenses'])}  "
+            f"💵 {format_money(stats['balance'])}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")
+            ]])
         )
         return
 
@@ -694,8 +862,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔙 Oylar", callback_data="history"),
                 InlineKeyboardButton("🏠 Menyu", callback_data="back_main")]]))
 
-    # ===================== QARZLAR =====================
-
     elif data == "debts":
         debts = await get_debts(user_id)
         gave  = [d for d in debts if d["direction"] == "gave"]
@@ -773,8 +939,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Qarzlar", callback_data="debts")]]))
-
-    # ===================== BALANSLAR =====================
 
     elif data == "balances":
         bals = await get_balances(user_id)
@@ -907,7 +1071,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👇 Boshlash uchun /start yuboring.")
         return
 
-    # Balans kiritish oqimi
     if context.user_data.get("awaiting_balance_name"):
         context.user_data["balance_name"] = text
         context.user_data.pop("awaiting_balance_name")
@@ -962,7 +1125,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
 
-    # Qarz kiritish oqimi
     elif context.user_data.get("awaiting_debt_person"):
         context.user_data["debt_person"] = text
         context.user_data.pop("awaiting_debt_person")
@@ -1135,6 +1297,7 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     await app.initialize()
