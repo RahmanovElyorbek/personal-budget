@@ -5,6 +5,7 @@
 - 7 kunlik bepul sinov
 - To'lov tizimi
 - Qarzlar ro'yxati
+- Balanslar nazorati
 """
 
 import logging
@@ -51,6 +52,13 @@ INCOME_CATEGORIES = [
     "🏦 Bank foizi", "🛒 Sotish", "📦 Boshqa daromad"
 ]
 
+BALANCE_TYPES = {
+    "cash":  "💵 Naqd pul",
+    "card":  "💳 Karta",
+    "bank":  "🏦 Bank hisobi",
+    "other": "📦 Boshqa",
+}
+
 MONTH_NAMES = {
     1: "Yanvar", 2: "Fevral", 3: "Mart", 4: "Aprel",
     5: "May", 6: "Iyun", 7: "Iyul", 8: "Avgust",
@@ -95,6 +103,16 @@ async def init_db():
                 due_date    DATE DEFAULT NULL,
                 is_paid     BOOLEAN DEFAULT FALSE,
                 note        TEXT DEFAULT '',
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS balances (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                type        TEXT NOT NULL,
+                amount      NUMERIC DEFAULT 0,
                 created_at  TIMESTAMP DEFAULT NOW()
             )
         """)
@@ -252,6 +270,35 @@ async def check_due_debts(telegram_id: int) -> list:
         """, telegram_id)
         return [dict(r) for r in rows]
 
+# ===================== BALANS FUNKSIYALARI =====================
+
+async def get_balances(telegram_id: int) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, name, type, amount
+            FROM balances
+            WHERE telegram_id = $1
+            ORDER BY created_at ASC
+        """, telegram_id)
+        return [dict(r) for r in rows]
+
+async def add_balance(telegram_id: int, name: str, bal_type: str, amount: float):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO balances (telegram_id, name, type, amount)
+            VALUES ($1, $2, $3, $4)
+        """, telegram_id, name, bal_type, amount)
+
+async def update_balance(balance_id: int, amount: float):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE balances SET amount = $1 WHERE id = $2", amount, balance_id
+        )
+
+async def delete_balance(balance_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM balances WHERE id = $1", balance_id)
+
 # ===================== YORDAMCHI FUNKSIYALAR =====================
 
 def calc_stats(transactions: list) -> dict:
@@ -277,7 +324,8 @@ def main_keyboard():
          InlineKeyboardButton("💰 Budget belgilash", callback_data="set_budget")],
         [InlineKeyboardButton("📋 Tarix", callback_data="history"),
          InlineKeyboardButton("💸 Qarzlar", callback_data="debts")],
-        [InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_month")],
+        [InlineKeyboardButton("💳 Balanslar", callback_data="balances"),
+         InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_month")],
     ])
 
 def category_keyboard(categories, txn_type):
@@ -316,6 +364,15 @@ def debt_direction_keyboard():
         [InlineKeyboardButton("🔴 Men berdim (menga qaytarishi kerak)", callback_data="debt_dir_gave")],
         [InlineKeyboardButton("🟢 Men oldim (men qaytarishi kerak)", callback_data="debt_dir_took")],
         [InlineKeyboardButton("🔙 Orqaga", callback_data="debts")],
+    ])
+
+def balance_type_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💵 Naqd pul", callback_data="bal_type_cash")],
+        [InlineKeyboardButton("💳 Karta", callback_data="bal_type_card")],
+        [InlineKeyboardButton("🏦 Bank hisobi", callback_data="bal_type_bank")],
+        [InlineKeyboardButton("📦 Boshqa", callback_data="bal_type_other")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="balances")],
     ])
 
 # ===================== TO'LOV EKRANI =====================
@@ -362,7 +419,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_new = await is_new_user(user.id)
     await ensure_user(user.id, user.first_name)
 
-    # Muddati o'tgan qarzlarni tekshirish
     due_debts = await check_due_debts(user.id)
     for debt in due_debts:
         direction = "menga qaytarishi" if debt["direction"] == "gave" else "men qaytarishim"
@@ -381,7 +437,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Daromad va xarajatlarni yozing\n"
             f"✅ Oylik statistikani ko'ring\n"
             f"✅ Byudjet belgilang va nazorat qiling\n"
-            f"✅ Qarzlarni kuzating\n\n"
+            f"✅ Qarzlarni kuzating\n"
+            f"✅ Balanslaringizni boshqaring\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎁 <b>7 kun to'liq BEPUL!</b>\n"
             f"Hech qanday to'lovsiz barcha imkoniyatlardan foydalaning!\n\n"
@@ -404,6 +461,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txns   = await get_month_transactions(user.id)
     stats  = calc_stats(txns)
     budget = await get_budget(user.id)
+    bals   = await get_balances(user.id)
 
     trial_msg = ""
     if days_left > 0:
@@ -419,6 +477,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📤 Xarajat : <b>{format_money(stats['expenses'])}</b>\n"
         f"💵 Balans  : <b>{format_money(stats['balance'])}</b>\n"
     )
+    if bals:
+        total = sum(float(b["amount"]) for b in bals)
+        text += f"\n💳 Jami balans: <b>{format_money(total)}</b>\n"
     if budget > 0:
         pct = min(int(stats["expenses"] / budget * 10), 10)
         bar = "🟥" * pct + "⬜" * (10 - pct)
@@ -442,6 +503,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 Oylik budget belgilash\n"
         "📊 Statistika va tahlil\n"
         "💸 Qarzlar ro'yxati\n"
+        "💳 Balanslar nazorati\n"
         "⚠️ Budget oshsa ogohlantirish",
         parse_mode="HTML"
     )
@@ -640,7 +702,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         took  = [d for d in debts if d["direction"] == "took"]
 
         msg = "💸 <b>Qarzlar ro'yxati</b>\n\n"
-
         if gave:
             total_gave = sum(float(d["amount"]) for d in gave)
             msg += f"🔴 <b>Men berganlar</b> (menga qaytarishi kerak):\n"
@@ -649,7 +710,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
                 msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
             msg += "\n"
-
         if took:
             total_took = sum(float(d["amount"]) for d in took)
             msg += f"🟢 <b>Men olganlar</b> (men qaytarishim kerak):\n"
@@ -657,7 +717,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for d in took:
                 due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
                 msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
-
         if not debts:
             msg += "✅ Hozircha qarz yo'q!"
 
@@ -694,7 +753,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔙 Orqaga", callback_data="debts")]]))
             return
-
         buttons = []
         for d in debts:
             direction = "🔴" if d["direction"] == "gave" else "🟢"
@@ -715,6 +773,82 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Qarzlar", callback_data="debts")]]))
+
+    # ===================== BALANSLAR =====================
+
+    elif data == "balances":
+        bals = await get_balances(user_id)
+        msg = "💳 <b>Balanslar</b>\n\n"
+        if bals:
+            total = sum(float(b["amount"]) for b in bals)
+            for b in bals:
+                type_name = BALANCE_TYPES.get(b["type"], "📦 Boshqa")
+                msg += f"{type_name} — <b>{b['name']}</b>\n"
+                msg += f"   💵 {format_money(float(b['amount']))}\n\n"
+            msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"💰 Jami: <b>{format_money(total)}</b>"
+        else:
+            msg += "Hali balans qo'shilmagan."
+
+        buttons = []
+        if bals:
+            bal_buttons = []
+            for b in bals:
+                bal_buttons.append(
+                    InlineKeyboardButton(f"✏️ {b['name']}", callback_data=f"bal_edit_{b['id']}")
+                )
+                if len(bal_buttons) == 2:
+                    buttons.append(bal_buttons)
+                    bal_buttons = []
+            if bal_buttons:
+                buttons.append(bal_buttons)
+
+        buttons.append([InlineKeyboardButton("➕ Yangi balans", callback_data="add_balance")])
+        buttons.append([InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")])
+        await query.edit_message_text(
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif data == "add_balance":
+        await query.edit_message_text(
+            "💳 <b>Balans turi</b>\n\nQaysi turdagi balans qo'shmoqchisiz?",
+            parse_mode="HTML",
+            reply_markup=balance_type_keyboard()
+        )
+
+    elif data.startswith("bal_type_"):
+        bal_type = data.replace("bal_type_", "")
+        context.user_data["balance_type"] = bal_type
+        context.user_data["awaiting_balance_name"] = True
+        type_name = BALANCE_TYPES.get(bal_type, "Boshqa")
+        await query.edit_message_text(
+            f"{type_name} uchun <b>nom</b> kiriting:\n"
+            f"<i>Masalan: Kapitalbank, Naqd, Hamyon</i>",
+            parse_mode="HTML"
+        )
+
+    elif data.startswith("bal_edit_"):
+        bal_id = int(data.split("_")[2])
+        context.user_data["editing_balance_id"] = bal_id
+        context.user_data["awaiting_balance_update"] = True
+        await query.edit_message_text(
+            "💰 Yangi miqdorni kiriting:\n<i>Masalan: 500000</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑️ O'chirish", callback_data=f"bal_delete_{bal_id}"),
+                InlineKeyboardButton("🔙 Orqaga", callback_data="balances")
+            ]])
+        )
+
+    elif data.startswith("bal_delete_"):
+        bal_id = int(data.split("_")[2])
+        await delete_balance(bal_id)
+        await query.edit_message_text(
+            "🗑️ <b>Balans o'chirildi!</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Balanslar", callback_data="balances")]]))
 
     elif data == "set_budget":
         context.user_data["awaiting_budget"] = True
@@ -762,6 +896,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_debt_person"),
         context.user_data.get("awaiting_debt_amount"),
         context.user_data.get("awaiting_debt_date"),
+        context.user_data.get("awaiting_balance_name"),
+        context.user_data.get("awaiting_balance_amount"),
+        context.user_data.get("awaiting_balance_update"),
     ]):
         premium = await is_user_premium(user_id)
         if not premium:
@@ -770,8 +907,63 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👇 Boshlash uchun /start yuboring.")
         return
 
+    # Balans kiritish oqimi
+    if context.user_data.get("awaiting_balance_name"):
+        context.user_data["balance_name"] = text
+        context.user_data.pop("awaiting_balance_name")
+        context.user_data["awaiting_balance_amount"] = True
+        await update.message.reply_text(
+            f"💳 Nom: <b>{text}</b>\n\n"
+            f"💰 Hozirgi miqdorini kiriting:\n<i>Masalan: 500000</i>",
+            parse_mode="HTML"
+        )
+
+    elif context.user_data.get("awaiting_balance_amount"):
+        try:
+            amount = float(text.replace(" ", "").replace(",", ""))
+            if amount < 0:
+                raise ValueError
+            name     = context.user_data.get("balance_name", "")
+            bal_type = context.user_data.get("balance_type", "other")
+            await add_balance(user_id, name, bal_type, amount)
+            for k in ("balance_name", "balance_type", "awaiting_balance_amount"):
+                context.user_data.pop(k, None)
+            type_name = BALANCE_TYPES.get(bal_type, "📦 Boshqa")
+            await update.message.reply_text(
+                f"✅ <b>Balans qo'shildi!</b>\n\n"
+                f"{type_name} — <b>{name}</b>\n"
+                f"💵 {format_money(amount)}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💳 Balanslar", callback_data="balances"),
+                    InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+                ]])
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
+
+    elif context.user_data.get("awaiting_balance_update"):
+        try:
+            amount = float(text.replace(" ", "").replace(",", ""))
+            if amount < 0:
+                raise ValueError
+            bal_id = context.user_data.get("editing_balance_id")
+            await update_balance(bal_id, amount)
+            context.user_data.pop("awaiting_balance_update", None)
+            context.user_data.pop("editing_balance_id", None)
+            await update.message.reply_text(
+                f"✅ <b>Balans yangilandi!</b>\n💵 {format_money(amount)}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💳 Balanslar", callback_data="balances"),
+                    InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+                ]])
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
+
     # Qarz kiritish oqimi
-    if context.user_data.get("awaiting_debt_person"):
+    elif context.user_data.get("awaiting_debt_person"):
         context.user_data["debt_person"] = text
         context.user_data.pop("awaiting_debt_person")
         context.user_data["awaiting_debt_amount"] = True
