@@ -26,6 +26,14 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+import io
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
@@ -408,7 +416,94 @@ async def delete_balance(balance_id: int):
         await conn.execute("DELETE FROM balances WHERE id = $1", balance_id)
 
 # ===================== YORDAMCHI FUNKSIYALAR =====================
-
+def generate_stats_pdf(user_name: str, stats: dict, cat_stats: dict, 
+                        budget: float, month_str: str) -> bytes:
+    """Statistika PDF fayl yaratish."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                           rightMargin=2*cm, leftMargin=2*cm,
+                           topMargin=2*cm, bottomMargin=2*cm)
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'Title', parent=styles['Title'],
+        fontSize=16, spaceAfter=20
+    )
+    normal_style = ParagraphStyle(
+        'Normal', parent=styles['Normal'],
+        fontSize=11, spaceAfter=6
+    )
+    
+    elements = []
+    
+    # Sarlavha
+    elements.append(Paragraph(f"Oson Byudjet — Hisobot", title_style))
+    elements.append(Paragraph(f"Foydalanuvchi: {user_name}", normal_style))
+    elements.append(Paragraph(f"Davr: {month_str}", normal_style))
+    elements.append(Spacer(1, 0.5*cm))
+    
+    # Asosiy statistika jadvali
+    main_data = [
+        ["Ko'rsatkich", "Miqdor"],
+        ["Jami daromad", f"{stats['income']:,.0f} so'm"],
+        ["Jami xarajat", f"{stats['expenses']:,.0f} so'm"],
+        ["Sof balans", f"{stats['balance']:,.0f} so'm"],
+    ]
+    
+    if budget > 0:
+        used_pct = int(stats['expenses'] / budget * 100) if budget else 0
+        remaining = max(budget - stats['expenses'], 0)
+        main_data.append(["Belgilangan budget", f"{budget:,.0f} so'm"])
+        main_data.append(["Sarflangan", f"{stats['expenses']:,.0f} so'm ({used_pct}%)"])
+        main_data.append(["Qolgan budget", f"{remaining:,.0f} so'm"])
+    
+    main_table = Table(main_data, colWidths=[9*cm, 8*cm])
+    main_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('FONTSIZE', (0, 1), (-1, -1), 11),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F4FF')]),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    elements.append(main_table)
+    elements.append(Spacer(1, 0.5*cm))
+    
+    # Kategoriyalar jadvali
+    if cat_stats:
+        elements.append(Paragraph("Xarajatlar kategoriyalar bo'yicha:", normal_style))
+        elements.append(Spacer(1, 0.3*cm))
+        
+        cat_data = [["Kategoriya", "Miqdor", "Foiz"]]
+        total_exp = stats['expenses'] if stats['expenses'] > 0 else 1
+        
+        for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
+            pct = int(amt / total_exp * 100)
+            cat_data.append([cat, f"{amt:,.0f} so'm", f"{pct}%"])
+        
+        cat_table = Table(cat_data, colWidths=[9*cm, 6*cm, 2*cm])
+        cat_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('ALIGN', (1, 0), (2, -1), 'RIGHT'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F4FF')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        elements.append(cat_table)
+    
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
 def calc_stats(transactions: list) -> dict:
     income = expenses = 0
     for t in transactions:
@@ -831,32 +926,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cat = t.get("category", "Boshqa")
                 cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
 
-        msg = (
-            f"📊 <b>Statistika — {datetime.now().strftime('%B %Y')}</b>\n\n"
-            f"📥 Jami daromad : <b>{format_money(stats['income'])}</b>\n"
-            f"📤 Jami xarajat : <b>{format_money(stats['expenses'])}</b>\n"
-            f"💵 Sof balans   : <b>{format_money(stats['balance'])}</b>\n"
-        )
+        msg = f"📊 <b>Statistika — {datetime.now().strftime('%B %Y')}</b>\n\n"
+        msg += "┌─────────────────────────┐\n"
+        msg += f"│ 📥 Daromad : {format_money(stats['income']):>12} │\n"
+        msg += f"│ 📤 Xarajat : {format_money(stats['expenses']):>12} │\n"
+        msg += f"│ 💵 Balans  : {format_money(stats['balance']):>12} │\n"
+        msg += "└─────────────────────────┘\n"
+
         if budget > 0:
             used = int(stats['expenses'] / budget * 100) if budget else 0
             rem  = budget - stats['expenses']
-            msg += (
-                f"\n🎯 <b>Budget holati:</b>\n"
-                f"  Belgilangan : {format_money(budget)}\n"
-                f"  Sarflangan  : {format_money(stats['expenses'])} ({used}%)\n"
-                f"  Qolgan      : {format_money(max(rem, 0))}\n"
-            )
+            pct  = min(int(stats["expenses"] / budget * 10), 10)
+            bar  = "🟥" * pct + "⬜" * (10 - pct)
+            msg += f"\n🎯 <b>Budget:</b>\n"
+            msg += f"  {bar} {used}%\n"
+            msg += f"  Belgilangan : {format_money(budget)}\n"
+            msg += f"  Sarflangan  : {format_money(stats['expenses'])}\n"
+            msg += f"  Qolgan      : {format_money(max(rem, 0))}\n"
             if rem < 0:
-                msg += f"  ⚠️ Budget {format_money(abs(rem))} oshib ketdi!\n"
+                msg += f"  ⚠️ {format_money(abs(rem))} oshib ketdi!\n"
+
         if cat_stats:
-            msg += "\n🏆 <b>Top xarajatlar:</b>\n"
+            msg += f"\n🏆 <b>Top xarajatlar:</b>\n"
+            msg += "─" * 30 + "\n"
             for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1])[:5]:
                 pct = int(amt / stats['expenses'] * 100) if stats['expenses'] else 0
-                msg += f"  {cat}: {format_money(amt)} ({pct}%)\n"
+                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                msg += f"{cat}\n  {bar} {pct}%  {format_money(amt)}\n"
 
         await query.edit_message_text(msg, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]]))
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 PDF yuklab olish", callback_data="stats_pdf")],
+                [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]
+            ]))
+
+    elif data == "stats_pdf":
+        txns   = await get_month_transactions(user_id)
+        stats  = calc_stats(txns)
+        budget = await get_budget(user_id)
+        cat_stats = {}
+        for t in txns:
+            if t["type"] == "expense":
+                cat = t.get("category", "Boshqa")
+                cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
+
+        user_name = query.from_user.full_name
+        month_str = datetime.now().strftime("%B %Y")
+
+        await query.answer("PDF tayyorlanmoqda...")
+
+        pdf_bytes = generate_stats_pdf(user_name, stats, cat_stats, budget, month_str)
+
+        await context.bot.send_document(
+            chat_id=user_id,
+            document=io.BytesIO(pdf_bytes),
+            filename=f"hisobot_{datetime.now().strftime('%Y_%m')}.pdf",
+            caption=f"📄 <b>{month_str} hisoboti</b>",
+            parse_mode="HTML"
+        )
 
     elif data == "history":
         months = await get_available_months(user_id)
