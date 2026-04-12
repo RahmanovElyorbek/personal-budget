@@ -2,3 +2,4 @@ python-telegram-bot==20.8
 aiohttp
 asyncpg
 httpx
+reportlab
