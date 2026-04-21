@@ -5,8 +5,9 @@
 - 7 kunlik bepul sinov
 - To'lov tizimi
 - Qarzlar ro'yxati
-- Balanslar nazorati
+- Balanslar nazorati (avtomatik yangilanadi)
 - Ovoz orqali kiritish (OpenAI Whisper)
+- PDF hisobot
 """
 
 import logging
@@ -15,6 +16,7 @@ import asyncio
 import asyncpg
 import tempfile
 import httpx
+import io
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,14 +28,11 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-import io
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
@@ -80,7 +79,6 @@ MONTH_NAMES = {
 # ===================== OVOZ TANISH =====================
 
 async def transcribe_voice(file_path: str) -> str:
-    """OpenAI Whisper orqali ovozni matnga o'girish."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             with open(file_path, "rb") as f:
@@ -100,27 +98,22 @@ async def transcribe_voice(file_path: str) -> str:
         return ""
 
 async def parse_voice_transaction(text: str) -> dict:
-    """Matndan tranzaksiya ma'lumotlarini ajratish."""
     import re
     text_lower = text.lower()
 
-    # So'z bilan yozilgan raqamlarni aniqlash (o'zbek/turk/rus)
     word_numbers = {
         "bir": 1, "ikki": 2, "uch": 3, "to'rt": 4, "besh": 5,
         "olti": 6, "yetti": 7, "sakkiz": 8, "to'qqiz": 9, "o'n": 10,
         "yigirma": 20, "o'ttiz": 30, "qirq": 40, "ellik": 50,
         "oltmish": 60, "yetmish": 70, "sakson": 80, "to'qson": 90,
         "yuz": 100, "ming": 1000, "million": 1000000,
-        # Turk tili
         "iki": 2, "üç": 3, "dört": 4, "beş": 5, "altı": 6,
         "yedi": 7, "sekiz": 8, "dokuz": 9, "on": 10, "bin": 1000,
         "milyon": 1000000, "milisom": 1000000,
-        # Rus tili
         "одна": 1, "два": 2, "три": 3, "пять": 5, "десять": 10,
         "тысяча": 1000, "миллион": 1000000,
     }
 
-    # Avval raqamlarni topish
     numbers = re.findall(r'\d+(?:[.,]\d+)?', text.replace(" ", ""))
     amount = 0
     for n in numbers:
@@ -131,14 +124,12 @@ async def parse_voice_transaction(text: str) -> dict:
         elif val > 0 and amount == 0:
             amount = val
 
-    # Agar raqam topilmasa — so'zlardan topish
     if amount == 0:
         words = text_lower.split()
         for i, word in enumerate(words):
             clean_word = word.strip(".,!?")
             if clean_word in word_numbers:
                 base = word_numbers[clean_word]
-                # Keyingi so'z multiplier bo'lishi mumkin
                 if i + 1 < len(words):
                     next_word = words[i+1].strip(".,!?")
                     if next_word in ("ming", "bin", "тысяча"):
@@ -150,9 +141,8 @@ async def parse_voice_transaction(text: str) -> dict:
                 if amount == 0:
                     amount = base
 
-    # Tranzaksiya turini aniqlash
     income_words = ["maosh", "daromad", "oldim", "tushdi", "kirdi", "topdi", "solib", "berildi"]
-    expense_words = ["xarajat", "sarf", "berdim", "to'ladim", "harajat", "sotib", "oldim narx", "ketdi"]
+    expense_words = ["xarajat", "sarf", "berdim", "to'ladim", "harajat", "sotib"]
 
     txn_type = "expense"
     for w in income_words:
@@ -160,7 +150,6 @@ async def parse_voice_transaction(text: str) -> dict:
             txn_type = "income"
             break
 
-    # Kategoriyani aniqlash
     category_map = {
         "oziq": "🍔 Oziq-ovqat", "ovqat": "🍔 Oziq-ovqat", "non": "🍔 Oziq-ovqat",
         "go'sht": "🍔 Oziq-ovqat", "sabzavot": "🍔 Oziq-ovqat", "bozor": "🍔 Oziq-ovqat",
@@ -203,6 +192,16 @@ async def init_db():
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS balances (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                type        TEXT NOT NULL,
+                amount      NUMERIC DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id          SERIAL PRIMARY KEY,
                 telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -210,6 +209,7 @@ async def init_db():
                 amount      NUMERIC NOT NULL,
                 category    TEXT DEFAULT 'Boshqa',
                 note        TEXT DEFAULT '',
+                balance_id  INTEGER REFERENCES balances(id) ON DELETE SET NULL,
                 date        TIMESTAMP DEFAULT NOW()
             )
         """)
@@ -226,16 +226,6 @@ async def init_db():
                 created_at  TIMESTAMP DEFAULT NOW()
             )
         """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS balances (
-                id          SERIAL PRIMARY KEY,
-                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
-                name        TEXT NOT NULL,
-                type        TEXT NOT NULL,
-                amount      NUMERIC DEFAULT 0,
-                created_at  TIMESTAMP DEFAULT NOW()
-            )
-        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -247,11 +237,20 @@ async def is_new_user(telegram_id: int) -> bool:
 
 async def ensure_user(telegram_id: int, name: str = ""):
     async with db_pool.acquire() as conn:
+        is_new = await conn.fetchrow(
+            "SELECT telegram_id FROM users WHERE telegram_id = $1", telegram_id
+        )
         await conn.execute("""
             INSERT INTO users (telegram_id, name, registered_at)
             VALUES ($1, $2, NOW())
             ON CONFLICT (telegram_id) DO UPDATE SET name = $2
         """, telegram_id, name)
+        # Yangi foydalanuvchi uchun avtomatik balanslar
+        if is_new is None:
+            await conn.execute("""
+                INSERT INTO balances (telegram_id, name, type, amount)
+                VALUES ($1, '💵 Naqd', 'cash', 0), ($1, '💳 Karta', 'card', 0)
+            """, telegram_id)
 
 async def is_user_premium(telegram_id: int) -> bool:
     async with db_pool.acquire() as conn:
@@ -281,8 +280,7 @@ async def get_trial_days_left(telegram_id: int) -> int:
 async def activate_premium(telegram_id: int, days: int):
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            UPDATE users
-            SET is_premium = TRUE,
+            UPDATE users SET is_premium = TRUE,
                 premium_until = NOW() + ($1 || ' days')::INTERVAL
             WHERE telegram_id = $2
         """, str(days), telegram_id)
@@ -301,13 +299,25 @@ async def set_budget(telegram_id: int, amount: float):
             amount, telegram_id
         )
 
-async def add_transaction(telegram_id: int, txn_type: str,
-                          amount: float, category: str, note: str):
+async def add_transaction(telegram_id: int, txn_type: str, amount: float,
+                          category: str, note: str, balance_id: int = None):
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO transactions (telegram_id, type, amount, category, note)
-            VALUES ($1, $2, $3, $4, $5)
-        """, telegram_id, txn_type, amount, category, note)
+            INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """, telegram_id, txn_type, amount, category, note, balance_id)
+        # Balansni yangilash
+        if balance_id:
+            if txn_type == "income":
+                await conn.execute(
+                    "UPDATE balances SET amount = amount + $1 WHERE id = $2",
+                    amount, balance_id
+                )
+            else:
+                await conn.execute(
+                    "UPDATE balances SET amount = amount - $1 WHERE id = $2",
+                    amount, balance_id
+                )
 
 async def get_month_transactions(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
@@ -353,8 +363,7 @@ async def clear_month_transactions(telegram_id: int):
               AND DATE_TRUNC('month', date) = DATE_TRUNC('month', NOW())
         """, telegram_id)
 
-async def add_debt(telegram_id: int, person_name: str, amount: float,
-                   direction: str, due_date=None, note: str = ""):
+async def add_debt(telegram_id, person_name, amount, direction, due_date=None, note=""):
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO debts (telegram_id, person_name, amount, direction, due_date, note)
@@ -373,137 +382,116 @@ async def get_debts(telegram_id: int) -> list:
 
 async def mark_debt_paid(debt_id: int):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE debts SET is_paid = TRUE WHERE id = $1", debt_id
-        )
+        await conn.execute("UPDATE debts SET is_paid = TRUE WHERE id = $1", debt_id)
 
 async def check_due_debts(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, person_name, amount, direction, due_date
             FROM debts
-            WHERE telegram_id = $1
-              AND is_paid = FALSE
-              AND due_date = CURRENT_DATE
+            WHERE telegram_id = $1 AND is_paid = FALSE AND due_date = CURRENT_DATE
         """, telegram_id)
         return [dict(r) for r in rows]
 
 async def get_balances(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, name, type, amount
-            FROM balances
-            WHERE telegram_id = $1
-            ORDER BY created_at ASC
+            SELECT id, name, type, amount FROM balances
+            WHERE telegram_id = $1 ORDER BY created_at ASC
         """, telegram_id)
         return [dict(r) for r in rows]
 
-async def add_balance(telegram_id: int, name: str, bal_type: str, amount: float):
+async def add_balance(telegram_id, name, bal_type, amount):
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO balances (telegram_id, name, type, amount)
             VALUES ($1, $2, $3, $4)
         """, telegram_id, name, bal_type, amount)
 
-async def update_balance(balance_id: int, amount: float):
+async def update_balance(balance_id, amount):
     async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE balances SET amount = $1 WHERE id = $2", amount, balance_id
         )
 
-async def delete_balance(balance_id: int):
+async def delete_balance(balance_id):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM balances WHERE id = $1", balance_id)
 
-# ===================== YORDAMCHI FUNKSIYALAR =====================
-def generate_stats_pdf(user_name: str, stats: dict, cat_stats: dict, 
-                        budget: float, month_str: str) -> bytes:
-    """Statistika PDF fayl yaratish."""
+# ===================== YORDAMCHI =====================
+
+def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                            rightMargin=2*cm, leftMargin=2*cm,
                            topMargin=2*cm, bottomMargin=2*cm)
-    
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'Title', parent=styles['Title'],
-        fontSize=16, spaceAfter=20
-    )
-    normal_style = ParagraphStyle(
-        'Normal', parent=styles['Normal'],
-        fontSize=11, spaceAfter=6
-    )
-    
+    title_style = ParagraphStyle('Title', parent=styles['Title'],
+                                  fontSize=16, spaceAfter=20)
+    normal_style = ParagraphStyle('Normal', parent=styles['Normal'],
+                                   fontSize=11, spaceAfter=6)
     elements = []
-    
-    # Sarlavha
     elements.append(Paragraph(f"Oson Byudjet — Hisobot", title_style))
     elements.append(Paragraph(f"Foydalanuvchi: {user_name}", normal_style))
     elements.append(Paragraph(f"Davr: {month_str}", normal_style))
     elements.append(Spacer(1, 0.5*cm))
-    
-    # Asosiy statistika jadvali
+
     main_data = [
         ["Ko'rsatkich", "Miqdor"],
         ["Jami daromad", f"{stats['income']:,.0f} so'm"],
         ["Jami xarajat", f"{stats['expenses']:,.0f} so'm"],
         ["Sof balans", f"{stats['balance']:,.0f} so'm"],
     ]
-    
     if budget > 0:
         used_pct = int(stats['expenses'] / budget * 100) if budget else 0
         remaining = max(budget - stats['expenses'], 0)
         main_data.append(["Belgilangan budget", f"{budget:,.0f} so'm"])
         main_data.append(["Sarflangan", f"{stats['expenses']:,.0f} so'm ({used_pct}%)"])
         main_data.append(["Qolgan budget", f"{remaining:,.0f} so'm"])
-    
+
     main_table = Table(main_data, colWidths=[9*cm, 8*cm])
     main_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('FONTSIZE', (0, 1), (-1, -1), 11),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F4FF')]),
-        ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ('LEFTPADDING', (0, 0), (-1, -1), 10),
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2255A8')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('FONTSIZE', (0,0), (-1,0), 12),
+        ('FONTSIZE', (0,1), (-1,-1), 11),
+        ('ALIGN', (1,0), (1,-1), 'RIGHT'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F0F4FF')]),
+        ('TOPPADDING', (0,0), (-1,-1), 8),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+        ('LEFTPADDING', (0,0), (-1,-1), 10),
     ]))
     elements.append(main_table)
     elements.append(Spacer(1, 0.5*cm))
-    
-    # Kategoriyalar jadvali
+
     if cat_stats:
         elements.append(Paragraph("Xarajatlar kategoriyalar bo'yicha:", normal_style))
         elements.append(Spacer(1, 0.3*cm))
-        
         cat_data = [["Kategoriya", "Miqdor", "Foiz"]]
         total_exp = stats['expenses'] if stats['expenses'] > 0 else 1
-        
         for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
             pct = int(amt / total_exp * 100)
             cat_data.append([cat, f"{amt:,.0f} so'm", f"{pct}%"])
-        
         cat_table = Table(cat_data, colWidths=[9*cm, 6*cm, 2*cm])
         cat_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTSIZE', (0, 0), (-1, 0), 11),
-            ('FONTSIZE', (0, 1), (-1, -1), 10),
-            ('ALIGN', (1, 0), (2, -1), 'RIGHT'),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F4FF')]),
-            ('TOPPADDING', (0, 0), (-1, -1), 6),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2255A8')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTSIZE', (0,0), (-1,0), 11),
+            ('FONTSIZE', (0,1), (-1,-1), 10),
+            ('ALIGN', (1,0), (2,-1), 'RIGHT'),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#F0F4FF')]),
+            ('TOPPADDING', (0,0), (-1,-1), 6),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+            ('LEFTPADDING', (0,0), (-1,-1), 8),
         ]))
         elements.append(cat_table)
-    
+
     doc.build(elements)
     buffer.seek(0)
     return buffer.getvalue()
+
 def calc_stats(transactions: list) -> dict:
     income = expenses = 0
     for t in transactions:
@@ -542,6 +530,17 @@ def category_keyboard(categories, txn_type):
     buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
+def balance_select_keyboard(balances, txn_type):
+    """Xarajat/daromad uchun balans tanlash klaviaturasi."""
+    buttons = []
+    for b in balances:
+        amt = format_money(float(b["amount"]))
+        label = f"{b['name']} ({amt})"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"balsel_{b['id']}")])
+    buttons.append([InlineKeyboardButton("⏭️ Balanssiz saqlash", callback_data="balsel_none")])
+    buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
 def payment_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Oylik — 25,000 so'm", callback_data="pay_monthly")],
@@ -549,11 +548,11 @@ def payment_keyboard():
         [InlineKeyboardButton("🗓 Yillik — 199,000 so'm", callback_data="pay_yearly")],
     ])
 
-def history_months_keyboard(months: list):
+def history_months_keyboard(months):
     buttons, row = [], []
     for m in months:
         label = f"{MONTH_NAMES[m['month']]} {m['year']}"
-        cb    = f"history_{m['year']}_{m['month']}"
+        cb = f"history_{m['year']}_{m['month']}"
         row.append(InlineKeyboardButton(label, callback_data=cb))
         if len(row) == 2:
             buttons.append(row); row = []
@@ -578,17 +577,17 @@ def balance_type_keyboard():
         [InlineKeyboardButton("🔙 Orqaga", callback_data="balances")],
     ])
 
-def voice_confirm_keyboard(txn_type: str, amount: float, category: str):
+def voice_confirm_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ To'g'ri, saqlash", callback_data="voice_confirm")],
-        [InlineKeyboardButton("📥 Daromad qilib saqlash", callback_data="voice_save_income"),
-         InlineKeyboardButton("📤 Xarajat qilib saqlash", callback_data="voice_save_expense")],
+        [InlineKeyboardButton("✅ Davom etish (balans tanlash)", callback_data="voice_continue")],
+        [InlineKeyboardButton("📥 Daromad qilib o'zgartirish", callback_data="voice_set_income"),
+         InlineKeyboardButton("📤 Xarajat qilib o'zgartirish", callback_data="voice_set_expense")],
         [InlineKeyboardButton("❌ Bekor qilish", callback_data="back_main")],
     ])
 
 # ===================== TO'LOV EKRANI =====================
 
-async def show_payment_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_payment_screen(update, context):
     text = (
         "⏰ <b>Sinov muddati tugadi!</b>\n\n"
         "Budget botdan foydalanishni davom ettirish uchun\n"
@@ -598,11 +597,9 @@ async def show_payment_screen(update: Update, context: ContextTypes.DEFAULT_TYPE
         "🗓 Yillik   — <b>199,000 so'm</b>\n"
     )
     if update.message:
-        await update.message.reply_text(
-            text, parse_mode="HTML", reply_markup=payment_keyboard())
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=payment_keyboard())
     else:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", reply_markup=payment_keyboard())
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=payment_keyboard())
 
 async def notify_admin_payment(context, user_id, user_name, plan, price):
     days_map = {"Oylik": 30, "3 Oylik": 90, "Yillik": 365}
@@ -619,9 +616,7 @@ async def notify_admin_payment(context, user_id, user_name, plan, price):
         [InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"adm_confirm_{user_id}_{days}")],
         [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"adm_reject_{user_id}")],
     ])
-    await context.bot.send_message(
-        chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=markup
-    )
+    await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=markup)
 
 # ===================== HANDLERLAR =====================
 
@@ -652,8 +647,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Qarzlarni kuzating\n"
             f"✅ Balanslaringizni boshqaring\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎁 <b>7 kun to'liq BEPUL!</b>\n"
-            f"Hech qanday to'lovsiz barcha imkoniyatlardan foydalaning!\n\n"
+            f"💡 <b>Sizga avtomatik yaratildi:</b>\n"
+            f"💵 Naqd pul — 0 so'm\n"
+            f"💳 Karta — 0 so'm\n\n"
+            f"Balans bo'limiga kirib miqdorni yangilang yoki yangi balans qo'shing!\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎁 <b>7 kun to'liq BEPUL!</b>\n\n"
             f"👇 Boshlash uchun quyidagi tugmani bosing!"
         )
         await update.message.reply_text(
@@ -703,21 +702,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Qolgan : <b>{format_money(max(remaining, 0))}</b>\n"
         )
     text += "\n🎤 Ovoz yuboring yoki tugma bosing:"
-    await update.message.reply_text(
-        text, parse_mode="HTML", reply_markup=main_keyboard())
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_keyboard())
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     premium = await is_user_premium(user_id)
     if not premium:
         await show_payment_screen(update, context)
         return
 
     msg = await update.message.reply_text("🎤 Ovoz tanilmoqda...")
-
     voice = update.message.voice
-    file  = await context.bot.get_file(voice.file_id)
+    file = await context.bot.get_file(voice.file_id)
 
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         await file.download_to_drive(tmp.name)
@@ -728,7 +724,6 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     parsed = await parse_voice_transaction(text)
-
     if parsed["amount"] <= 0:
         await msg.edit_text(
             f"🎤 <b>Tanildi:</b> {text}\n\n"
@@ -748,32 +743,29 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{emoji} Tur: <b>{type_text}</b>\n"
         f"💰 Miqdor: <b>{format_money(parsed['amount'])}</b>\n"
         f"📁 Kategoriya: {parsed['category']}\n\n"
-        f"To'g'rimi?",
+        f"Balans tanlash uchun davom eting:",
         parse_mode="HTML",
-        reply_markup=voice_confirm_keyboard(
-            parsed["type"], parsed["amount"], parsed["category"]
-        )
+        reply_markup=voice_confirm_keyboard()
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update, context):
     await update.message.reply_text(
         "📖 <b>Yordam — Oson Byudjet</b>\n\n"
         "/start — Bosh menyu\n/help — Yordam\n\n"
-        "➕ Daromad/Xarajat kiritish\n"
+        "➕ Daromad/Xarajat kiritish (balansdan)\n"
         "🎤 Ovoz orqali kiritish\n"
         "📁 Kategoriyalar bo'yicha tasniflash\n"
         "🎯 Oylik budget belgilash\n"
-        "📊 Statistika va tahlil\n"
+        "📊 Statistika va PDF hisobot\n"
         "💸 Qarzlar ro'yxati\n"
-        "💳 Balanslar nazorati\n"
-        "⚠️ Budget oshsa ogohlantirish",
+        "💳 Balanslar avtomatik yangilanadi\n",
         parse_mode="HTML"
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
+    query = update.callback_query
     await query.answer()
-    data    = query.data
+    data = query.data
     user_id = query.from_user.id
 
     # To'lov tugmalari
@@ -799,9 +791,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("paid_"):
         plans = {
-            "paid_pay_monthly":   ("Oylik",   PRICE_MONTHLY),
+            "paid_pay_monthly":   ("Oylik", PRICE_MONTHLY),
             "paid_pay_quarterly": ("3 Oylik", PRICE_QUARTERLY),
-            "paid_pay_yearly":    ("Yillik",  PRICE_YEARLY),
+            "paid_pay_yearly":    ("Yillik", PRICE_YEARLY),
         }
         plan_name, price = plans.get(data, ("Oylik", PRICE_MONTHLY))
         user_name = query.from_user.full_name
@@ -814,11 +806,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Admin tugmalari
     elif data.startswith("adm_confirm_"):
         parts = data.split("_")
         target_id = int(parts[2])
-        days      = int(parts[3])
+        days = int(parts[3])
         await activate_premium(target_id, days)
         await query.edit_message_text(
             f"✅ Premium faollashtirildi!\n🆔 {target_id} | 📅 {days} kun",
@@ -826,8 +817,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await context.bot.send_message(
             chat_id=target_id,
-            text="🎉 <b>Premium faollashtirildi!</b>\n\n"
-                 "Endi botdan to'liq foydalanishingiz mumkin.\n/start",
+            text="🎉 <b>Premium faollashtirildi!</b>\n\nEndi botdan to'liq foydalanishingiz mumkin.\n/start",
             parse_mode="HTML"
         )
         return
@@ -837,47 +827,99 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ Bekor qilindi. 🆔 {target_id}")
         await context.bot.send_message(
             chat_id=target_id,
-            text="❌ <b>To'lov tasdiqlanmadi.</b>\n\n"
-                 "Muammo bo'lsa admin bilan bog'laning.",
+            text="❌ <b>To'lov tasdiqlanmadi.</b>\n\nMuammo bo'lsa admin bilan bog'laning.",
             parse_mode="HTML"
         )
         return
 
     # Ovoz tasdiqlash
-    elif data in ("voice_confirm", "voice_save_income", "voice_save_expense"):
+    elif data == "voice_continue":
         parsed = context.user_data.get("voice_parsed", {})
         if not parsed:
-            await query.edit_message_text("❌ Ma'lumot topilmadi. Qaytadan yuboring.")
+            await query.edit_message_text("❌ Ma'lumot topilmadi.")
             return
+        bals = await get_balances(user_id)
+        await query.edit_message_text(
+            f"💳 <b>Balansni tanlang:</b>\n\n"
+            f"{'📥' if parsed['type']=='income' else '📤'} {format_money(parsed['amount'])}\n"
+            f"📁 {parsed['category']}",
+            parse_mode="HTML",
+            reply_markup=balance_select_keyboard(bals, parsed['type'])
+        )
+        return
 
-        if data == "voice_save_income":
+    elif data in ("voice_set_income", "voice_set_expense"):
+        parsed = context.user_data.get("voice_parsed", {})
+        if not parsed:
+            await query.edit_message_text("❌ Ma'lumot topilmadi.")
+            return
+        if data == "voice_set_income":
             parsed["type"] = "income"
             parsed["category"] = "📦 Boshqa daromad"
-        elif data == "voice_save_expense":
+        else:
             parsed["type"] = "expense"
             parsed["category"] = "📦 Boshqa"
-
-        await add_transaction(user_id, parsed["type"], parsed["amount"],
-                              parsed["category"], parsed.get("text", ""))
-        context.user_data.pop("voice_parsed", None)
-
-        txns   = await get_month_transactions(user_id)
-        stats  = calc_stats(txns)
-        emoji  = "📥" if parsed["type"] == "income" else "📤"
-        type_t = "Daromad" if parsed["type"] == "income" else "Xarajat"
-
+        context.user_data["voice_parsed"] = parsed
+        bals = await get_balances(user_id)
         await query.edit_message_text(
-            f"✅ <b>{type_t} saqlandi!</b>\n\n"
-            f"{emoji} {format_money(parsed['amount'])}\n"
-            f"📁 {parsed['category']}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📥 {format_money(stats['income'])}  "
-            f"📤 {format_money(stats['expenses'])}  "
-            f"💵 {format_money(stats['balance'])}",
+            f"💳 <b>Balansni tanlang:</b>\n\n"
+            f"{'📥' if parsed['type']=='income' else '📤'} {format_money(parsed['amount'])}\n"
+            f"📁 {parsed['category']}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")
-            ]])
+            reply_markup=balance_select_keyboard(bals, parsed['type'])
+        )
+        return
+
+    elif data.startswith("balsel_"):
+        # Balans tanlandi — tranzaksiyani saqlash
+        bal_part = data.replace("balsel_", "")
+        balance_id = None if bal_part == "none" else int(bal_part)
+
+        # Ovozdan kelgan bo'lsa
+        if "voice_parsed" in context.user_data:
+            parsed = context.user_data.pop("voice_parsed")
+            await add_transaction(
+                user_id, parsed["type"], parsed["amount"],
+                parsed["category"], parsed.get("text", ""), balance_id
+            )
+            txns = await get_month_transactions(user_id)
+            stats = calc_stats(txns)
+            emoji = "📥" if parsed["type"] == "income" else "📤"
+            type_t = "Daromad" if parsed["type"] == "income" else "Xarajat"
+
+            bal_info = ""
+            if balance_id:
+                bals = await get_balances(user_id)
+                for b in bals:
+                    if b["id"] == balance_id:
+                        bal_info = f"\n💳 Balans: {b['name']} — {format_money(float(b['amount']))}"
+                        break
+
+            await query.edit_message_text(
+                f"✅ <b>{type_t} saqlandi!</b>\n\n"
+                f"{emoji} {format_money(parsed['amount'])}\n"
+                f"📁 {parsed['category']}{bal_info}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 {format_money(stats['income'])}  "
+                f"📤 {format_money(stats['expenses'])}  "
+                f"💵 {format_money(stats['balance'])}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")
+                ]])
+            )
+            return
+
+        # Oddiy tranzaksiyadan kelgan bo'lsa
+        context.user_data["selected_balance_id"] = balance_id
+        context.user_data["awaiting_amount"] = True
+        cat = context.user_data.get("category", "📦 Boshqa")
+        txn_type = context.user_data.get("txn_type", "expense")
+        emoji = "📥" if txn_type == "income" else "📤"
+        await query.edit_message_text(
+            f"{emoji} <b>Kategoriya:</b> {cat}\n\n"
+            f"💬 Miqdorni kiriting (faqat raqam):\n<i>Masalan: 50000</i>",
+            parse_mode="HTML"
         )
         return
 
@@ -903,22 +945,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("cat_"):
         _, txn_type, idx = data.split("_", 2)
-        cats     = INCOME_CATEGORIES if txn_type == "income" else EXPENSE_CATEGORIES
+        cats = INCOME_CATEGORIES if txn_type == "income" else EXPENSE_CATEGORIES
         category = cats[int(idx)]
         context.user_data.update({
             "category": category,
             "txn_type": txn_type,
-            "awaiting_amount": True
         })
+        # Balans tanlash ekraniga o'tamiz
+        bals = await get_balances(user_id)
         emoji = "📥" if txn_type == "income" else "📤"
         await query.edit_message_text(
             f"{emoji} <b>Kategoriya:</b> {category}\n\n"
-            f"💬 Miqdorni kiriting (faqat raqam):\n<i>Masalan: 50000</i>",
-            parse_mode="HTML")
+            f"💳 Qaysi balansdan?",
+            parse_mode="HTML",
+            reply_markup=balance_select_keyboard(bals, txn_type)
+        )
 
     elif data == "stats":
-        txns   = await get_month_transactions(user_id)
-        stats  = calc_stats(txns)
+        txns = await get_month_transactions(user_id)
+        stats = calc_stats(txns)
         budget = await get_budget(user_id)
         cat_stats = {}
         for t in txns:
@@ -935,9 +980,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if budget > 0:
             used = int(stats['expenses'] / budget * 100) if budget else 0
-            rem  = budget - stats['expenses']
-            pct  = min(int(stats["expenses"] / budget * 10), 10)
-            bar  = "🟥" * pct + "⬜" * (10 - pct)
+            rem = budget - stats['expenses']
+            pct = min(int(stats["expenses"] / budget * 10), 10)
+            bar = "🟥" * pct + "⬜" * (10 - pct)
             msg += f"\n🎯 <b>Budget:</b>\n"
             msg += f"  {bar} {used}%\n"
             msg += f"  Belgilangan : {format_money(budget)}\n"
@@ -961,8 +1006,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]))
 
     elif data == "stats_pdf":
-        txns   = await get_month_transactions(user_id)
-        stats  = calc_stats(txns)
+        txns = await get_month_transactions(user_id)
+        stats = calc_stats(txns)
         budget = await get_budget(user_id)
         cat_stats = {}
         for t in txns:
@@ -972,11 +1017,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_name = query.from_user.full_name
         month_str = datetime.now().strftime("%B %Y")
-
         await query.answer("PDF tayyorlanmoqda...")
-
         pdf_bytes = generate_stats_pdf(user_name, stats, cat_stats, budget, month_str)
-
         await context.bot.send_document(
             chat_id=user_id,
             document=io.BytesIO(pdf_bytes),
@@ -1006,7 +1048,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not txns:
             msg = f"📋 <b>{MONTH_NAMES[month]} {year} — tranzaksiyalar yo'q.</b>"
         else:
-            income   = sum(float(t['amount']) for t in txns if t['type'] == 'income')
+            income = sum(float(t['amount']) for t in txns if t['type'] == 'income')
             expenses = sum(float(t['amount']) for t in txns if t['type'] == 'expense')
             msg = (
                 f"📋 <b>{MONTH_NAMES[month]} {year}</b>\n"
@@ -1016,9 +1058,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             for t in txns:
                 emoji = "📥" if t["type"] == "income" else "📤"
-                date  = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
-                note  = f" — {t['note']}" if t.get("note") else ""
-                msg  += f"{emoji} <b>{format_money(float(t['amount']))}</b> | 📁 {t.get('category','Boshqa')} | 📅 {date}{note}\n"
+                date = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
+                note = f" — {t['note']}" if t.get("note") else ""
+                msg += f"{emoji} <b>{format_money(float(t['amount']))}</b> | 📁 {t.get('category','Boshqa')} | 📅 {date}{note}\n"
 
         await query.edit_message_text(
             msg, parse_mode="HTML",
@@ -1028,28 +1070,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "debts":
         debts = await get_debts(user_id)
-        gave  = [d for d in debts if d["direction"] == "gave"]
-        took  = [d for d in debts if d["direction"] == "took"]
-
+        gave = [d for d in debts if d["direction"] == "gave"]
+        took = [d for d in debts if d["direction"] == "took"]
         msg = "💸 <b>Qarzlar ro'yxati</b>\n\n"
         if gave:
             total_gave = sum(float(d["amount"]) for d in gave)
-            msg += f"🔴 <b>Men berganlar</b> (menga qaytarishi kerak):\n"
-            msg += f"Jami: <b>{format_money(total_gave)}</b>\n\n"
+            msg += f"🔴 <b>Men berganlar</b>:\nJami: <b>{format_money(total_gave)}</b>\n\n"
             for d in gave:
                 due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
                 msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
             msg += "\n"
         if took:
             total_took = sum(float(d["amount"]) for d in took)
-            msg += f"🟢 <b>Men olganlar</b> (men qaytarishim kerak):\n"
-            msg += f"Jami: <b>{format_money(total_took)}</b>\n\n"
+            msg += f"🟢 <b>Men olganlar</b>:\nJami: <b>{format_money(total_took)}</b>\n\n"
             for d in took:
                 due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
                 msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
         if not debts:
             msg += "✅ Hozircha qarz yo'q!"
-
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Yangi qarz", callback_data="add_debt")],
             [InlineKeyboardButton("✅ Qarz to'landi", callback_data="debt_paid_list")],
@@ -1069,8 +1107,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_debt_person"] = True
         direction_text = "bergan" if data == "debt_dir_gave" else "olgan"
         await query.edit_message_text(
-            f"👤 Qarz {direction_text} odamning <b>ismini</b> yozing:\n"
-            f"<i>Masalan: Akbar</i>",
+            f"👤 Qarz {direction_text} odamning <b>ismini</b> yozing:\n<i>Masalan: Akbar</i>",
             parse_mode="HTML"
         )
 
@@ -1113,8 +1150,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 type_name = BALANCE_TYPES.get(b["type"], "📦 Boshqa")
                 msg += f"{type_name} — <b>{b['name']}</b>\n"
                 msg += f"   💵 {format_money(float(b['amount']))}\n\n"
-            msg += f"━━━━━━━━━━━━━━━━━━━━\n"
-            msg += f"💰 Jami: <b>{format_money(total)}</b>"
+            msg += f"━━━━━━━━━━━━━━━━━━━━\n💰 Jami: <b>{format_money(total)}</b>"
         else:
             msg += "Hali balans qo'shilmagan."
 
@@ -1130,7 +1166,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     bal_buttons = []
             if bal_buttons:
                 buttons.append(bal_buttons)
-
         buttons.append([InlineKeyboardButton("➕ Yangi balans", callback_data="add_balance")])
         buttons.append([InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")])
         await query.edit_message_text(
@@ -1151,8 +1186,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_balance_name"] = True
         type_name = BALANCE_TYPES.get(bal_type, "Boshqa")
         await query.edit_message_text(
-            f"{type_name} uchun <b>nom</b> kiriting:\n"
-            f"<i>Masalan: Kapitalbank, Naqd, Hamyon</i>",
+            f"{type_name} uchun <b>nom</b> kiriting:\n<i>Masalan: Kapitalbank, Naqd, Hamyon</i>",
             parse_mode="HTML"
         )
 
@@ -1203,7 +1237,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _save_debt(user_id, context, due_date=None, via_query=query)
 
     elif data == "back_main":
-        txns  = await get_month_transactions(user_id)
+        txns = await get_month_transactions(user_id)
         stats = calc_stats(txns)
         await query.edit_message_text(
             f"🏠 <b>Bosh menyu</b>\n\n"
@@ -1213,9 +1247,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💵 {format_money(stats['balance'])}",
             parse_mode="HTML", reply_markup=main_keyboard())
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def message_handler(update, context):
     user_id = update.effective_user.id
-    text    = update.message.text.strip()
+    text = update.message.text.strip()
 
     if not any([
         context.user_data.get("awaiting_amount"),
@@ -1240,8 +1274,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_balance_name")
         context.user_data["awaiting_balance_amount"] = True
         await update.message.reply_text(
-            f"💳 Nom: <b>{text}</b>\n\n"
-            f"💰 Hozirgi miqdorini kiriting:\n<i>Masalan: 500000</i>",
+            f"💳 Nom: <b>{text}</b>\n\n💰 Hozirgi miqdorini kiriting:\n<i>Masalan: 500000</i>",
             parse_mode="HTML"
         )
 
@@ -1250,16 +1283,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = float(text.replace(" ", "").replace(",", ""))
             if amount < 0:
                 raise ValueError
-            name     = context.user_data.get("balance_name", "")
+            name = context.user_data.get("balance_name", "")
             bal_type = context.user_data.get("balance_type", "other")
             await add_balance(user_id, name, bal_type, amount)
             for k in ("balance_name", "balance_type", "awaiting_balance_amount"):
                 context.user_data.pop(k, None)
             type_name = BALANCE_TYPES.get(bal_type, "📦 Boshqa")
             await update.message.reply_text(
-                f"✅ <b>Balans qo'shildi!</b>\n\n"
-                f"{type_name} — <b>{name}</b>\n"
-                f"💵 {format_money(amount)}",
+                f"✅ <b>Balans qo'shildi!</b>\n\n{type_name} — <b>{name}</b>\n💵 {format_money(amount)}",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("💳 Balanslar", callback_data="balances"),
@@ -1294,8 +1325,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_debt_person")
         context.user_data["awaiting_debt_amount"] = True
         await update.message.reply_text(
-            f"👤 Ism: <b>{text}</b>\n\n"
-            f"💰 Qarz miqdorini kiriting:\n<i>Masalan: 100000</i>",
+            f"👤 Ism: <b>{text}</b>\n\n💰 Qarz miqdorini kiriting:\n<i>Masalan: 100000</i>",
             parse_mode="HTML"
         )
 
@@ -1308,9 +1338,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("awaiting_debt_amount")
             context.user_data["awaiting_debt_date"] = True
             await update.message.reply_text(
-                f"💰 Miqdor: <b>{format_money(amount)}</b>\n\n"
-                f"📅 Qaytarish sanasini kiriting:\n"
-                f"<i>Masalan: 15.05.2026</i>",
+                f"💰 Miqdor: <b>{format_money(amount)}</b>\n\n📅 Qaytarish sanasini kiriting:\n<i>Masalan: 15.05.2026</i>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("⏭️ Sana yo'q", callback_data="debt_skip_date")
@@ -1322,8 +1350,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.user_data.get("awaiting_debt_date"):
         try:
             due_date = datetime.strptime(text, "%d.%m.%Y").date()
-            await _save_debt(user_id, context, due_date=due_date,
-                             reply_fn=update.message.reply_text)
+            await _save_debt(user_id, context, due_date=due_date, reply_fn=update.message.reply_text)
         except ValueError:
             await update.message.reply_text(
                 "❌ Sana formati noto'g'ri.\n<i>Masalan: 15.05.2026</i>",
@@ -1341,8 +1368,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "awaiting_note": True
             })
             await update.message.reply_text(
-                f"✅ Miqdor: <b>{format_money(amount)}</b>\n\n"
-                f"📝 Izoh qo'shmoqchimisiz? (Ixtiyoriy)",
+                f"✅ Miqdor: <b>{format_money(amount)}</b>\n\n📝 Izoh qo'shmoqchimisiz? (Ixtiyoriy)",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("⏭️ O'tkazib yuborish", callback_data="skip_note")]]))
@@ -1352,8 +1378,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML")
 
     elif context.user_data.get("awaiting_note"):
-        await _save_transaction(user_id, context, note=text,
-                                reply_fn=update.message.reply_text)
+        await _save_transaction(user_id, context, note=text, reply_fn=update.message.reply_text)
 
     elif context.user_data.get("awaiting_budget"):
         try:
@@ -1363,22 +1388,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await set_budget(user_id, budget)
             context.user_data.pop("awaiting_budget")
             await update.message.reply_text(
-                f"✅ <b>Oylik budget belgilandi!</b>\n\n"
-                f"🎯 Budget: <b>{format_money(budget)}</b>\n\n/start",
+                f"✅ <b>Oylik budget belgilandi!</b>\n\n🎯 Budget: <b>{format_money(budget)}</b>\n\n/start",
                 parse_mode="HTML")
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
 
 async def _save_debt(user_id, context, due_date=None, reply_fn=None, via_query=None):
-    person    = context.user_data.get("debt_person", "")
-    amount    = context.user_data.get("debt_amount", 0)
+    person = context.user_data.get("debt_person", "")
+    amount = context.user_data.get("debt_amount", 0)
     direction = context.user_data.get("debt_direction", "gave")
 
     for k in ("debt_person", "debt_amount", "debt_direction", "awaiting_debt_date"):
         context.user_data.pop(k, None)
 
     await add_debt(user_id, person, amount, direction, due_date)
-
     direction_text = "bergan" if direction == "gave" else "olgan"
     due_text = f"\n📅 Qaytarish: {due_date.strftime('%d.%m.%Y')}" if due_date else ""
     emoji = "🔴" if direction == "gave" else "🟢"
@@ -1393,36 +1416,43 @@ async def _save_debt(user_id, context, due_date=None, reply_fn=None, via_query=N
         InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
         InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
     ]])
-
     if via_query:
         await via_query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
     elif reply_fn:
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
 
-async def _save_transaction(user_id, context, note="",
-                            reply_fn=None, via_query=None):
-    amount   = context.user_data.get("amount")
+async def _save_transaction(user_id, context, note="", reply_fn=None, via_query=None):
+    amount = context.user_data.get("amount")
     category = context.user_data.get("category", "📦 Boshqa")
     txn_type = context.user_data.get("txn_type", "expense")
+    balance_id = context.user_data.get("selected_balance_id")
 
-    for k in ("amount", "category", "txn_type", "awaiting_amount", "awaiting_note"):
+    for k in ("amount", "category", "txn_type", "awaiting_amount", "awaiting_note", "selected_balance_id"):
         context.user_data.pop(k, None)
 
     if not amount:
         return
 
-    await add_transaction(user_id, txn_type, amount, category, note)
-    txns   = await get_month_transactions(user_id)
-    stats  = calc_stats(txns)
+    await add_transaction(user_id, txn_type, amount, category, note, balance_id)
+    txns = await get_month_transactions(user_id)
+    stats = calc_stats(txns)
     budget = await get_budget(user_id)
 
-    emoji  = "📥" if txn_type == "income" else "📤"
+    emoji = "📥" if txn_type == "income" else "📤"
     note_t = f"\n📝 Izoh: {note}" if note else ""
+
+    bal_info = ""
+    if balance_id:
+        bals = await get_balances(user_id)
+        for b in bals:
+            if b["id"] == balance_id:
+                bal_info = f"\n💳 Balans: {b['name']} → {format_money(float(b['amount']))}"
+                break
 
     msg = (
         f"✅ <b>{'Daromad' if txn_type=='income' else 'Xarajat'} saqlandi!</b>\n\n"
         f"{emoji} Miqdor    : <b>{format_money(amount)}</b>\n"
-        f"📁 Kategoriya: {category}{note_t}\n\n"
+        f"📁 Kategoriya: {category}{note_t}{bal_info}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📥 {format_money(stats['income'])}  "
         f"📤 {format_money(stats['expenses'])}  "
@@ -1435,28 +1465,25 @@ async def _save_transaction(user_id, context, note="",
         elif rem < budget * 0.2:
             msg += f"\n⚠️ Budget tugayapti! Qolgan: {format_money(rem)}"
 
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
-
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
     if via_query:
         await via_query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
     elif reply_fn:
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
 
-# ===================== WEBHOOK SERVER =====================
+# ===================== WEBHOOK =====================
 
 async def health(request):
     return web.Response(text="✅ Oson Byudjet Bot is alive!", status=200)
 
 async def webhook_handler(request, application):
-    data   = await request.json()
+    data = await request.json()
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return web.Response(status=200)
 
 async def main():
     await init_db()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -1466,7 +1493,6 @@ async def main():
 
     await app.initialize()
     await app.start()
-
     webhook_path = f"/webhook/{BOT_TOKEN}"
     await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
     logger.info(f"✅ Webhook set: {WEBHOOK_URL}{webhook_path}")
@@ -1474,13 +1500,11 @@ async def main():
     web_app = web.Application()
     web_app.router.add_get("/", health)
     web_app.router.add_post(webhook_path, lambda r: webhook_handler(r, app))
-
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     logger.info(f"🚀 Server started on port {PORT}")
-
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
