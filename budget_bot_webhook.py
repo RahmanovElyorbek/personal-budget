@@ -787,6 +787,62 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uchun: kunlik eslatmani zudlik bilan test qilish."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Bu komanda faqat admin uchun.")
+        return
+
+    await update.message.reply_text(
+        "🔔 <b>Kunlik eslatma test qilinmoqda...</b>\n\n"
+        "Barcha foydalanuvchilarga (bugun kiritmaganlariga) eslatma yuboriladi.",
+        parse_mode="HTML"
+    )
+
+    await send_daily_reminders(context.bot)
+
+    await update.message.reply_text(
+        "✅ <b>Test tugadi!</b>\n\n"
+        "Natijalarni Render logs'dan ko'ring:\n"
+        "<code>✅ Eslatmalar yuborildi: X ta</code>",
+        parse_mode="HTML"
+    )
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uchun: umumiy statistika."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Bu komanda faqat admin uchun.")
+        return
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        premium_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE is_premium = TRUE AND premium_until > NOW()"
+        )
+        today_active = await conn.fetchval("""
+            SELECT COUNT(DISTINCT telegram_id) FROM transactions
+            WHERE DATE(date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
+        """)
+        week_active = await conn.fetchval("""
+            SELECT COUNT(DISTINCT telegram_id) FROM transactions
+            WHERE date >= NOW() - INTERVAL '7 days'
+        """)
+        total_txns = await conn.fetchval("SELECT COUNT(*) FROM transactions")
+
+    msg = (
+        f"👑 <b>Admin Statistika</b>\n\n"
+        f"👥 Jami foydalanuvchilar: <b>{total_users}</b>\n"
+        f"⭐ Premium: <b>{premium_users}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 Bugun faol: <b>{today_active}</b>\n"
+        f"📊 Haftalik faol: <b>{week_active}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💳 Jami tranzaksiyalar: <b>{total_txns}</b>\n"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
@@ -1578,6 +1634,8 @@ async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("testreminder", admin_test_reminder))
+    app.add_handler(CommandHandler("adminstats", admin_stats))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
