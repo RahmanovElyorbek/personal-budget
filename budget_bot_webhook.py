@@ -534,8 +534,8 @@ def format_money(amount: float) -> str:
 
 # ===================== KLAVIATURALAR =====================
 
-def main_keyboard():
-    return InlineKeyboardMarkup([
+def main_keyboard(user_id=None):
+    buttons = [
         [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
          InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
         [InlineKeyboardButton("📊 Statistika", callback_data="stats"),
@@ -544,7 +544,11 @@ def main_keyboard():
          InlineKeyboardButton("💸 Qarzlar", callback_data="debts")],
         [InlineKeyboardButton("💳 Balanslar", callback_data="balances"),
          InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_month")],
-    ])
+    ]
+    # Admin uchun qo'shimcha tugma
+    if user_id == ADMIN_ID:
+        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(buttons)
 
 def category_keyboard(categories, txn_type):
     buttons, row = [], []
@@ -722,7 +726,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     text += "\n🎤 Ovoz yuboring yoki tugma bosing:"
     await update.message.reply_text(
-        text, parse_mode="HTML", reply_markup=main_keyboard())
+        text, parse_mode="HTML", reply_markup=main_keyboard(user.id))
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1283,6 +1287,72 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "debt_skip_date":
         await _save_debt(user_id, context, due_date=None, via_query=query)
 
+    elif data == "admin_panel":
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("❌ Ruxsat yo'q.")
+            return
+        async with db_pool.acquire() as conn:
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            premium_users = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE is_premium = TRUE AND premium_until > NOW()"
+            )
+            today_active = await conn.fetchval("""
+                SELECT COUNT(DISTINCT telegram_id) FROM transactions
+                WHERE DATE(date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
+            """)
+            week_active = await conn.fetchval("""
+                SELECT COUNT(DISTINCT telegram_id) FROM transactions
+                WHERE date >= NOW() - INTERVAL '7 days'
+            """)
+            total_txns = await conn.fetchval("SELECT COUNT(*) FROM transactions")
+
+        msg = (
+            f"👑 <b>Admin Panel</b>\n\n"
+            f"👥 Jami foydalanuvchilar: <b>{total_users}</b>\n"
+            f"⭐ Premium: <b>{premium_users}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 Bugun faol: <b>{today_active}</b>\n"
+            f"📊 Haftalik faol: <b>{week_active}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💳 Jami tranzaksiyalar: <b>{total_txns}</b>\n"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔔 Eslatma yuborish (test)", callback_data="admin_send_reminder")],
+            [InlineKeyboardButton("📢 Broadcast xabar", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")],
+        ])
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
+
+    elif data == "admin_send_reminder":
+        if user_id != ADMIN_ID:
+            return
+        await query.edit_message_text(
+            "🔔 <b>Eslatmalar yuborilmoqda...</b>\n\n"
+            "Bugun tranzaksiya kiritmagan foydalanuvchilarga eslatma boradi.",
+            parse_mode="HTML"
+        )
+        await send_daily_reminders(context.bot)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="✅ <b>Eslatmalar yuborildi!</b>\n\nNatijani Render logs'dan ko'ring.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")
+            ]])
+        )
+
+    elif data == "admin_broadcast":
+        if user_id != ADMIN_ID:
+            return
+        context.user_data["awaiting_broadcast"] = True
+        await query.edit_message_text(
+            "📢 <b>Broadcast xabar</b>\n\n"
+            "Barcha foydalanuvchilarga yubormoqchi bo'lgan xabarni yozing:\n\n"
+            "<i>HTML teglar qo'llab-quvvatlanadi (&lt;b&gt;, &lt;i&gt;, &lt;code&gt;)</i>\n\n"
+            "Bekor qilish uchun /start bosing.",
+            parse_mode="HTML"
+        )
+
     elif data == "back_main":
         txns  = await get_month_transactions(user_id)
         stats = calc_stats(txns)
@@ -1292,7 +1362,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📥 {format_money(stats['income'])}\n"
             f"📤 {format_money(stats['expenses'])}\n"
             f"💵 {format_money(stats['balance'])}",
-            parse_mode="HTML", reply_markup=main_keyboard())
+            parse_mode="HTML", reply_markup=main_keyboard(user_id))
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1308,12 +1378,46 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_balance_name"),
         context.user_data.get("awaiting_balance_amount"),
         context.user_data.get("awaiting_balance_update"),
+        context.user_data.get("awaiting_broadcast"),
     ]):
         premium = await is_user_premium(user_id)
         if not premium:
             await show_payment_screen(update, context)
             return
         await update.message.reply_text("👇 Boshlash uchun /start yuboring.")
+        return
+
+    # Broadcast xabar (faqat admin)
+    if context.user_data.get("awaiting_broadcast"):
+        context.user_data.pop("awaiting_broadcast", None)
+        if user_id != ADMIN_ID:
+            return
+        await update.message.reply_text(
+            f"📢 <b>Yuborilmoqda...</b>\n\nXabar matni:\n\n{text}",
+            parse_mode="HTML"
+        )
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT telegram_id FROM users")
+        sent = 0
+        failed = 0
+        for row in rows:
+            try:
+                await context.bot.send_message(
+                    chat_id=row["telegram_id"],
+                    text=text,
+                    parse_mode="HTML"
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"⚠️ Broadcast xato {row['telegram_id']}: {e}")
+            await asyncio.sleep(0.1)
+        await update.message.reply_text(
+            f"✅ <b>Broadcast tugadi!</b>\n\n"
+            f"📤 Yuborildi: <b>{sent}</b>\n"
+            f"❌ Xato: <b>{failed}</b>",
+            parse_mode="HTML"
+        )
         return
 
     if context.user_data.get("awaiting_balance_name"):
