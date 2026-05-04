@@ -474,13 +474,20 @@ async def mark_debt_paid(debt_id: int):
         )
 
 async def check_due_debts(telegram_id: int) -> list:
+    """/start ekranida qarz eslatmasi ko'rsatish uchun.
+    30 kun ichida yoki kechikkan qarzlarni qaytaradi."""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, person_name, amount, direction, due_date
+            SELECT id, person_name, amount, direction, due_date,
+                   (due_date - CURRENT_DATE) AS days_left
             FROM debts
             WHERE telegram_id = $1
               AND is_paid = FALSE
-              AND due_date = CURRENT_DATE
+              AND due_date IS NOT NULL
+              AND (
+                  (due_date - CURRENT_DATE) <= 30
+              )
+            ORDER BY due_date ASC
         """, telegram_id)
         return [dict(r) for r in rows]
 
@@ -513,7 +520,7 @@ async def delete_balance(balance_id: int):
 
 # ===================== PDF =====================
 
-def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str):
+def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str, transactions=None):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                            rightMargin=2*cm, leftMargin=2*cm,
@@ -527,6 +534,11 @@ def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str):
     normal_style = ParagraphStyle(
         'Normal', parent=styles['Normal'],
         fontSize=11, spaceAfter=6
+    )
+    cat_heading_style = ParagraphStyle(
+        'CatHeading', parent=styles['Heading3'],
+        fontSize=12, spaceAfter=8, spaceBefore=10,
+        textColor=colors.HexColor('#2255A8')
     )
 
     elements = []
@@ -591,6 +603,112 @@ def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str):
             ('LEFTPADDING', (0, 0), (-1, -1), 8),
         ]))
         elements.append(cat_table)
+        elements.append(Spacer(1, 0.7*cm))
+
+    # Har kategoriya bo'yicha batafsil tranzaksiyalar
+    if transactions:
+        # Tranzaksiyalarni kategoriyalar bo'yicha guruhlash
+        cat_txns = {}
+        for t in transactions:
+            cat = t.get("category", "Boshqa")
+            if cat not in cat_txns:
+                cat_txns[cat] = []
+            cat_txns[cat].append(t)
+
+        # Xarajatlar (kategoriya tartibida)
+        expense_cats = sorted(
+            [(c, ts) for c, ts in cat_txns.items() if any(t["type"] == "expense" for t in ts)],
+            key=lambda x: -sum(float(t["amount"]) for t in x[1] if t["type"] == "expense")
+        )
+
+        if expense_cats:
+            elements.append(Paragraph("Batafsil xarajatlar (izohlar bilan):", normal_style))
+            elements.append(Spacer(1, 0.3*cm))
+
+            for cat, txns in expense_cats:
+                cat_total = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+                elements.append(Paragraph(
+                    f"{cat} — {cat_total:,.0f} so'm",
+                    cat_heading_style
+                ))
+
+                detail_data = [["Sana", "Miqdor", "Izoh"]]
+                for t in txns:
+                    if t["type"] != "expense":
+                        continue
+                    date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
+                    note = t.get("note", "") or "—"
+                    if len(note) > 50:
+                        note = note[:47] + "..."
+                    detail_data.append([
+                        date_str,
+                        f"{float(t['amount']):,.0f} so'm",
+                        note
+                    ])
+
+                detail_table = Table(detail_data, colWidths=[2.5*cm, 4*cm, 10.5*cm])
+                detail_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E8EDF5')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
+                    ('FONTSIZE', (0, 0), (-1, 0), 10),
+                    ('FONTSIZE', (0, 1), (-1, -1), 9),
+                    ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                    ('GRID', (0, 0), (-1, -1), 0.3, colors.lightgrey),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#FAFBFD')]),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ]))
+                elements.append(detail_table)
+                elements.append(Spacer(1, 0.3*cm))
+
+        # Daromadlar
+        income_cats = sorted(
+            [(c, ts) for c, ts in cat_txns.items() if any(t["type"] == "income" for t in ts)],
+            key=lambda x: -sum(float(t["amount"]) for t in x[1] if t["type"] == "income")
+        )
+
+        if income_cats:
+            elements.append(Spacer(1, 0.3*cm))
+            elements.append(Paragraph("Batafsil daromadlar (izohlar bilan):", normal_style))
+            elements.append(Spacer(1, 0.3*cm))
+
+            for cat, txns in income_cats:
+                cat_total = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+                elements.append(Paragraph(
+                    f"{cat} — {cat_total:,.0f} so'm",
+                    cat_heading_style
+                ))
+
+                detail_data = [["Sana", "Miqdor", "Izoh"]]
+                for t in txns:
+                    if t["type"] != "income":
+                        continue
+                    date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
+                    note = t.get("note", "") or "—"
+                    if len(note) > 50:
+                        note = note[:47] + "..."
+                    detail_data.append([
+                        date_str,
+                        f"{float(t['amount']):,.0f} so'm",
+                        note
+                    ])
+
+                detail_table = Table(detail_data, colWidths=[2.5*cm, 4*cm, 10.5*cm])
+                detail_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E8F5E9')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#2E7D32')),
+                    ('FONTSIZE', (0, 0), (-1, 0), 10),
+                    ('FONTSIZE', (0, 1), (-1, -1), 9),
+                    ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                    ('GRID', (0, 0), (-1, -1), 0.3, colors.lightgrey),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F5FAF5')]),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ]))
+                elements.append(detail_table)
+                elements.append(Spacer(1, 0.3*cm))
 
     doc.build(elements)
     buffer.seek(0)
@@ -732,13 +850,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user(user.id, user.first_name)
 
     due_debts = await check_due_debts(user.id)
-    for debt in due_debts:
-        direction = "menga qaytarishi" if debt["direction"] == "gave" else "men qaytarishim"
+    if due_debts:
+        msg = "🔔 <b>Qarz eslatmasi!</b>\n\n"
+        overdue = [d for d in due_debts if d["days_left"] < 0]
+        today_debts = [d for d in due_debts if d["days_left"] == 0]
+        urgent = [d for d in due_debts if 0 < d["days_left"] <= 3]
+        soon = [d for d in due_debts if 3 < d["days_left"] <= 14]
+        future = [d for d in due_debts if d["days_left"] > 14]
+
+        if overdue:
+            msg += "⚠️ <b>KECHIKKAN:</b>\n"
+            for d in overdue:
+                action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                msg += f"⛔️ {d['person_name']} — {format_money(float(d['amount']))} ({abs(d['days_left'])} kun kechikdi)\n"
+            msg += "\n"
+
+        if today_debts:
+            msg += "🚨 <b>BUGUN:</b>\n"
+            for d in today_debts:
+                emoji = "🟢" if d["direction"] == "took" else "🔴"
+                action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                msg += f"{emoji} {d['person_name']} — {format_money(float(d['amount']))} ({action})\n"
+            msg += "\n"
+
+        if urgent:
+            msg += "🟠 <b>1-3 kun ichida:</b>\n"
+            for d in urgent:
+                action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                msg += f"📅 {d['days_left']} kun ({d['due_date'].strftime('%d.%m')}) — {d['person_name']}: {format_money(float(d['amount']))}\n"
+            msg += "\n"
+
+        if soon:
+            msg += "🟡 <b>1-2 hafta ichida:</b>\n"
+            for d in soon:
+                msg += f"📅 {d['days_left']} kun ({d['due_date'].strftime('%d.%m')}) — {d['person_name']}: {format_money(float(d['amount']))}\n"
+            msg += "\n"
+
+        if future:
+            msg += "🔵 <b>Kelajakda (1 oy ichida):</b>\n"
+            for d in future:
+                msg += f"📅 {d['days_left']} kun ({d['due_date'].strftime('%d.%m')}) — {d['person_name']}: {format_money(float(d['amount']))}\n"
+
         await update.message.reply_text(
-            f"🔔 <b>Qarz eslatmasi!</b>\n\n"
-            f"👤 {debt['person_name']} — {format_money(float(debt['amount']))}\n"
-            f"📅 Bugun {direction} kerak!",
-            parse_mode="HTML"
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💸 Qarzlar", callback_data="debts")
+            ]])
         )
 
     if is_new:
@@ -1098,9 +1255,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📤 {format_money(stats['expenses'])}  "
                 f"💵 {format_money(stats['balance'])}",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")
-                ]])
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+                     InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+                    [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+                ])
             )
             return
 
@@ -1170,14 +1330,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.answer("PDF tayyorlanmoqda...")
 
-        pdf_bytes = generate_stats_pdf(user_name, stats, cat_stats, budget, month_str)
+        pdf_bytes = generate_stats_pdf(user_name, stats, cat_stats, budget, month_str, transactions=txns)
 
         await context.bot.send_document(
             chat_id=user_id,
             document=io.BytesIO(pdf_bytes),
             filename=f"hisobot_{datetime.now().strftime('%Y_%m')}.pdf",
-            caption=f"📄 <b>{month_str} hisoboti</b>",
-            parse_mode="HTML"
+            caption=f"📄 <b>{month_str} hisoboti</b>\n\nDavom etish uchun tugma bosing 👇",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+                 InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+                [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+            ])
         )
 
     elif data == "history":
@@ -1866,8 +2032,12 @@ async def _save_transaction(user_id, context, note="",
         elif rem < budget * 0.2:
             msg += f"\n⚠️ Budget tugayapti! Qolgan: {format_money(rem)}"
 
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+         InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+        [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+    ])
 
     if via_query:
         await via_query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
@@ -2135,7 +2305,12 @@ async def send_weekly_reports(bot):
                     document=io.BytesIO(pdf_bytes),
                     filename=f"haftalik_hisobot_{last_monday.strftime('%Y_%m_%d')}.pdf",
                     caption=caption,
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+                         InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+                        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+                    ])
                 )
                 sent += 1
             except Exception as e:
@@ -2157,10 +2332,19 @@ async def send_weekly_reports(bot):
 
 async def send_debt_reminders(bot):
     """Har kuni 9:00 (Toshkent) da qarz eslatmalarini yuboradi.
-    Bugun yoki 3 kun ichida qaytarish kerak bo'lgan qarzlar."""
+    Bosqichma-bosqich eslatma:
+    - 30, 14, 7, 3, 2, 1 kun qolganda
+    - Bugun
+    - Kechikkan har bir kun uchun"""
     try:
+        # Eslatma yuborish kerak bo'lgan kunlar (qaytarish sanasidan kunlar farqi)
+        # 0 = bugun, manfiy = kechikkan
+        REMINDER_DAYS = [30, 14, 7, 3, 2, 1, 0]
+
         async with db_pool.acquire() as conn:
-            # Bugun + keyingi 3 kun ichida qaytarish kerak bo'lgan qarzlar
+            # Eslatma yuborish kerak bo'lgan barcha qarzlar:
+            # - days_left muhim sanada (30, 14, 7, 3, 2, 1, 0)
+            # - YOKI kechikkan (negative)
             rows = await conn.fetch("""
                 SELECT
                     d.telegram_id,
@@ -2172,25 +2356,40 @@ async def send_debt_reminders(bot):
                 FROM debts d
                 WHERE d.is_paid = FALSE
                   AND d.due_date IS NOT NULL
-                  AND d.due_date >= CURRENT_DATE
-                  AND d.due_date <= CURRENT_DATE + INTERVAL '3 days'
+                  AND (
+                      (d.due_date - CURRENT_DATE) IN (30, 14, 7, 3, 2, 1, 0)
+                      OR d.due_date < CURRENT_DATE
+                  )
                 ORDER BY d.telegram_id, d.due_date ASC
             """)
 
         if not rows:
-            logger.info("📭 Qarz eslatmasi: bugun yoki 3 kun ichida qarz yo'q")
+            logger.info("📭 Qarz eslatmasi: bugun eslatma yuborish kerak bo'lgan qarz yo'q")
             return
 
         # Foydalanuvchilar bo'yicha guruhlash
         user_debts = {}
         for r in rows:
             uid = r["telegram_id"]
+            days = r["days_left"]
             if uid not in user_debts:
-                user_debts[uid] = {"today": [], "soon": []}
-            if r["days_left"] == 0:
+                user_debts[uid] = {
+                    "overdue": [],   # kechikkan
+                    "today": [],     # bugun
+                    "urgent": [],    # 1-3 kun
+                    "soon": [],      # 7-14 kun
+                    "future": [],    # 30 kun
+                }
+            if days < 0:
+                user_debts[uid]["overdue"].append(r)
+            elif days == 0:
                 user_debts[uid]["today"].append(r)
-            else:
+            elif days <= 3:
+                user_debts[uid]["urgent"].append(r)
+            elif days <= 14:
                 user_debts[uid]["soon"].append(r)
+            else:  # 30
+                user_debts[uid]["future"].append(r)
 
         logger.info(f"💸 Qarz eslatmasi: {len(user_debts)} foydalanuvchiga yuboriladi")
 
@@ -2204,29 +2403,66 @@ async def send_debt_reminders(bot):
 
             msg = "💸 <b>Qarz eslatmasi!</b>\n\n"
 
+            # Kechikkan qarzlar
+            if debts["overdue"]:
+                msg += "⚠️ <b>KECHIKKAN!</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["overdue"]:
+                    days_late = abs(d["days_left"])
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                    msg += (
+                        f"⛔️ <b>{days_late} kun kechikdi!</b>\n"
+                        f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
+                        f"   <i>{action} kerak edi: {d['due_date'].strftime('%d.%m.%Y')}</i>\n\n"
+                    )
+
             # Bugungi qarzlar
             if debts["today"]:
-                msg += "🔴 <b>Bugun qaytarish kerak:</b>\n"
+                msg += "🚨 <b>BUGUN qaytarish kerak!</b>\n"
                 msg += "━━━━━━━━━━━━━━━━━━━━\n"
                 for d in debts["today"]:
-                    direction = "Men olganman (qaytarishim kerak)" if d["direction"] == "took" else "Men berganman (olishim kerak)"
                     emoji = "🟢" if d["direction"] == "took" else "🔴"
+                    direction = "Men olganman (qaytarishim kerak)" if d["direction"] == "took" else "Men berganman (olishim kerak)"
                     msg += (
                         f"{emoji} <b>{d['person_name']}</b> — {format_money(float(d['amount']))}\n"
                         f"   <i>{direction}</i>\n\n"
                     )
 
-            # Yaqin kunlardagi qarzlar
+            # 1-3 kun qoldi
+            if debts["urgent"]:
+                msg += "🟠 <b>Tayyorlaning:</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["urgent"]:
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                    day_word = "kun" if d["days_left"] > 1 else "kun"
+                    msg += (
+                        f"📅 <b>{d['days_left']} {day_word}</b> qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
+                        f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
+                        f"   <i>{action}</i>\n\n"
+                    )
+
+            # 7-14 kun
             if debts["soon"]:
                 msg += "🟡 <b>Yaqin kunlarda:</b>\n"
                 msg += "━━━━━━━━━━━━━━━━━━━━\n"
                 for d in debts["soon"]:
-                    days_left = d["days_left"]
-                    direction = "qaytarishingiz kerak" if d["direction"] == "took" else "olishingiz kerak"
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
                     msg += (
-                        f"📅 <b>{days_left} kun</b> qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
+                        f"📅 <b>{d['days_left']} kun</b> qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
                         f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
-                        f"   <i>{direction}</i>\n\n"
+                        f"   <i>{action}</i>\n\n"
+                    )
+
+            # 30 kun
+            if debts["future"]:
+                msg += "🔵 <b>1 oydan keyin:</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["future"]:
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                    msg += (
+                        f"📅 30 kun qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
+                        f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
+                        f"   <i>{action} kerak</i>\n\n"
                     )
 
             msg += "Qarzlarni boshqarish uchun 👇"
