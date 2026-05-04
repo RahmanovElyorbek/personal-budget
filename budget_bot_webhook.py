@@ -108,7 +108,6 @@ async def transcribe_voice(file_path: str) -> str:
                     data={
                         "model": "whisper-1",
                         "prompt": whisper_prompt,
-                        "language": "uz",  # O'zbek tilini majburlash
                     }
                 )
             if response.status_code == 200:
