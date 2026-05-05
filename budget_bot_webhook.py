@@ -1742,7 +1742,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Balansni boshqarish\n"
             "✅ Ovoz orqali kiritish 🎤\n"
             "✅ Statistika va PDF hisobot\n\n"
-            "<i>Savollar bo'lsa: @USERNAME</i>"
+            "<i>Savollar bo'lsa: @elyorbek_tech</i>"
         )
         try:
             await context.bot.send_video(
