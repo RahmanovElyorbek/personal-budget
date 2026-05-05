@@ -1121,6 +1121,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     user_id = query.from_user.id
 
+    # PDF/document yoki rasm xabaridan keyin tugma bosilganda
+    # edit_message_text ishlamaydi, shuning uchun safe wrapper
+    async def safe_edit(text, **kwargs):
+        try:
+            await query.edit_message_text(text, **kwargs)
+        except Exception:
+            # Edit ishlamasa, yangi xabar yuboramiz
+            await context.bot.send_message(
+                chat_id=user_id, text=text, **kwargs
+            )
+
     # To'lov tugmalari
     if data in ("pay_monthly", "pay_quarterly", "pay_yearly"):
         plans = {
@@ -1195,14 +1206,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "add_income":
         context.user_data["txn_type"] = "income"
-        await query.edit_message_text(
+        await safe_edit(
             "📥 <b>Daromad kategoriyasini tanlang:</b>",
             parse_mode="HTML",
             reply_markup=category_keyboard(INCOME_CATEGORIES, "income"))
 
     elif data == "add_expense":
         context.user_data["txn_type"] = "expense"
-        await query.edit_message_text(
+        await safe_edit(
             "📤 <b>Xarajat kategoriyasini tanlang:</b>",
             parse_mode="HTML",
             reply_markup=category_keyboard(EXPENSE_CATEGORIES, "expense"))
@@ -1309,7 +1320,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                 msg += f"{cat}\n  {bar} {pct}%  {format_money(amt)}\n"
 
-        await query.edit_message_text(msg, parse_mode="HTML",
+        await safe_edit(msg, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📄 PDF yuklab olish", callback_data="stats_pdf")],
                 [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]
@@ -1756,7 +1767,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "back_main":
         txns  = await get_month_transactions(user_id)
         stats = calc_stats(txns)
-        await query.edit_message_text(
+        await safe_edit(
             f"🏠 <b>Bosh menyu</b>\n\n"
             f"📅 {datetime.now().strftime('%B %Y')}\n"
             f"📥 {format_money(stats['income'])}\n"
