@@ -81,24 +81,54 @@ MONTH_NAMES = {
     9: "Sentabr", 10: "Oktabr", 11: "Noyabr", 12: "Dekabr"
 }
 
-# ===================== OVOZ TANISH =====================
-
 async def transcribe_voice(file_path: str) -> str:
-    """Whisper API orqali ovozni matnga aylantiradi.
-    O'zbek tilini yaxshi tushunishi uchun maxsus prompt qo'shilgan."""
+    """Ovozni matnga aylantiradi.
+    1. Avval gpt-4o-mini-transcribe (o'zbek tilini yaxshi biladi)
+    2. Agar ishlamasa, whisper-1 ga qaytamiz (language siz)"""
+    
+    whisper_prompt = (
+        "Bu o'zbek tilidagi moliyaviy ovoz xabari. "
+        "Oilaviy so'zlar: qizim, qizimdan, qizimga, o'g'lim, o'g'limga, "
+        "ukam, opam, akam, onam, otam, xotinim, erim. "
+        "Ismlar: Mohinur, Mohinurga, Sevara, Aziza, Malika, Madina, "
+        "Nodira, Dilnoza, Akbar, Sardor, Jasur. "
+        "Joylar: bog'cha, bog'chaga, maktab, do'kon, bozor, ish. "
+        "Xarajat: sarfladim, berdim, oldim, to'ladim, "
+        "yo'lkira, taksi, avtobus, non, sut, oziq-ovqat. "
+        "Raqamlar: ming, million, so'm, "
+        "besh ming, o'n ming, yigirma ming, o'ttiz ming, o'ttiz besh ming, "
+        "qirq ming, ellik ming, oltmish ming, yuz ming. "
+        "Misol: Qizimdan ellik ming so'm oldim. "
+        "Bog'chaga ellik ming so'm to'ladim. "
+        "Mohinurga yo'lkiraga o'ttiz besh ming so'm berdim."
+    )
+    
+    # 1-urinish: gpt-4o-mini-transcribe (o'zbek tilini yaxshi biladi)
     try:
-        # Whisper'ga yo'naltiruvchi prompt — o'zbek so'zlarini taniydi
-        whisper_prompt = (
-            "Bu o'zbek tilidagi ovoz xabari. "
-            "Asosiy so'zlar: bozor, do'kon, taksi, avtobus, benzin, mashina, "
-            "oziq-ovqat, non, go'sht, sabzavot, meva, dori, shifokor, kiyim, "
-            "ijara, kommunal, gaz, elektr, internet, telefon, "
-            "maosh, oylik, daromad, xarajat, sarfladim, berdim, oldim, to'ladim, "
-            "ming, million, so'm, dollar, "
-            "bir, ikki, uch, to'rt, besh, olti, yetti, sakkiz, to'qqiz, o'n, "
-            "yigirma, o'ttiz, qirq, ellik, oltmish, yetmish, sakson, to'qson, yuz."
-        )
-
+        async with httpx.AsyncClient(timeout=30) as client:
+            with open(file_path, "rb") as f:
+                response = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    files={"file": ("voice.ogg", f, "audio/ogg")},
+                    data={
+                        "model": "gpt-4o-mini-transcribe",
+                        "language": "uz",
+                        "prompt": whisper_prompt,
+                    }
+                )
+            if response.status_code == 200:
+                text = response.json().get("text", "")
+                logger.info(f"🎤 gpt-4o-mini-transcribe: '{text}'")
+                if text:
+                    return text
+            else:
+                logger.warning(f"gpt-4o-mini-transcribe xato: {response.text}")
+    except Exception as e:
+        logger.warning(f"gpt-4o-mini-transcribe exception: {e}")
+    
+    # 2-urinish: whisper-1 (language siz, chunki uz ni qo'llab-quvvatlamaydi)
+    try:
         async with httpx.AsyncClient(timeout=30) as client:
             with open(file_path, "rb") as f:
                 response = await client.post(
@@ -107,19 +137,19 @@ async def transcribe_voice(file_path: str) -> str:
                     files={"file": ("voice.ogg", f, "audio/ogg")},
                     data={
                         "model": "whisper-1",
-                        "language": "uz",  # ← FAQAT SHU QATORNI QO'SHING
                         "prompt": whisper_prompt,
+                        # language qo'shmaymiz - whisper-1 uz ni bilmaydi
                     }
                 )
             if response.status_code == 200:
                 text = response.json().get("text", "")
-                logger.info(f"🎤 Whisper: '{text}'")
+                logger.info(f"🎤 whisper-1 fallback: '{text}'")
                 return text
             else:
-                logger.error(f"Whisper error: {response.text}")
+                logger.error(f"whisper-1 ham xato: {response.text}")
                 return ""
     except Exception as e:
-        logger.error(f"Transcribe error: {e}")
+        logger.error(f"Transcribe to'liq xato: {e}")
         return ""
 
 
