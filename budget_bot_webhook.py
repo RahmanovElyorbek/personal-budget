@@ -107,6 +107,7 @@ async def transcribe_voice(file_path: str) -> str:
                     files={"file": ("voice.ogg", f, "audio/ogg")},
                     data={
                         "model": "whisper-1",
+                        "language": "uz",  # ← FAQAT SHU QATORNI QO'SHING
                         "prompt": whisper_prompt,
                     }
                 )
