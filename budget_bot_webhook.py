@@ -238,6 +238,115 @@ async def parse_voice_transaction(text: str) -> dict:
         logger.error(f"GPT parse error: {e}")
         return _simple_parse_fallback(text)
 
+async def analyze_receipt_image(image_bytes: bytes) -> dict:
+    """Chek rasmini GPT-4o-mini Vision orqali tahlil qiladi.
+    Voice parser bilan bir xil format qaytaradi: type, amount, category, note."""
+    
+    import base64
+    
+    # Rasmni base64'ga o'tkazish
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    
+    # Kategoriyalar ro'yxati GPT uchun
+    expense_cats = ", ".join(EXPENSE_CATEGORIES)
+    
+    system_prompt = (
+        "Sen Oson Byudjet ilovasi uchun chek rasmini tahlil qiluvchi yordamchisan.\n\n"
+        "Chek rasmidan quyidagi ma'lumotlarni aniqlab, FAQAT JSON formatida qaytar:\n\n"
+        "1. amount: chekning UMUMIY summasi (raqam, so'mda)\n"
+        "2. category: quyidagilardan ANIQ BIRINI tanlang:\n"
+        f"   {expense_cats}\n"
+        "3. merchant: savdo joyining nomi (masalan: Korzinka, Makro, Havas, Lola Bozori)\n"
+        "4. note: qisqa izoh (savdo nomi + asosiy mahsulotlar, 5-10 so'z)\n"
+        "5. confidence: 'high', 'medium' yoki 'low'\n\n"
+        "QOIDALAR:\n"
+        "- Chek rasmi emas bo'lsa: {\"error\": \"not_a_receipt\"}\n"
+        "- Summa o'qib bo'lmasa: amount=0\n"
+        "- Ruscha mahsulot nomlarini o'zbekchaga tarjima qil:\n"
+        "  Хлеб→Non, Молоко→Sut, Яблоки→Olma, Мясо→Go'sht, Сахар→Shakar\n"
+        "- Savdo turi:\n"
+        "  • Supermarket/do'kon/bozor → '🍔 Oziq-ovqat'\n"
+        "  • Dorixona/klinika → '💊 Salomatlik'\n"
+        "  • Yoqilg'i/taksi → '🚌 Transport'\n"
+        "  • Restoran/kafe → '🎮 Ko'ngil ochar'\n"
+        "  • Kommunal to'lov → '💡 Kommunal'\n"
+        "  • Aniqlanmasa → '📦 Boshqa'\n\n"
+        "Misol javob: {\"amount\":247500,\"category\":\"🍔 Oziq-ovqat\","
+        "\"merchant\":\"Korzinka Yunusobod\",\"note\":\"Korzinka: non, sut, olma\","
+        "\"confidence\":\"high\"}"
+    )
+    
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Bu chekni tahlil qil va JSON qaytar."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_b64}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 500,
+                    "response_format": {"type": "json_object"},
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"GPT Vision error: {response.text}")
+                return {"success": False, "error": "api_error"}
+            
+            content = response.json()["choices"][0]["message"]["content"]
+            logger.info(f"📸 GPT receipt response: {content}")
+            
+            import json
+            parsed = json.loads(content)
+            
+            # Chek emas
+            if "error" in parsed:
+                return {"success": False, "error": parsed["error"]}
+            
+            amount = float(parsed.get("amount", 0))
+            if amount <= 0:
+                return {"success": False, "error": "amount_not_detected"}
+            
+            # Kategoriya validatsiyasi
+            category = parsed.get("category", "📦 Boshqa")
+            if category not in EXPENSE_CATEGORIES:
+                logger.warning(f"Invalid category from GPT: {category}")
+                category = "📦 Boshqa"
+            
+            return {
+                "success": True,
+                "type": "expense",  # Chek doim xarajat
+                "amount": amount,
+                "category": category,
+                "merchant": parsed.get("merchant", ""),
+                "note": parsed.get("note", "")[:200],
+                "confidence": parsed.get("confidence", "medium"),
+            }
+            
+    except Exception as e:
+        logger.error(f"Receipt analysis error: {e}")
+        return {"success": False, "error": f"exception: {str(e)}"}
 
 def _simple_parse_fallback(text: str) -> dict:
     """GPT ishlamasa, oddiy parser orqali tahlil qiladi (zaxira)."""
@@ -1050,6 +1159,95 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=balance_select_keyboard(bals)
     )
 
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chek rasmi qabul qilib, GPT Vision orqali tahlil qiladi."""
+    user_id = update.effective_user.id
+    
+    # Premium tekshiruv
+    premium = await is_user_premium(user_id)
+    if not premium:
+        await show_payment_screen(update, context)
+        return
+    
+    msg = await update.message.reply_text(
+        "📸 Chek qabul qilindi\n"
+        "🤖 Tahlil qilinmoqda... (5-10 soniya)"
+    )
+    
+    # Eng yaxshi sifatdagi rasmni olish
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    
+    # Rasmni yuklab olish (bytes sifatida)
+    image_bytes_io = await file.download_as_bytearray()
+    image_bytes = bytes(image_bytes_io)
+    
+    # Hajm tekshiruvi (20MB limit GPT uchun, lekin 10MB'da tutaylik)
+    if len(image_bytes) > 10 * 1024 * 1024:
+        await msg.edit_text(
+            "❌ Rasm hajmi juda katta (10MB dan ortiq).\n"
+            "Kichikroq rasm yuboring."
+        )
+        return
+    
+    # GPT Vision orqali tahlil
+    result = await analyze_receipt_image(image_bytes)
+    
+    if not result["success"]:
+        error_messages = {
+            "not_a_receipt": (
+                "❌ Bu chek emas ko'rinadi.\n\n"
+                "Iltimos, do'kon yoki to'lov chekining aniq rasmini yuboring."
+            ),
+            "amount_not_detected": (
+                "❌ Chek summasini aniqlab bo'lmadi.\n\n"
+                "Rasm sifati past bo'lishi mumkin. Yorug' joyda, "
+                "to'g'ri burchakdan qaytadan suratga oling."
+            ),
+            "api_error": "❌ Tahlil xizmatida xatolik. Birozdan keyin urinib ko'ring.",
+        }
+        error_text = error_messages.get(
+            result["error"],
+            f"❌ Xatolik yuz berdi. Qaytadan urinib ko'ring."
+        )
+        await msg.edit_text(error_text)
+        return
+    
+    # Natijani context'ga saqlash (tasdiqlash uchun)
+    context.user_data["receipt_parsed"] = result
+    
+    # Tasdiqlash xabari
+    confidence_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+    conf_emoji = confidence_emoji.get(result["confidence"], "⚪")
+    
+    merchant_text = f"\n🏪 Savdo: <b>{result['merchant']}</b>" if result.get("merchant") else ""
+    
+    confirmation_text = (
+        f"🧾 <b>Chek tahlili tayyor</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📤 Tur: <b>Xarajat</b>{merchant_text}\n"
+        f"💰 Summa: <b>{format_money(result['amount'])}</b>\n"
+        f"🏷 Kategoriya: <b>{result['category']}</b>\n"
+        f"📝 Izoh: <i>{result['note']}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{conf_emoji} Ishonch: {result['confidence']}\n\n"
+        f"Tasdiqlaysizmi?"
+    )
+    
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Tasdiqlash", callback_data="receipt_confirm"),
+            InlineKeyboardButton("✏️ Tahrirlash", callback_data="receipt_edit"),
+        ],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="receipt_cancel")],
+    ])
+    
+    await msg.edit_text(
+        confirmation_text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Yordam — Oson Byudjet</b>\n\n"
@@ -1795,6 +1993,95 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chek rasmi qabul qilib, GPT Vision orqali tahlil qiladi."""
+    user_id = update.effective_user.id
+    
+    # Premium tekshiruv
+    premium = await is_user_premium(user_id)
+    if not premium:
+        await show_payment_screen(update, context)
+        return
+    
+    msg = await update.message.reply_text(
+        "📸 Chek qabul qilindi\n"
+        "🤖 Tahlil qilinmoqda... (5-10 soniya)"
+    )
+    
+    # Eng yaxshi sifatdagi rasmni olish
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    
+    # Rasmni yuklab olish (bytes sifatida)
+    image_bytes_io = await file.download_as_bytearray()
+    image_bytes = bytes(image_bytes_io)
+    
+    # Hajm tekshiruvi (20MB limit GPT uchun, lekin 10MB'da tutaylik)
+    if len(image_bytes) > 10 * 1024 * 1024:
+        await msg.edit_text(
+            "❌ Rasm hajmi juda katta (10MB dan ortiq).\n"
+            "Kichikroq rasm yuboring."
+        )
+        return
+    
+    # GPT Vision orqali tahlil
+    result = await analyze_receipt_image(image_bytes)
+    
+    if not result["success"]:
+        error_messages = {
+            "not_a_receipt": (
+                "❌ Bu chek emas ko'rinadi.\n\n"
+                "Iltimos, do'kon yoki to'lov chekining aniq rasmini yuboring."
+            ),
+            "amount_not_detected": (
+                "❌ Chek summasini aniqlab bo'lmadi.\n\n"
+                "Rasm sifati past bo'lishi mumkin. Yorug' joyda, "
+                "to'g'ri burchakdan qaytadan suratga oling."
+            ),
+            "api_error": "❌ Tahlil xizmatida xatolik. Birozdan keyin urinib ko'ring.",
+        }
+        error_text = error_messages.get(
+            result["error"],
+            f"❌ Xatolik yuz berdi. Qaytadan urinib ko'ring."
+        )
+        await msg.edit_text(error_text)
+        return
+    
+    # Natijani context'ga saqlash (tasdiqlash uchun)
+    context.user_data["receipt_parsed"] = result
+    
+    # Tasdiqlash xabari
+    confidence_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+    conf_emoji = confidence_emoji.get(result["confidence"], "⚪")
+    
+    merchant_text = f"\n🏪 Savdo: <b>{result['merchant']}</b>" if result.get("merchant") else ""
+    
+    confirmation_text = (
+        f"🧾 <b>Chek tahlili tayyor</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📤 Tur: <b>Xarajat</b>{merchant_text}\n"
+        f"💰 Summa: <b>{format_money(result['amount'])}</b>\n"
+        f"🏷 Kategoriya: <b>{result['category']}</b>\n"
+        f"📝 Izoh: <i>{result['note']}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{conf_emoji} Ishonch: {result['confidence']}\n\n"
+        f"Tasdiqlaysizmi?"
+    )
+    
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Tasdiqlash", callback_data="receipt_confirm"),
+            InlineKeyboardButton("✏️ Tahrirlash", callback_data="receipt_edit"),
+        ],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="receipt_cancel")],
+    ])
+    
+    await msg.edit_text(
+        confirmation_text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    
     elif data == "back_main":
         txns  = await get_month_transactions(user_id)
         stats = calc_stats(txns)
@@ -1821,6 +2108,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_balance_amount"),
         context.user_data.get("awaiting_balance_update"),
         context.user_data.get("awaiting_broadcast"),
+        context.user_data.get("awaiting_receipt_amount"),  # YANGI
+        context.user_data.get("awaiting_receipt_note"), 
     ]):
         premium = await is_user_premium(user_id)
         if not premium:
@@ -1995,6 +2284,43 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML")
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
+
+    elif context.user_data.get("awaiting_receipt_amount"):
+        try:
+            amount = float(text.replace(" ", "").replace(",", ""))
+            if amount <= 0:
+                raise ValueError
+            parsed = context.user_data.get("receipt_parsed", {})
+            parsed["amount"] = amount
+            context.user_data["receipt_parsed"] = parsed
+            context.user_data.pop("awaiting_receipt_amount")
+            
+            await update.message.reply_text(
+                f"✅ Summa o'zgartirildi: <b>{format_money(amount)}</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Tasdiqlash", callback_data="receipt_confirm")],
+                    [InlineKeyboardButton("✏️ Yana tahrir", callback_data="receipt_edit")],
+                    [InlineKeyboardButton("❌ Bekor", callback_data="receipt_cancel")],
+                ])
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
+    
+    elif context.user_data.get("awaiting_receipt_note"):
+        parsed = context.user_data.get("receipt_parsed", {})
+        parsed["note"] = text[:200]
+        context.user_data["receipt_parsed"] = parsed
+        context.user_data.pop("awaiting_receipt_note")
+        
+        await update.message.reply_text(
+            f"✅ Izoh yangilandi.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Tasdiqlash", callback_data="receipt_confirm")],
+                [InlineKeyboardButton("✏️ Yana tahrir", callback_data="receipt_edit")],
+                [InlineKeyboardButton("❌ Bekor", callback_data="receipt_cancel")],
+            ])
+        )
 
 async def _save_debt(user_id, context, due_date=None, reply_fn=None, via_query=None):
     person    = context.user_data.get("debt_person", "")
@@ -2632,6 +2958,7 @@ async def main():
     app.add_handler(CommandHandler("adminstats", admin_stats))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, video_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
