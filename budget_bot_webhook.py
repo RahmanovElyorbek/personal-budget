@@ -1,5 +1,5 @@
 """
-💰 Oson Byudjet Telegram Bot — v3
+💰 Oson Byudjet Telegram Bot — v4 (Chek tahlili qo'shildi)
 =======================================================
 - Supabase PostgreSQL database
 - 7 kunlik bepul sinov
@@ -7,6 +7,7 @@
 - Qarzlar ro'yxati
 - Balanslar nazorati (tranzaksiya bilan bog'langan!)
 - Ovoz orqali kiritish (OpenAI Whisper)
+- Chek rasm tahlili (GPT-4o-mini Vision)  ← YANGI
 - PDF hisobot
 """
 
@@ -17,6 +18,8 @@ import asyncpg
 import tempfile
 import httpx
 import io
+import base64
+import json
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -85,7 +88,7 @@ async def transcribe_voice(file_path: str) -> str:
     """Ovozni matnga aylantiradi.
     1. Avval gpt-4o-mini-transcribe (o'zbek tilini yaxshi biladi)
     2. Agar ishlamasa, whisper-1 ga qaytamiz (language siz)"""
-    
+
     whisper_prompt = (
         "Bu o'zbek tilidagi moliyaviy ovoz xabari. "
         "Oilaviy so'zlar: qizim, qizimdan, qizimga, o'g'lim, o'g'limga, "
@@ -102,7 +105,7 @@ async def transcribe_voice(file_path: str) -> str:
         "Bog'chaga ellik ming so'm to'ladim. "
         "Mohinurga yo'lkiraga o'ttiz besh ming so'm berdim."
     )
-    
+
     # 1-urinish: gpt-4o-mini-transcribe (o'zbek tilini yaxshi biladi)
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -126,7 +129,7 @@ async def transcribe_voice(file_path: str) -> str:
                 logger.warning(f"gpt-4o-mini-transcribe xato: {response.text}")
     except Exception as e:
         logger.warning(f"gpt-4o-mini-transcribe exception: {e}")
-    
+
     # 2-urinish: whisper-1 (language siz, chunki uz ni qo'llab-quvvatlamaydi)
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -138,7 +141,6 @@ async def transcribe_voice(file_path: str) -> str:
                     data={
                         "model": "whisper-1",
                         "prompt": whisper_prompt,
-                        # language qo'shmaymiz - whisper-1 uz ni bilmaydi
                     }
                 )
             if response.status_code == 200:
@@ -154,10 +156,9 @@ async def transcribe_voice(file_path: str) -> str:
 
 
 async def parse_voice_transaction(text: str) -> dict:
-        """GPT-4o-mini orqali matnni aniq tahlil qiladi.
-        Tur, miqdor, kategoriya — barchasini aqlli aniqlaydi."""
+    """GPT-4o-mini orqali matnni aniq tahlil qiladi.
+    Tur, miqdor, kategoriya — barchasini aqlli aniqlaydi."""
 
-    # Kategoriyalar ro'yxati GPT uchun
     expense_cats = ", ".join(EXPENSE_CATEGORIES)
     income_cats = ", ".join(INCOME_CATEGORIES)
 
@@ -204,10 +205,8 @@ async def parse_voice_transaction(text: str) -> dict:
                 content = response.json()["choices"][0]["message"]["content"]
                 logger.info(f"🤖 GPT response: {content}")
 
-                import json
                 parsed = json.loads(content)
 
-                # Tekshirish va tozalash
                 txn_type = parsed.get("type", "expense")
                 if txn_type not in ("income", "expense"):
                     txn_type = "expense"
@@ -215,12 +214,11 @@ async def parse_voice_transaction(text: str) -> dict:
                 amount = float(parsed.get("amount", 0))
 
                 category = parsed.get("category", "")
-                # Kategoriya ro'yxatda borligini tekshirish
                 valid_cats = EXPENSE_CATEGORIES if txn_type == "expense" else INCOME_CATEGORIES
                 if category not in valid_cats:
                     category = "📦 Boshqa" if txn_type == "expense" else "📦 Boshqa daromad"
 
-                note = parsed.get("note", "")[:200]  # max 200 belgi
+                note = parsed.get("note", "")[:200]
 
                 return {
                     "type": txn_type,
@@ -231,25 +229,59 @@ async def parse_voice_transaction(text: str) -> dict:
                 }
             else:
                 logger.error(f"GPT error: {response.text}")
-                # Fallback — eski oddiy parser
                 return _simple_parse_fallback(text)
 
     except Exception as e:
         logger.error(f"GPT parse error: {e}")
         return _simple_parse_fallback(text)
 
+
+def _simple_parse_fallback(text: str) -> dict:
+    """GPT ishlamasa, oddiy parser orqali tahlil qiladi (zaxira)."""
+    import re
+    text_lower = text.lower()
+
+    numbers = re.findall(r'\d+(?:[.,]\d+)?', text.replace(" ", ""))
+    amount = 0
+    for n in numbers:
+        val = float(n.replace(",", ".").replace(".", ""))
+        if val >= 100:
+            amount = val
+            break
+
+    if "ming" in text_lower or "bin" in text_lower:
+        if amount > 0 and amount < 1000:
+            amount *= 1000
+    elif "million" in text_lower or "milyon" in text_lower:
+        if amount > 0 and amount < 1000:
+            amount *= 1000000
+
+    income_words = ["maosh", "daromad", "oldim", "tushdi", "kirdi", "topdi"]
+    txn_type = "expense"
+    for w in income_words:
+        if w in text_lower:
+            txn_type = "income"
+            break
+
+    category = "📦 Boshqa daromad" if txn_type == "income" else "📦 Boshqa"
+
+    return {
+        "type": txn_type,
+        "amount": amount,
+        "category": category,
+        "note": text[:100],
+        "text": text,
+    }
+
+
 async def analyze_receipt_image(image_bytes: bytes) -> dict:
     """Chek rasmini GPT-4o-mini Vision orqali tahlil qiladi.
     Voice parser bilan bir xil format qaytaradi: type, amount, category, note."""
-    
-    import base64
-    
-    # Rasmni base64'ga o'tkazish
+
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    
-    # Kategoriyalar ro'yxati GPT uchun
+
     expense_cats = ", ".join(EXPENSE_CATEGORIES)
-    
+
     system_prompt = (
         "Sen Oson Byudjet ilovasi uchun chek rasmini tahlil qiluvchi yordamchisan.\n\n"
         "Chek rasmidan quyidagi ma'lumotlarni aniqlab, FAQAT JSON formatida qaytar:\n\n"
@@ -275,7 +307,7 @@ async def analyze_receipt_image(image_bytes: bytes) -> dict:
         "\"merchant\":\"Korzinka Yunusobod\",\"note\":\"Korzinka: non, sut, olma\","
         "\"confidence\":\"high\"}"
     )
-    
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -309,85 +341,41 @@ async def analyze_receipt_image(image_bytes: bytes) -> dict:
                     "response_format": {"type": "json_object"},
                 }
             )
-            
+
             if response.status_code != 200:
                 logger.error(f"GPT Vision error: {response.text}")
                 return {"success": False, "error": "api_error"}
-            
+
             content = response.json()["choices"][0]["message"]["content"]
             logger.info(f"📸 GPT receipt response: {content}")
-            
-            import json
+
             parsed = json.loads(content)
-            
-            # Chek emas
+
             if "error" in parsed:
                 return {"success": False, "error": parsed["error"]}
-            
+
             amount = float(parsed.get("amount", 0))
             if amount <= 0:
                 return {"success": False, "error": "amount_not_detected"}
-            
-            # Kategoriya validatsiyasi
+
             category = parsed.get("category", "📦 Boshqa")
             if category not in EXPENSE_CATEGORIES:
                 logger.warning(f"Invalid category from GPT: {category}")
                 category = "📦 Boshqa"
-            
+
             return {
                 "success": True,
-                "type": "expense",  # Chek doim xarajat
+                "type": "expense",
                 "amount": amount,
                 "category": category,
                 "merchant": parsed.get("merchant", ""),
                 "note": parsed.get("note", "")[:200],
                 "confidence": parsed.get("confidence", "medium"),
             }
-            
+
     except Exception as e:
         logger.error(f"Receipt analysis error: {e}")
         return {"success": False, "error": f"exception: {str(e)}"}
-
-def _simple_parse_fallback(text: str) -> dict:
-    """GPT ishlamasa, oddiy parser orqali tahlil qiladi (zaxira)."""
-    import re
-    text_lower = text.lower()
-
-    # Raqam topish
-    numbers = re.findall(r'\d+(?:[.,]\d+)?', text.replace(" ", ""))
-    amount = 0
-    for n in numbers:
-        val = float(n.replace(",", ".").replace(".", ""))
-        if val >= 100:
-            amount = val
-            break
-
-    # "ming/million" so'zlarini hisoblash
-    if "ming" in text_lower or "bin" in text_lower:
-        if amount > 0 and amount < 1000:
-            amount *= 1000
-    elif "million" in text_lower or "milyon" in text_lower:
-        if amount > 0 and amount < 1000:
-            amount *= 1000000
-
-    # Tur
-    income_words = ["maosh", "daromad", "oldim", "tushdi", "kirdi", "topdi"]
-    txn_type = "expense"
-    for w in income_words:
-        if w in text_lower:
-            txn_type = "income"
-            break
-
-    # Kategoriya
-    category = "📦 Boshqa daromad" if txn_type == "income" else "📦 Boshqa"
-
-    return {
-        "type": txn_type,
-        "amount": amount,
-        "category": category,
-        "note": text[:100],
-        "text": text,
-    }
 
 
 # ===================== DATABASE =====================
@@ -453,7 +441,6 @@ async def is_new_user(telegram_id: int) -> bool:
 
 async def ensure_user(telegram_id: int, name: str = ""):
     async with db_pool.acquire() as conn:
-        # Foydalanuvchi yangi bo'lsa — user yaratamiz
         was_new = await conn.fetchrow(
             "SELECT telegram_id FROM users WHERE telegram_id = $1", telegram_id
         )
@@ -463,7 +450,6 @@ async def ensure_user(telegram_id: int, name: str = ""):
             ON CONFLICT (telegram_id) DO UPDATE SET name = $2
         """, telegram_id, name)
 
-        # Yangi foydalanuvchiga avtomatik 2 ta balans
         if was_new is None:
             await conn.execute("""
                 INSERT INTO balances (telegram_id, name, type, amount)
@@ -524,13 +510,11 @@ async def add_transaction(telegram_id: int, txn_type: str,
     """Tranzaksiya qo'shish + balansni yangilash."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            # Tranzaksiyani saqlash
             await conn.execute("""
                 INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id)
                 VALUES ($1, $2, $3, $4, $5, $6)
             """, telegram_id, txn_type, amount, category, note, balance_id)
 
-            # Balansni yangilash
             if balance_id:
                 if txn_type == "income":
                     await conn.execute(
@@ -745,9 +729,7 @@ def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str, transacti
         elements.append(cat_table)
         elements.append(Spacer(1, 0.7*cm))
 
-    # Har kategoriya bo'yicha batafsil tranzaksiyalar
     if transactions:
-        # Tranzaksiyalarni kategoriyalar bo'yicha guruhlash
         cat_txns = {}
         for t in transactions:
             cat = t.get("category", "Boshqa")
@@ -755,7 +737,6 @@ def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str, transacti
                 cat_txns[cat] = []
             cat_txns[cat].append(t)
 
-        # Xarajatlar (kategoriya tartibida)
         expense_cats = sorted(
             [(c, ts) for c, ts in cat_txns.items() if any(t["type"] == "expense" for t in ts)],
             key=lambda x: -sum(float(t["amount"]) for t in x[1] if t["type"] == "expense")
@@ -802,7 +783,6 @@ def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str, transacti
                 elements.append(detail_table)
                 elements.append(Spacer(1, 0.3*cm))
 
-        # Daromadlar
         income_cats = sorted(
             [(c, ts) for c, ts in cat_txns.items() if any(t["type"] == "income" for t in ts)],
             key=lambda x: -sum(float(t["amount"]) for t in x[1] if t["type"] == "income")
@@ -883,7 +863,6 @@ def main_keyboard(user_id=None):
          InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_month")],
         [InlineKeyboardButton("📖 Qo'llanma (video)", callback_data="guide")],
     ]
-    # Admin uchun qo'shimcha tugma
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(buttons)
@@ -1001,7 +980,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if overdue:
             msg += "⚠️ <b>KECHIKKAN:</b>\n"
             for d in overdue:
-                action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
                 msg += f"⛔️ {d['person_name']} — {format_money(float(d['amount']))} ({abs(d['days_left'])} kun kechikdi)\n"
             msg += "\n"
 
@@ -1016,7 +994,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if urgent:
             msg += "🟠 <b>1-3 kun ichida:</b>\n"
             for d in urgent:
-                action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
                 msg += f"📅 {d['days_left']} kun ({d['due_date'].strftime('%d.%m')}) — {d['person_name']}: {format_money(float(d['amount']))}\n"
             msg += "\n"
 
@@ -1045,6 +1022,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Bu bot bilan:\n"
             f"✅ Daromad va xarajatlarni yozing\n"
             f"✅ Ovoz orqali kiritish 🎤\n"
+            f"✅ Chek rasmini yuboring — avtomatik tahlil 📸\n"
             f"✅ Oylik statistika va PDF hisobot\n"
             f"✅ Byudjet belgilang va nazorat qiling\n"
             f"✅ Qarzlarni kuzating\n"
@@ -1103,7 +1081,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 {bar} {int(stats['expenses']/budget*100)}%\n"
             f"✅ Qolgan : <b>{format_money(max(remaining, 0))}</b>\n"
         )
-    text += "\n🎤 Ovoz yuboring yoki tugma bosing:"
+    text += "\n🎤 Ovoz yuboring, 📸 chek rasmini yuboring yoki tugma bosing:"
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_keyboard(user.id))
 
@@ -1139,7 +1117,6 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Balanslarni olish
     bals = await get_balances(user_id)
 
     context.user_data["voice_parsed"] = parsed
@@ -1159,40 +1136,36 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=balance_select_keyboard(bals)
     )
 
+
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Chek rasmi qabul qilib, GPT Vision orqali tahlil qiladi."""
     user_id = update.effective_user.id
-    
-    # Premium tekshiruv
+
     premium = await is_user_premium(user_id)
     if not premium:
         await show_payment_screen(update, context)
         return
-    
+
     msg = await update.message.reply_text(
         "📸 Chek qabul qilindi\n"
         "🤖 Tahlil qilinmoqda... (5-10 soniya)"
     )
-    
-    # Eng yaxshi sifatdagi rasmni olish
+
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
-    
-    # Rasmni yuklab olish (bytes sifatida)
+
     image_bytes_io = await file.download_as_bytearray()
     image_bytes = bytes(image_bytes_io)
-    
-    # Hajm tekshiruvi (20MB limit GPT uchun, lekin 10MB'da tutaylik)
+
     if len(image_bytes) > 10 * 1024 * 1024:
         await msg.edit_text(
             "❌ Rasm hajmi juda katta (10MB dan ortiq).\n"
             "Kichikroq rasm yuboring."
         )
         return
-    
-    # GPT Vision orqali tahlil
+
     result = await analyze_receipt_image(image_bytes)
-    
+
     if not result["success"]:
         error_messages = {
             "not_a_receipt": (
@@ -1212,16 +1185,14 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await msg.edit_text(error_text)
         return
-    
-    # Natijani context'ga saqlash (tasdiqlash uchun)
+
     context.user_data["receipt_parsed"] = result
-    
-    # Tasdiqlash xabari
+
     confidence_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}
     conf_emoji = confidence_emoji.get(result["confidence"], "⚪")
-    
+
     merchant_text = f"\n🏪 Savdo: <b>{result['merchant']}</b>" if result.get("merchant") else ""
-    
+
     confirmation_text = (
         f"🧾 <b>Chek tahlili tayyor</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1233,7 +1204,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{conf_emoji} Ishonch: {result['confidence']}\n\n"
         f"Tasdiqlaysizmi?"
     )
-    
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Tasdiqlash", callback_data="receipt_confirm"),
@@ -1241,12 +1212,13 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("❌ Bekor qilish", callback_data="receipt_cancel")],
     ])
-    
+
     await msg.edit_text(
         confirmation_text,
         parse_mode="HTML",
         reply_markup=keyboard
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1254,6 +1226,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — Bosh menyu\n/help — Yordam\n\n"
         "➕ Daromad/Xarajat kiritish\n"
         "🎤 Ovoz orqali kiritish\n"
+        "📸 Chek rasm orqali kiritish\n"
         "💳 Balanslar bilan bog'langan\n"
         "📊 Statistika va PDF hisobot\n"
         "💸 Qarzlar ro'yxati\n"
@@ -1266,7 +1239,6 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin video yuborsa, file_id ni qaytaradi (qo'llanma videosini sozlash uchun)."""
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        # Oddiy foydalanuvchiga video yuborishni hali qabul qilmaymiz
         return
 
     video = update.message.video or update.message.document
@@ -1350,18 +1322,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     user_id = query.from_user.id
 
-    # PDF/document yoki rasm xabaridan keyin tugma bosilganda
-    # edit_message_text ishlamaydi, shuning uchun safe wrapper
     async def safe_edit(text, **kwargs):
         try:
             await query.edit_message_text(text, **kwargs)
         except Exception:
-            # Edit ishlamasa, yangi xabar yuboramiz
             await context.bot.send_message(
                 chat_id=user_id, text=text, **kwargs
             )
 
-    # To'lov tugmalari
     if data in ("pay_monthly", "pay_quarterly", "pay_yearly"):
         plans = {
             "pay_monthly":   ("Oylik",   PRICE_MONTHLY,   30),
@@ -1427,7 +1395,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Premium tekshiruv
     premium = await is_user_premium(user_id)
     if not premium:
         await show_payment_screen(update, context)
@@ -1455,7 +1422,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "category": category,
             "txn_type": txn_type,
         })
-        # Kategoriya tanlangach balans tanlash chiqadi
         bals = await get_balances(user_id)
         emoji = "📥" if txn_type == "income" else "📤"
         action = "qaysi balansga tushadi" if txn_type == "income" else "qaysi balansdan chiqadi"
@@ -1470,7 +1436,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["balance_id"] = balance_id
         context.user_data["awaiting_amount"] = True
 
-        # Voice rejimidan kelgan bo'lsa — to'g'ri saqlash
         if context.user_data.get("voice_parsed"):
             parsed = context.user_data["voice_parsed"]
             await add_transaction(
@@ -1504,12 +1469,129 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Oddiy rejim — miqdor so'rash
         emoji = "📥" if context.user_data.get("txn_type") == "income" else "📤"
         await query.edit_message_text(
             f"{emoji} <b>Kategoriya:</b> {context.user_data.get('category')}\n\n"
             f"💬 Miqdorni kiriting (faqat raqam):\n<i>Masalan: 50000</i>",
             parse_mode="HTML")
+
+    elif data == "receipt_confirm":
+        parsed = context.user_data.get("receipt_parsed")
+        if not parsed:
+            await query.edit_message_text("❌ Ma'lumot topilmadi. /start bosing.")
+            return
+
+        context.user_data["voice_parsed"] = {
+            "type": parsed["type"],
+            "amount": parsed["amount"],
+            "category": parsed["category"],
+            "note": parsed["note"],
+            "text": parsed.get("merchant", "Chek tahlili"),
+        }
+        context.user_data.pop("receipt_parsed", None)
+
+        bals = await get_balances(user_id)
+        await query.edit_message_text(
+            f"✅ Tasdiqlandi\n\n"
+            f"📤 {format_money(parsed['amount'])}\n"
+            f"🏷 {parsed['category']}\n\n"
+            f"💳 Qaysi balansdan chiqdi?",
+            parse_mode="HTML",
+            reply_markup=balance_select_keyboard(bals)
+        )
+
+    elif data == "receipt_cancel":
+        context.user_data.pop("receipt_parsed", None)
+        await query.edit_message_text(
+            "❌ Chek tahlili bekor qilindi.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")
+            ]])
+        )
+
+    elif data == "receipt_edit":
+        parsed = context.user_data.get("receipt_parsed")
+        if not parsed:
+            await query.edit_message_text("❌ Ma'lumot topilmadi. /start bosing.")
+            return
+
+        await query.edit_message_text(
+            f"✏️ <b>Nimani tahrirlamoqchisiz?</b>\n\n"
+            f"💰 Summa: {format_money(parsed['amount'])}\n"
+            f"🏷 Kategoriya: {parsed['category']}\n"
+            f"📝 Izoh: {parsed['note']}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Summa", callback_data="receipt_edit_amount")],
+                [InlineKeyboardButton("🏷 Kategoriya", callback_data="receipt_edit_category")],
+                [InlineKeyboardButton("📝 Izoh", callback_data="receipt_edit_note")],
+                [
+                    InlineKeyboardButton("✅ Saqlash", callback_data="receipt_confirm"),
+                    InlineKeyboardButton("❌ Bekor", callback_data="receipt_cancel"),
+                ],
+            ])
+        )
+
+    elif data == "receipt_edit_amount":
+        context.user_data["awaiting_receipt_amount"] = True
+        await query.edit_message_text(
+            "💰 Yangi summani kiriting:\n<i>Masalan: 247500</i>",
+            parse_mode="HTML"
+        )
+
+    elif data == "receipt_edit_category":
+        buttons, row = [], []
+        for i, cat in enumerate(EXPENSE_CATEGORIES):
+            row.append(InlineKeyboardButton(cat, callback_data=f"rcat_{i}"))
+            if len(row) == 2:
+                buttons.append(row); row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="receipt_edit")])
+
+        await query.edit_message_text(
+            "🏷 <b>Yangi kategoriyani tanlang:</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif data.startswith("rcat_"):
+        idx = int(data.split("_")[1])
+        new_category = EXPENSE_CATEGORIES[idx]
+        parsed = context.user_data.get("receipt_parsed", {})
+        parsed["category"] = new_category
+        context.user_data["receipt_parsed"] = parsed
+
+        confidence_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+        conf_emoji = confidence_emoji.get(parsed.get("confidence", "medium"), "⚪")
+        merchant_text = f"\n🏪 Savdo: <b>{parsed.get('merchant', '')}</b>" if parsed.get("merchant") else ""
+
+        await query.edit_message_text(
+            f"🧾 <b>Chek tahlili (tahrirlangan)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📤 Tur: <b>Xarajat</b>{merchant_text}\n"
+            f"💰 Summa: <b>{format_money(parsed['amount'])}</b>\n"
+            f"🏷 Kategoriya: <b>{parsed['category']}</b> ✏️\n"
+            f"📝 Izoh: <i>{parsed['note']}</i>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{conf_emoji} Ishonch: {parsed.get('confidence', 'medium')}\n\n"
+            f"Tasdiqlaysizmi?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Tasdiqlash", callback_data="receipt_confirm"),
+                    InlineKeyboardButton("✏️ Yana tahrir", callback_data="receipt_edit"),
+                ],
+                [InlineKeyboardButton("❌ Bekor", callback_data="receipt_cancel")],
+            ])
+        )
+
+    elif data == "receipt_edit_note":
+        context.user_data["awaiting_receipt_note"] = True
+        await query.edit_message_text(
+            "📝 Yangi izohni kiriting:",
+            parse_mode="HTML"
+        )
 
     elif data == "stats":
         txns   = await get_month_transactions(user_id)
@@ -1617,10 +1699,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             for t in txns:
                 emoji = "📥" if t["type"] == "income" else "📤"
-                date  = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
+                date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
                 bal   = f" | 💳 {t['balance_name']}" if t.get("balance_name") else ""
                 note  = f" — {t['note']}" if t.get("note") else ""
-                msg  += f"{emoji} <b>{format_money(float(t['amount']))}</b>\n   📁 {t.get('category','Boshqa')}{bal} | 📅 {date}{note}\n\n"
+                msg  += f"{emoji} <b>{format_money(float(t['amount']))}</b>\n   📁 {t.get('category','Boshqa')}{bal} | 📅 {date_str}{note}\n\n"
 
         await query.edit_message_text(
             msg, parse_mode="HTML",
@@ -1907,7 +1989,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         async with db_pool.acquire() as conn:
-            # Balansi umuman yo'q foydalanuvchilarni topamiz
             users_without_balance = await conn.fetch("""
                 SELECT u.telegram_id, u.name
                 FROM users u
@@ -1951,7 +2032,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "guide":
-        # Qo'llanma videosini yuborish
         if not GUIDE_VIDEO_FILE_ID:
             await query.edit_message_text(
                 "📖 <b>Qo'llanma</b>\n\n"
@@ -1993,95 +2073,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chek rasmi qabul qilib, GPT Vision orqali tahlil qiladi."""
-    user_id = update.effective_user.id
-    
-    # Premium tekshiruv
-    premium = await is_user_premium(user_id)
-    if not premium:
-        await show_payment_screen(update, context)
-        return
-    
-    msg = await update.message.reply_text(
-        "📸 Chek qabul qilindi\n"
-        "🤖 Tahlil qilinmoqda... (5-10 soniya)"
-    )
-    
-    # Eng yaxshi sifatdagi rasmni olish
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    
-    # Rasmni yuklab olish (bytes sifatida)
-    image_bytes_io = await file.download_as_bytearray()
-    image_bytes = bytes(image_bytes_io)
-    
-    # Hajm tekshiruvi (20MB limit GPT uchun, lekin 10MB'da tutaylik)
-    if len(image_bytes) > 10 * 1024 * 1024:
-        await msg.edit_text(
-            "❌ Rasm hajmi juda katta (10MB dan ortiq).\n"
-            "Kichikroq rasm yuboring."
-        )
-        return
-    
-    # GPT Vision orqali tahlil
-    result = await analyze_receipt_image(image_bytes)
-    
-    if not result["success"]:
-        error_messages = {
-            "not_a_receipt": (
-                "❌ Bu chek emas ko'rinadi.\n\n"
-                "Iltimos, do'kon yoki to'lov chekining aniq rasmini yuboring."
-            ),
-            "amount_not_detected": (
-                "❌ Chek summasini aniqlab bo'lmadi.\n\n"
-                "Rasm sifati past bo'lishi mumkin. Yorug' joyda, "
-                "to'g'ri burchakdan qaytadan suratga oling."
-            ),
-            "api_error": "❌ Tahlil xizmatida xatolik. Birozdan keyin urinib ko'ring.",
-        }
-        error_text = error_messages.get(
-            result["error"],
-            f"❌ Xatolik yuz berdi. Qaytadan urinib ko'ring."
-        )
-        await msg.edit_text(error_text)
-        return
-    
-    # Natijani context'ga saqlash (tasdiqlash uchun)
-    context.user_data["receipt_parsed"] = result
-    
-    # Tasdiqlash xabari
-    confidence_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}
-    conf_emoji = confidence_emoji.get(result["confidence"], "⚪")
-    
-    merchant_text = f"\n🏪 Savdo: <b>{result['merchant']}</b>" if result.get("merchant") else ""
-    
-    confirmation_text = (
-        f"🧾 <b>Chek tahlili tayyor</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📤 Tur: <b>Xarajat</b>{merchant_text}\n"
-        f"💰 Summa: <b>{format_money(result['amount'])}</b>\n"
-        f"🏷 Kategoriya: <b>{result['category']}</b>\n"
-        f"📝 Izoh: <i>{result['note']}</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{conf_emoji} Ishonch: {result['confidence']}\n\n"
-        f"Tasdiqlaysizmi?"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Tasdiqlash", callback_data="receipt_confirm"),
-            InlineKeyboardButton("✏️ Tahrirlash", callback_data="receipt_edit"),
-        ],
-        [InlineKeyboardButton("❌ Bekor qilish", callback_data="receipt_cancel")],
-    ])
-    
-    await msg.edit_text(
-        confirmation_text,
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-    
     elif data == "back_main":
         txns  = await get_month_transactions(user_id)
         stats = calc_stats(txns)
@@ -2108,8 +2099,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_balance_amount"),
         context.user_data.get("awaiting_balance_update"),
         context.user_data.get("awaiting_broadcast"),
-        context.user_data.get("awaiting_receipt_amount"),  # YANGI
-        context.user_data.get("awaiting_receipt_note"), 
+        context.user_data.get("awaiting_receipt_amount"),
+        context.user_data.get("awaiting_receipt_note"),
     ]):
         premium = await is_user_premium(user_id)
         if not premium:
@@ -2118,7 +2109,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👇 Boshlash uchun /start yuboring.")
         return
 
-    # Broadcast xabar (faqat admin)
     if context.user_data.get("awaiting_broadcast"):
         context.user_data.pop("awaiting_broadcast", None)
         if user_id != ADMIN_ID:
@@ -2294,7 +2284,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parsed["amount"] = amount
             context.user_data["receipt_parsed"] = parsed
             context.user_data.pop("awaiting_receipt_amount")
-            
+
             await update.message.reply_text(
                 f"✅ Summa o'zgartirildi: <b>{format_money(amount)}</b>",
                 parse_mode="HTML",
@@ -2306,13 +2296,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
-    
+
     elif context.user_data.get("awaiting_receipt_note"):
         parsed = context.user_data.get("receipt_parsed", {})
         parsed["note"] = text[:200]
         context.user_data["receipt_parsed"] = parsed
         context.user_data.pop("awaiting_receipt_note")
-        
+
         await update.message.reply_text(
             f"✅ Izoh yangilandi.",
             reply_markup=InlineKeyboardMarkup([
@@ -2374,7 +2364,6 @@ async def _save_transaction(user_id, context, note="",
     emoji  = "📥" if txn_type == "income" else "📤"
     note_t = f"\n📝 Izoh: {note}" if note else ""
 
-    # Balans nomini olish
     bal_text = ""
     if balance_id:
         async with db_pool.acquire() as conn:
@@ -2412,7 +2401,7 @@ async def _save_transaction(user_id, context, note="",
     elif reply_fn:
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
 
-# ===================== KUNLIK ESLATMA =====================
+# ===================== HAFTALIK PDF =====================
 
 def generate_weekly_pdf(user_name, week_data, week_start, week_end):
     """Haftalik hisobot uchun chiroyli PDF yaratadi."""
@@ -2441,7 +2430,6 @@ def generate_weekly_pdf(user_name, week_data, week_start, week_end):
 
     elements = []
 
-    # Sarlavha
     elements.append(Paragraph("Haftalik Moliyaviy Hisobot", title_style))
     elements.append(Paragraph(
         f"Foydalanuvchi: {user_name} | "
@@ -2450,7 +2438,6 @@ def generate_weekly_pdf(user_name, week_data, week_start, week_end):
     ))
     elements.append(Spacer(1, 0.3*cm))
 
-    # Umumiy ma'lumot
     income = week_data['income']
     expense = week_data['expense']
     balance = income - expense
@@ -2483,7 +2470,6 @@ def generate_weekly_pdf(user_name, week_data, week_start, week_end):
     elements.append(summary_table)
     elements.append(Spacer(1, 0.7*cm))
 
-    # Kategoriyalar bo'yicha
     if week_data['categories']:
         elements.append(Paragraph("Kategoriyalar bo'yicha xarajatlar:", heading_style))
         cat_data = [["Kategoriya", "Miqdor", "Foiz"]]
@@ -2506,7 +2492,6 @@ def generate_weekly_pdf(user_name, week_data, week_start, week_end):
         elements.append(cat_table)
         elements.append(Spacer(1, 0.7*cm))
 
-    # Kunlik xarajatlar
     if week_data['daily']:
         elements.append(Paragraph("Kunlik xarajatlar:", heading_style))
         daily_data = [["Kun", "Xarajat", "Tranzaksiya"]]
@@ -2536,7 +2521,6 @@ def generate_weekly_pdf(user_name, week_data, week_start, week_end):
         ]))
         elements.append(daily_table)
 
-    # Pastki qismda izoh
     elements.append(Spacer(1, 1*cm))
     footer_style = ParagraphStyle(
         'Footer', parent=styles['Normal'],
@@ -2556,14 +2540,11 @@ async def send_weekly_reports(bot):
     """Har Dushanba ertalab 9:00 da o'tgan haftaning hisobotini yuboradi."""
     try:
         async with db_pool.acquire() as conn:
-            # Barcha foydalanuvchilarni olish
             users = await conn.fetch("SELECT telegram_id, name FROM users")
 
         logger.info(f"📊 Haftalik hisobot: {len(users)} foydalanuvchiga yuboriladi")
 
-        # O'tgan hafta sanalari (Dushanbadan Yakshanbagacha)
         today = datetime.now(pytz.timezone("Asia/Tashkent")).date()
-        # Bugun Dushanba, o'tgan hafta — 7 kun oldin Dushanbadan 1 kun oldin Yakshanbagacha
         last_monday = today - timedelta(days=7)
         last_sunday = today - timedelta(days=1)
 
@@ -2575,13 +2556,11 @@ async def send_weekly_reports(bot):
             user_id = user["telegram_id"]
             name = user["name"] or "Do'stim"
 
-            # Premium/sinov tekshiruvi
             premium = await is_user_premium(user_id)
             if not premium:
                 skipped += 1
                 continue
 
-            # O'tgan hafta ma'lumotlari
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch("""
                     SELECT type, amount, category, date
@@ -2591,7 +2570,6 @@ async def send_weekly_reports(bot):
                       AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
                 """, user_id, last_monday, last_sunday)
 
-            # Agar o'tgan hafta tranzaksiya bo'lmasa — motivatsion xabar yuboramiz
             if not rows:
                 try:
                     await bot.send_message(
@@ -2616,7 +2594,6 @@ async def send_weekly_reports(bot):
                 await asyncio.sleep(0.1)
                 continue
 
-            # Ma'lumotlarni guruhlash
             income = 0.0
             expense = 0.0
             categories = {}
@@ -2630,10 +2607,8 @@ async def send_weekly_reports(bot):
                     income += amt
                 else:
                     expense += amt
-                    # Kategoriya
                     cat = r["category"] or "Boshqa"
                     categories[cat] = categories.get(cat, 0) + amt
-                    # Kunlik
                     if tx_date not in daily:
                         daily[tx_date] = {"amount": 0, "count": 0}
                     daily[tx_date]["amount"] += amt
@@ -2647,7 +2622,6 @@ async def send_weekly_reports(bot):
                 "daily": daily,
             }
 
-            # PDF yaratish
             try:
                 pdf_bytes = generate_weekly_pdf(
                     name, week_data,
@@ -2685,7 +2659,7 @@ async def send_weekly_reports(bot):
                 failed += 1
                 logger.warning(f"⚠️ PDF xato {user_id}: {e}")
 
-            await asyncio.sleep(0.15)  # Rate limit
+            await asyncio.sleep(0.15)
 
         logger.info(
             f"✅ Haftalik hisobot: {sent} yuborildi | "
@@ -2699,20 +2673,9 @@ async def send_weekly_reports(bot):
 # ===================== KUNLIK ESLATMA =====================
 
 async def send_debt_reminders(bot):
-    """Har kuni 9:00 (Toshkent) da qarz eslatmalarini yuboradi.
-    Bosqichma-bosqich eslatma:
-    - 30, 14, 7, 3, 2, 1 kun qolganda
-    - Bugun
-    - Kechikkan har bir kun uchun"""
+    """Har kuni 9:00 (Toshkent) da qarz eslatmalarini yuboradi."""
     try:
-        # Eslatma yuborish kerak bo'lgan kunlar (qaytarish sanasidan kunlar farqi)
-        # 0 = bugun, manfiy = kechikkan
-        REMINDER_DAYS = [30, 14, 7, 3, 2, 1, 0]
-
         async with db_pool.acquire() as conn:
-            # Eslatma yuborish kerak bo'lgan barcha qarzlar:
-            # - days_left muhim sanada (30, 14, 7, 3, 2, 1, 0)
-            # - YOKI kechikkan (negative)
             rows = await conn.fetch("""
                 SELECT
                     d.telegram_id,
@@ -2735,18 +2698,17 @@ async def send_debt_reminders(bot):
             logger.info("📭 Qarz eslatmasi: bugun eslatma yuborish kerak bo'lgan qarz yo'q")
             return
 
-        # Foydalanuvchilar bo'yicha guruhlash
         user_debts = {}
         for r in rows:
             uid = r["telegram_id"]
             days = r["days_left"]
             if uid not in user_debts:
                 user_debts[uid] = {
-                    "overdue": [],   # kechikkan
-                    "today": [],     # bugun
-                    "urgent": [],    # 1-3 kun
-                    "soon": [],      # 7-14 kun
-                    "future": [],    # 30 kun
+                    "overdue": [],
+                    "today": [],
+                    "urgent": [],
+                    "soon": [],
+                    "future": [],
                 }
             if days < 0:
                 user_debts[uid]["overdue"].append(r)
@@ -2756,7 +2718,7 @@ async def send_debt_reminders(bot):
                 user_debts[uid]["urgent"].append(r)
             elif days <= 14:
                 user_debts[uid]["soon"].append(r)
-            else:  # 30
+            else:
                 user_debts[uid]["future"].append(r)
 
         logger.info(f"💸 Qarz eslatmasi: {len(user_debts)} foydalanuvchiga yuboriladi")
@@ -2764,14 +2726,12 @@ async def send_debt_reminders(bot):
         sent = 0
         failed = 0
         for uid, debts in user_debts.items():
-            # Premium tekshiruvi
             premium = await is_user_premium(uid)
             if not premium:
                 continue
 
             msg = "💸 <b>Qarz eslatmasi!</b>\n\n"
 
-            # Kechikkan qarzlar
             if debts["overdue"]:
                 msg += "⚠️ <b>KECHIKKAN!</b>\n"
                 msg += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -2784,7 +2744,6 @@ async def send_debt_reminders(bot):
                         f"   <i>{action} kerak edi: {d['due_date'].strftime('%d.%m.%Y')}</i>\n\n"
                     )
 
-            # Bugungi qarzlar
             if debts["today"]:
                 msg += "🚨 <b>BUGUN qaytarish kerak!</b>\n"
                 msg += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -2796,20 +2755,17 @@ async def send_debt_reminders(bot):
                         f"   <i>{direction}</i>\n\n"
                     )
 
-            # 1-3 kun qoldi
             if debts["urgent"]:
                 msg += "🟠 <b>Tayyorlaning:</b>\n"
                 msg += "━━━━━━━━━━━━━━━━━━━━\n"
                 for d in debts["urgent"]:
                     action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
-                    day_word = "kun" if d["days_left"] > 1 else "kun"
                     msg += (
-                        f"📅 <b>{d['days_left']} {day_word}</b> qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
+                        f"📅 <b>{d['days_left']} kun</b> qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
                         f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
                         f"   <i>{action}</i>\n\n"
                     )
 
-            # 7-14 kun
             if debts["soon"]:
                 msg += "🟡 <b>Yaqin kunlarda:</b>\n"
                 msg += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -2821,7 +2777,6 @@ async def send_debt_reminders(bot):
                         f"   <i>{action}</i>\n\n"
                     )
 
-            # 30 kun
             if debts["future"]:
                 msg += "🔵 <b>1 oydan keyin:</b>\n"
                 msg += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -2862,7 +2817,6 @@ async def send_daily_reminders(bot):
     """Har kuni 20:00 (Toshkent) da bugun xarajat kiritmaganlarga eslatma yuboradi."""
     try:
         async with db_pool.acquire() as conn:
-            # Bugun tranzaksiya kiritmagan foydalanuvchilarni topish
             rows = await conn.fetch("""
                 SELECT u.telegram_id, u.name
                 FROM users u
@@ -2881,12 +2835,10 @@ async def send_daily_reminders(bot):
             user_id = row["telegram_id"]
             name = row["name"] or "Do'stim"
 
-            # Premium yoki sinov muddati tekshirish
             premium = await is_user_premium(user_id)
             if not premium:
-                continue  # Muddati tugaganlarga yubormaymiz
+                continue
 
-            # Haftalik statistika (shu hafta)
             async with db_pool.acquire() as conn:
                 week_row = await conn.fetchrow("""
                     SELECT
@@ -2929,7 +2881,6 @@ async def send_daily_reminders(bot):
                 failed += 1
                 logger.warning(f"⚠️ Eslatma yuborilmadi {user_id}: {e}")
 
-            # Telegram rate limit: sekundiga 30 xabar chegarasidan pastda qolamiz
             await asyncio.sleep(0.1)
 
         logger.info(f"✅ Eslatmalar yuborildi: {sent} ta | ❌ Xato: {failed} ta")
@@ -2969,7 +2920,6 @@ async def main():
     await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
     logger.info(f"✅ Webhook set: {WEBHOOK_URL}{webhook_path}")
 
-    # Kunlik eslatma scheduler (20:00 Toshkent vaqti)
     scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Tashkent"))
     scheduler.add_job(
         send_daily_reminders,
@@ -2980,7 +2930,6 @@ async def main():
         id="daily_reminder",
         replace_existing=True,
     )
-    # Qarz eslatmasi (har kuni ertalab 9:00)
     scheduler.add_job(
         send_debt_reminders,
         trigger="cron",
@@ -2990,7 +2939,6 @@ async def main():
         id="debt_reminder",
         replace_existing=True,
     )
-    # Haftalik hisobot (Dushanba ertalab 9:01 — qarz eslatmasidan keyin)
     scheduler.add_job(
         send_weekly_reports,
         trigger="cron",
