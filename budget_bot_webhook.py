@@ -154,8 +154,8 @@ async def transcribe_voice(file_path: str) -> str:
 
 
 async def parse_voice_transaction(text: str) -> dict:
-    """GPT-4o-mini orqali matnni aniq tahlil qiladi.
-    Tur, miqdor, kategoriya — barchasini aqlli aniqlaydi."""
+        """GPT-4o-mini orqali matnni aniq tahlil qiladi.
+        Tur, miqdor, kategoriya — barchasini aqlli aniqlaydi."""
 
     # Kategoriyalar ro'yxati GPT uchun
     expense_cats = ", ".join(EXPENSE_CATEGORIES)
