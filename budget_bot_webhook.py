@@ -2409,4 +2409,619 @@ async def _save_transaction(user_id, context, note="",
     balance_id = context.user_data.get("balance_id")
 
     for k in ("amount", "category", "txn_type", "balance_id",
-       
+              "awaiting_amount", "awaiting_note"):
+        context.user_data.pop(k, None)
+
+    if not amount:
+        return
+
+    await add_transaction(user_id, txn_type, amount, category, note, balance_id)
+    txns   = await get_month_transactions(user_id)
+    stats  = calc_stats(txns)
+    budget = await get_budget(user_id)
+
+    emoji  = "📥" if txn_type == "income" else "📤"
+    note_t = f"\n📝 Izoh: {note}" if note else ""
+
+    bal_text = ""
+    if balance_id:
+        async with db_pool.acquire() as conn:
+            bal = await conn.fetchrow(
+                "SELECT name, amount FROM balances WHERE id = $1", balance_id
+            )
+            if bal:
+                bal_text = f"\n💳 Balans: <b>{bal['name']}</b> — {format_money(float(bal['amount']))}"
+
+    msg = (
+        f"✅ <b>{'Daromad' if txn_type=='income' else 'Xarajat'} saqlandi!</b>\n\n"
+        f"{emoji} Miqdor    : <b>{format_money(amount)}</b>\n"
+        f"📁 Kategoriya: {category}{note_t}{bal_text}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 {format_money(stats['income'])}  "
+        f"📤 {format_money(stats['expenses'])}  "
+        f"💵 {format_money(stats['balance'])}\n"
+    )
+    if budget > 0 and txn_type == "expense":
+        rem = budget - stats["expenses"]
+        if rem < 0:
+            msg += f"\n⚠️ <b>Budget {format_money(abs(rem))} oshib ketdi!</b>"
+        elif rem < budget * 0.2:
+            msg += f"\n⚠️ Budget tugayapti! Qolgan: {format_money(rem)}"
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+         InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+        [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+    ])
+
+    if via_query:
+        await via_query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
+    elif reply_fn:
+        await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
+
+# ===================== HAFTALIK PDF =====================
+
+def generate_weekly_pdf(user_name, week_data, week_start, week_end):
+    """Haftalik hisobot uchun chiroyli PDF yaratadi."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                           rightMargin=2*cm, leftMargin=2*cm,
+                           topMargin=2*cm, bottomMargin=2*cm)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'Title', parent=styles['Title'],
+        fontSize=18, spaceAfter=10, textColor=colors.HexColor('#2255A8')
+    )
+    subtitle_style = ParagraphStyle(
+        'Subtitle', parent=styles['Normal'],
+        fontSize=13, spaceAfter=15, textColor=colors.HexColor('#666666')
+    )
+    normal_style = ParagraphStyle(
+        'Normal', parent=styles['Normal'],
+        fontSize=11, spaceAfter=6
+    )
+    heading_style = ParagraphStyle(
+        'Heading', parent=styles['Heading2'],
+        fontSize=13, spaceAfter=10, textColor=colors.HexColor('#2255A8')
+    )
+
+    elements = []
+
+    elements.append(Paragraph("Haftalik Moliyaviy Hisobot", title_style))
+    elements.append(Paragraph(
+        f"Foydalanuvchi: {user_name} | "
+        f"Davr: {week_start.strftime('%d.%m.%Y')} - {week_end.strftime('%d.%m.%Y')}",
+        subtitle_style
+    ))
+    elements.append(Spacer(1, 0.3*cm))
+
+    income = week_data['income']
+    expense = week_data['expense']
+    balance = income - expense
+    balance_status = "+" if balance >= 0 else ""
+
+    summary_data = [
+        ["Ko'rsatkich", "Miqdor"],
+        ["Jami daromad", f"{income:,.0f} so'm"],
+        ["Jami xarajat", f"{expense:,.0f} so'm"],
+        ["Sof natija", f"{balance_status}{balance:,.0f} so'm"],
+    ]
+    if week_data['tx_count'] > 0:
+        avg_daily = expense / 7
+        summary_data.append(["Kunlik o'rtacha xarajat", f"{avg_daily:,.0f} so'm"])
+        summary_data.append(["Tranzaksiyalar soni", f"{week_data['tx_count']} ta"])
+
+    summary_table = Table(summary_data, colWidths=[10*cm, 7*cm])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('FONTSIZE', (0, 1), (-1, -1), 11),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F4FF')]),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    elements.append(summary_table)
+    elements.append(Spacer(1, 0.7*cm))
+
+    if week_data['categories']:
+        elements.append(Paragraph("Kategoriyalar bo'yicha xarajatlar:", heading_style))
+        cat_data = [["Kategoriya", "Miqdor", "Foiz"]]
+        total_exp = expense if expense > 0 else 1
+        for cat, amt in sorted(week_data['categories'].items(), key=lambda x: -x[1]):
+            pct = int(amt / total_exp * 100)
+            cat_data.append([cat, f"{amt:,.0f} so'm", f"{pct}%"])
+        cat_table = Table(cat_data, colWidths=[9*cm, 6*cm, 2*cm])
+        cat_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('ALIGN', (1, 0), (2, -1), 'RIGHT'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F4FF')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(cat_table)
+        elements.append(Spacer(1, 0.7*cm))
+
+    if week_data['daily']:
+        elements.append(Paragraph("Kunlik xarajatlar:", heading_style))
+        daily_data = [["Kun", "Xarajat", "Tranzaksiya"]]
+        day_names_uz = {
+            0: "Dushanba", 1: "Seshanba", 2: "Chorshanba",
+            3: "Payshanba", 4: "Juma", 5: "Shanba", 6: "Yakshanba"
+        }
+        for day_date, day_info in sorted(week_data['daily'].items()):
+            day_name = day_names_uz.get(day_date.weekday(), "")
+            date_str = f"{day_name}, {day_date.strftime('%d.%m')}"
+            daily_data.append([
+                date_str,
+                f"{day_info['amount']:,.0f} so'm",
+                f"{day_info['count']} ta"
+            ])
+        daily_table = Table(daily_data, colWidths=[7*cm, 6*cm, 4*cm])
+        daily_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2255A8')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('ALIGN', (1, 0), (2, -1), 'RIGHT'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F4FF')]),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(daily_table)
+
+    elements.append(Spacer(1, 1*cm))
+    footer_style = ParagraphStyle(
+        'Footer', parent=styles['Normal'],
+        fontSize=9, textColor=colors.HexColor('#888888'), alignment=1
+    )
+    elements.append(Paragraph(
+        "Oson Byudjet — Shaxsiy moliya yordamchingiz | @monthbudget_bot",
+        footer_style
+    ))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+async def send_weekly_reports(bot):
+    """Har Dushanba ertalab 9:00 da o'tgan haftaning hisobotini yuboradi."""
+    try:
+        async with db_pool.acquire() as conn:
+            users = await conn.fetch("SELECT telegram_id, name FROM users")
+
+        logger.info(f"📊 Haftalik hisobot: {len(users)} foydalanuvchiga yuboriladi")
+
+        today = datetime.now(pytz.timezone("Asia/Tashkent")).date()
+        last_monday = today - timedelta(days=7)
+        last_sunday = today - timedelta(days=1)
+
+        sent = 0
+        failed = 0
+        skipped = 0
+
+        for user in users:
+            user_id = user["telegram_id"]
+            name = user["name"] or "Do'stim"
+
+            premium = await is_user_premium(user_id)
+            if not premium:
+                skipped += 1
+                continue
+
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT type, amount, category, date
+                    FROM transactions
+                    WHERE telegram_id = $1
+                      AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
+                      AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
+                """, user_id, last_monday, last_sunday)
+
+            if not rows:
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"📊 <b>Haftalik hisobot</b>\n\n"
+                            f"Assalomu alaykum, {name}!\n\n"
+                            f"📅 {last_monday.strftime('%d.%m')} - {last_sunday.strftime('%d.%m.%Y')}\n\n"
+                            f"O'tgan haftada hech qanday xarajat kiritmadingiz 📭\n\n"
+                            f"Moliyaviy nazorat — boy bo'lishning birinchi qadami!\n"
+                            f"Bu haftadan boshlab xarajatlaringizni yozib boring 💪"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("➕ Xarajat qo'shish", callback_data="add_expense")
+                        ]])
+                    )
+                    sent += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"⚠️ Haftalik xabar yuborilmadi {user_id}: {e}")
+                await asyncio.sleep(0.1)
+                continue
+
+            income = 0.0
+            expense = 0.0
+            categories = {}
+            daily = {}
+
+            for r in rows:
+                amt = float(r["amount"])
+                tx_date = r["date"].astimezone(pytz.timezone("Asia/Tashkent")).date()
+
+                if r["type"] == "income":
+                    income += amt
+                else:
+                    expense += amt
+                    cat = r["category"] or "Boshqa"
+                    categories[cat] = categories.get(cat, 0) + amt
+                    if tx_date not in daily:
+                        daily[tx_date] = {"amount": 0, "count": 0}
+                    daily[tx_date]["amount"] += amt
+                    daily[tx_date]["count"] += 1
+
+            week_data = {
+                "income": income,
+                "expense": expense,
+                "tx_count": len(rows),
+                "categories": categories,
+                "daily": daily,
+            }
+
+            try:
+                pdf_bytes = generate_weekly_pdf(
+                    name, week_data,
+                    last_monday, last_sunday
+                )
+
+                balance = income - expense
+                balance_emoji = "✅" if balance >= 0 else "⚠️"
+                top_cat = max(categories.items(), key=lambda x: x[1])[0] if categories else "—"
+
+                caption = (
+                    f"📊 <b>Haftalik hisobot</b>\n\n"
+                    f"📅 {last_monday.strftime('%d.%m')} - {last_sunday.strftime('%d.%m.%Y')}\n\n"
+                    f"📥 Daromad: <b>{format_money(income)}</b>\n"
+                    f"📤 Xarajat: <b>{format_money(expense)}</b>\n"
+                    f"{balance_emoji} Natija: <b>{format_money(balance)}</b>\n\n"
+                    f"🏆 Eng ko'p: {top_cat}\n\n"
+                    f"📄 To'liq tahlil PDF faylda ⬆️"
+                )
+
+                await bot.send_document(
+                    chat_id=user_id,
+                    document=io.BytesIO(pdf_bytes),
+                    filename=f"haftalik_hisobot_{last_monday.strftime('%Y_%m_%d')}.pdf",
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+                         InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+                        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+                    ])
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"⚠️ PDF xato {user_id}: {e}")
+
+            await asyncio.sleep(0.15)
+
+        logger.info(
+            f"✅ Haftalik hisobot: {sent} yuborildi | "
+            f"❌ {failed} xato | ⏭️ {skipped} o'tkazildi"
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Haftalik hisobot xato: {e}")
+
+
+# ===================== KUNLIK ESLATMA =====================
+
+async def send_debt_reminders(bot):
+    """Har kuni 9:00 (Toshkent) da qarz eslatmalarini yuboradi."""
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT
+                    d.telegram_id,
+                    d.person_name,
+                    d.amount,
+                    d.direction,
+                    d.due_date,
+                    (d.due_date - CURRENT_DATE) AS days_left
+                FROM debts d
+                WHERE d.is_paid = FALSE
+                  AND d.due_date IS NOT NULL
+                  AND (
+                      (d.due_date - CURRENT_DATE) IN (30, 14, 7, 3, 2, 1, 0)
+                      OR d.due_date < CURRENT_DATE
+                  )
+                ORDER BY d.telegram_id, d.due_date ASC
+            """)
+
+        if not rows:
+            logger.info("📭 Qarz eslatmasi: bugun eslatma yuborish kerak bo'lgan qarz yo'q")
+            return
+
+        user_debts = {}
+        for r in rows:
+            uid = r["telegram_id"]
+            days = r["days_left"]
+            if uid not in user_debts:
+                user_debts[uid] = {
+                    "overdue": [],
+                    "today": [],
+                    "urgent": [],
+                    "soon": [],
+                    "future": [],
+                }
+            if days < 0:
+                user_debts[uid]["overdue"].append(r)
+            elif days == 0:
+                user_debts[uid]["today"].append(r)
+            elif days <= 3:
+                user_debts[uid]["urgent"].append(r)
+            elif days <= 14:
+                user_debts[uid]["soon"].append(r)
+            else:
+                user_debts[uid]["future"].append(r)
+
+        logger.info(f"💸 Qarz eslatmasi: {len(user_debts)} foydalanuvchiga yuboriladi")
+
+        sent = 0
+        failed = 0
+        for uid, debts in user_debts.items():
+            premium = await is_user_premium(uid)
+            if not premium:
+                continue
+
+            msg = "💸 <b>Qarz eslatmasi!</b>\n\n"
+
+            if debts["overdue"]:
+                msg += "⚠️ <b>KECHIKKAN!</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["overdue"]:
+                    days_late = abs(d["days_left"])
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                    msg += (
+                        f"⛔️ <b>{days_late} kun kechikdi!</b>\n"
+                        f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
+                        f"   <i>{action} kerak edi: {d['due_date'].strftime('%d.%m.%Y')}</i>\n\n"
+                    )
+
+            if debts["today"]:
+                msg += "🚨 <b>BUGUN qaytarish kerak!</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["today"]:
+                    emoji = "🟢" if d["direction"] == "took" else "🔴"
+                    direction = "Men olganman (qaytarishim kerak)" if d["direction"] == "took" else "Men berganman (olishim kerak)"
+                    msg += (
+                        f"{emoji} <b>{d['person_name']}</b> — {format_money(float(d['amount']))}\n"
+                        f"   <i>{direction}</i>\n\n"
+                    )
+
+            if debts["urgent"]:
+                msg += "🟠 <b>Tayyorlaning:</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["urgent"]:
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                    msg += (
+                        f"📅 <b>{d['days_left']} kun</b> qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
+                        f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
+                        f"   <i>{action}</i>\n\n"
+                    )
+
+            if debts["soon"]:
+                msg += "🟡 <b>Yaqin kunlarda:</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["soon"]:
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                    msg += (
+                        f"📅 <b>{d['days_left']} kun</b> qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
+                        f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
+                        f"   <i>{action}</i>\n\n"
+                    )
+
+            if debts["future"]:
+                msg += "🔵 <b>1 oydan keyin:</b>\n"
+                msg += "━━━━━━━━━━━━━━━━━━━━\n"
+                for d in debts["future"]:
+                    action = "qaytarishingiz" if d["direction"] == "took" else "olishingiz"
+                    msg += (
+                        f"📅 30 kun qoldi — {d['due_date'].strftime('%d.%m.%Y')}\n"
+                        f"👤 {d['person_name']} — {format_money(float(d['amount']))}\n"
+                        f"   <i>{action} kerak</i>\n\n"
+                    )
+
+            msg += "Qarzlarni boshqarish uchun 👇"
+
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💸 Qarzlar", callback_data="debts")],
+                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+            ])
+
+            try:
+                await bot.send_message(
+                    chat_id=uid, text=msg,
+                    parse_mode="HTML", reply_markup=markup
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"⚠️ Qarz eslatmasi yuborilmadi {uid}: {e}")
+
+            await asyncio.sleep(0.1)
+
+        logger.info(f"✅ Qarz eslatmalari: {sent} yuborildi | ❌ {failed} xato")
+
+    except Exception as e:
+        logger.error(f"❌ Qarz eslatmasi funksiyasida xato: {e}")
+
+
+async def send_daily_reminders(bot):
+    """Har kuni 20:00 (Toshkent) da bugun xarajat kiritmaganlarga eslatma yuboradi."""
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT u.telegram_id, u.name
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM transactions t
+                    WHERE t.telegram_id = u.telegram_id
+                      AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
+                )
+            """)
+
+        logger.info(f"📬 Eslatma yuboriladi: {len(rows)} foydalanuvchi")
+
+        sent = 0
+        failed = 0
+        for row in rows:
+            user_id = row["telegram_id"]
+            name = row["name"] or "Do'stim"
+
+            premium = await is_user_premium(user_id)
+            if not premium:
+                continue
+
+            async with db_pool.acquire() as conn:
+                week_row = await conn.fetchrow("""
+                    SELECT
+                        COALESCE(SUM(CASE WHEN type='income' THEN amount END), 0) AS income,
+                        COALESCE(SUM(CASE WHEN type='expense' THEN amount END), 0) AS expense
+                    FROM transactions
+                    WHERE telegram_id = $1
+                      AND date >= DATE_TRUNC('week', NOW())
+                """, user_id)
+
+            income = float(week_row["income"])
+            expense = float(week_row["expense"])
+            balance = income - expense
+
+            msg = (
+                f"🌙 <b>Assalomu alaykum, {name}!</b>\n\n"
+                f"Bugun hali xarajat yoki daromad kiritmadingiz 📝\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>Bu hafta:</b>\n"
+                f"📥 Daromad: <b>{format_money(income)}</b>\n"
+                f"📤 Xarajat: <b>{format_money(expense)}</b>\n"
+                f"💵 Balans: <b>{format_money(balance)}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Hoziroq qo'shishni unutmang! 👇"
+            )
+
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+                 InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+                [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+            ])
+
+            try:
+                await bot.send_message(
+                    chat_id=user_id, text=msg,
+                    parse_mode="HTML", reply_markup=markup
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"⚠️ Eslatma yuborilmadi {user_id}: {e}")
+
+            await asyncio.sleep(0.1)
+
+        logger.info(f"✅ Eslatmalar yuborildi: {sent} ta | ❌ Xato: {failed} ta")
+
+    except Exception as e:
+        logger.error(f"❌ Eslatma funksiyasida xato: {e}")
+
+# ===================== WEBHOOK =====================
+
+async def health(request):
+    return web.Response(text="✅ Oson Byudjet Bot is alive!", status=200)
+
+async def webhook_handler(request, application):
+    data   = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return web.Response(status=200)
+
+async def main():
+    await init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("testreminder", admin_test_reminder))
+    app.add_handler(CommandHandler("adminstats", admin_stats))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, video_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    await app.initialize()
+    await app.start()
+
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+    await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
+    logger.info(f"✅ Webhook set: {WEBHOOK_URL}{webhook_path}")
+
+    scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Tashkent"))
+    scheduler.add_job(
+        send_daily_reminders,
+        trigger="cron",
+        hour=20,
+        minute=0,
+        args=[app.bot],
+        id="daily_reminder",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        send_debt_reminders,
+        trigger="cron",
+        hour=9,
+        minute=0,
+        args=[app.bot],
+        id="debt_reminder",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        send_weekly_reports,
+        trigger="cron",
+        day_of_week="mon",
+        hour=9,
+        minute=1,
+        args=[app.bot],
+        id="weekly_report",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("🔔 Scheduler: kunlik 20:00 + qarz 9:00 + haftalik Dushanba 9:01 (Asia/Tashkent)")
+
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    web_app.router.add_post(webhook_path, lambda r: webhook_handler(r, app))
+
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🚀 Server started on port {PORT}")
+
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
