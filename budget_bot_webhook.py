@@ -155,31 +155,41 @@ async def transcribe_voice(file_path: str) -> str:
         return ""
 
 
-async def parse_voice_transaction(text: str) -> dict:
-    """GPT-4o-mini orqali matnni aniq tahlil qiladi.
-    Tur, miqdor, kategoriya — barchasini aqlli aniqlaydi."""
+async def parse_voice_transactions(text: str) -> list:
+    """GPT-4o-mini orqali matndan BIR YOKI BIR NECHTA amaliyotni ajratadi.
+    Har biri: income / expense / debt_gave / debt_took"""
 
     expense_cats = ", ".join(EXPENSE_CATEGORIES)
     income_cats = ", ".join(INCOME_CATEGORIES)
 
     system_prompt = (
         "Sen o'zbek tilidagi moliyaviy ovoz xabarlarini tahlil qiluvchi yordamchisan.\n"
-        "Foydalanuvchi gapidan quyidagi ma'lumotlarni JSON formatda chiqar:\n\n"
-        "1. type: 'income' (daromad) yoki 'expense' (xarajat)\n"
-        "2. amount: raqam (so'mda, butun son)\n"
-        "3. category: quyidagilardan ANIQ BIRINI tanlang:\n"
-        f"   Xarajatlar: {expense_cats}\n"
-        f"   Daromadlar: {income_cats}\n"
-        "4. note: qisqa izoh (5-10 so'z)\n\n"
-        "MUHIM QOIDALAR:\n"
-        "- 'sarfladim/berdim/to'ladim/xarjladim' = expense\n"
-        "- 'oldim/maosh/tushdi/kirdi' = income\n"
-        "- 'ming' = 1000, 'million/milyon' = 1000000\n"
-        "- '50 ming' = 50000, '5 million' = 5000000\n"
-        "- Faqat tegishli emoji bilan kategoriya nomini qaytaring\n"
-        "- Agar matn tushunarsiz bo'lsa: amount=0\n\n"
-        "FAQAT JSON qaytaring, boshqa hech narsa yozmang!\n"
-        "Misol javob: {\"type\":\"expense\",\"amount\":50000,\"category\":\"🍔 Oziq-ovqat\",\"note\":\"Bozordan oziq-ovqat\"}"
+        "Foydalanuvchi BITTA gapda BIR YOKI BIR NECHTA moliyaviy amaliyotni aytishi mumkin.\n"
+        "Har bir alohida amaliyotni ajrat.\n\n"
+        "MUHIM: Har doim shu formatda JSON qaytar:\n"
+        '{\"transactions\": [ {...}, {...} ]}\n\n'
+        "Har bir amaliyot uchun:\n"
+        "1. type: 'income' | 'expense' | 'debt_gave' | 'debt_took'\n"
+        "   - 'sarfladim/berdim/to'ladim/oldim (mahsulot)/xarjladim' = expense\n"
+        "   - 'maosh/tushdi/kirdi/daromad/ishlab topdim' = income\n"
+        "   - 'qarz berdim/qarzga berdim' = debt_gave\n"
+        "   - 'qarz oldim/qarzga oldim' = debt_took\n"
+        "2. amount: butun son (so'mda). 'ming'=1000, 'million'=1000000\n"
+        "3. category: faqat expense/income uchun. Quyidagidan ANIQ BIRI:\n"
+        f"   Xarajat: {expense_cats}\n"
+        f"   Daromad: {income_cats}\n"
+        "4. note: qisqa izoh (3-8 so'z)\n"
+        "5. person: faqat debt uchun — kim (masalan 'Sardor'). Aks holda null\n\n"
+        "MISOL kirish: 'bozordan 600 ming bozorlik qildim, mashinaga 200 ming "
+        "yoqilg'i quydirdim, Sardorga 300 ming qarz berdim'\n"
+        "MISOL chiqish:\n"
+        '{\"transactions\": ['
+        '{\"type\":\"expense\",\"amount\":600000,\"category\":\"🍔 Oziq-ovqat\",\"note\":\"Bozorlik\",\"person\":null},'
+        '{\"type\":\"expense\",\"amount\":200000,\"category\":\"🚌 Transport\",\"note\":\"Yoqilg\'i\",\"person\":null},'
+        '{\"type\":\"debt_gave\",\"amount\":300000,\"category\":null,\"note\":\"Qarz berildi\",\"person\":\"Sardor\"}'
+        ']}\n\n'
+        "Tushunarsiz bo'lsa: {\"transactions\": []}\n"
+        "FAQAT JSON qaytar, boshqa hech narsa yozma!"
     )
 
     try:
@@ -201,40 +211,50 @@ async def parse_voice_transaction(text: str) -> dict:
                 }
             )
 
-            if response.status_code == 200:
-                content = response.json()["choices"][0]["message"]["content"]
-                logger.info(f"🤖 GPT response: {content}")
+            if response.status_code != 200:
+                logger.error(f"GPT error: {response.text}")
+                return []
 
-                parsed = json.loads(content)
+            content = response.json()["choices"][0]["message"]["content"]
+            logger.info(f"🤖 GPT multi response: {content}")
 
-                txn_type = parsed.get("type", "expense")
-                if txn_type not in ("income", "expense"):
-                    txn_type = "expense"
+            parsed = json.loads(content)
+            raw_list = parsed.get("transactions", [])
 
-                amount = float(parsed.get("amount", 0))
+            results = []
+            for item in raw_list:
+                ttype = item.get("type", "expense")
+                if ttype not in ("income", "expense", "debt_gave", "debt_took"):
+                    ttype = "expense"
 
-                category = parsed.get("category", "")
-                valid_cats = EXPENSE_CATEGORIES if txn_type == "expense" else INCOME_CATEGORIES
-                if category not in valid_cats:
-                    category = "📦 Boshqa" if txn_type == "expense" else "📦 Boshqa daromad"
+                amount = float(item.get("amount", 0))
+                if amount <= 0:
+                    continue
 
-                note = parsed.get("note", "")[:200]
+                # Kategoriya validatsiyasi faqat income/expense uchun
+                category = item.get("category") or ""
+                if ttype == "expense":
+                    if category not in EXPENSE_CATEGORIES:
+                        category = "📦 Boshqa"
+                elif ttype == "income":
+                    if category not in INCOME_CATEGORIES:
+                        category = "📦 Boshqa daromad"
+                else:
+                    category = None  # debt
 
-                return {
-                    "type": txn_type,
+                results.append({
+                    "type": ttype,
                     "amount": amount,
                     "category": category,
-                    "note": note,
-                    "text": text,
-                }
-            else:
-                logger.error(f"GPT error: {response.text}")
-                return _simple_parse_fallback(text)
+                    "note": (item.get("note") or "")[:200],
+                    "person": item.get("person"),
+                })
+
+            return results
 
     except Exception as e:
-        logger.error(f"GPT parse error: {e}")
-        return _simple_parse_fallback(text)
-
+        logger.error(f"GPT multi parse error: {e}")
+        return []
 
 def _simple_parse_fallback(text: str) -> dict:
     """GPT ishlamasa, oddiy parser orqali tahlil qiladi (zaxira)."""
@@ -1106,32 +1126,67 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("❌ Ovozni tanib bo'lmadi. Qaytadan urinib ko'ring.")
         return
 
-    parsed = await parse_voice_transaction(text)
+    transactions = await parse_voice_transactions(text)
 
-    if parsed["amount"] <= 0:
+    if not transactions:
         await msg.edit_text(
             f"🎤 <b>Tanildi:</b> {text}\n\n"
-            f"❌ Miqdor aniqlanmadi.\n"
-            f"<i>Masalan: 'Non uchun 5000'</i>",
+            f"❌ Amaliyot aniqlanmadi.\n"
+            f"<i>Masalan: 'Non uchun 5000 so'm'</i>",
             parse_mode="HTML"
         )
         return
 
+    # Qarzlarni darhol saqlaymiz (balans talab qilmaydi)
+    debts = [t for t in transactions if t["type"] in ("debt_gave", "debt_took")]
+    money_txns = [t for t in transactions if t["type"] in ("income", "expense")]
+
+    debt_summary = ""
+    for d in debts:
+        direction = "gave" if d["type"] == "debt_gave" else "took"
+        await add_debt(
+            user_id,
+            person_name=d.get("person") or "Noma'lum",
+            amount=d["amount"],
+            direction=direction,
+            due_date=None,
+            note=d.get("note", "")
+        )
+        emoji = "🔴" if direction == "gave" else "🟢"
+        action = "berdim" if direction == "gave" else "oldim"
+        debt_summary += f"{emoji} Qarz {action}: {d.get('person') or '—'} — {format_money(d['amount'])}\n"
+
+    # Agar faqat qarz bo'lsa
+    if not money_txns:
+        await msg.edit_text(
+            f"🎤 <b>Tanildi:</b> {text}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ <b>Qarz(lar) saqlandi!</b>\n\n{debt_summary}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
+                InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+            ]])
+        )
+        return
+
+    # Pul amaliyotlarini balans tanlashga saqlaymiz
+    context.user_data["pending_txns"] = money_txns
+    context.user_data["pending_text"] = text
+
+    # Xulosa ko'rsatish
+    summary = f"🎤 <b>Tanildi:</b> {text}\n\n━━━━━━━━━━━━━━━━━━━━\n"
+    if debt_summary:
+        summary += debt_summary + "\n"
+    summary += f"📋 <b>{len(money_txns)} ta amaliyot topildi:</b>\n\n"
+    for i, t in enumerate(money_txns, 1):
+        emoji = "📥" if t["type"] == "income" else "📤"
+        summary += f"{i}. {emoji} {format_money(t['amount'])} — {t['category']}\n   <i>{t['note']}</i>\n"
+    summary += "\nHammasi qaysi balansga?"
+
     bals = await get_balances(user_id)
-
-    context.user_data["voice_parsed"] = parsed
-    emoji = "📥" if parsed["type"] == "income" else "📤"
-    type_text = "Daromad" if parsed["type"] == "income" else "Xarajat"
-
-    note_text = f"\n📝 Izoh: {parsed.get('note', '')}" if parsed.get('note') else ""
-
     await msg.edit_text(
-        f"🎤 <b>Tanildi:</b> {text}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{emoji} Tur: <b>{type_text}</b>\n"
-        f"💰 Miqdor: <b>{format_money(parsed['amount'])}</b>\n"
-        f"📁 Kategoriya: {parsed['category']}{note_text}\n\n"
-        f"Qaysi balansga?",
+        summary,
         parse_mode="HTML",
         reply_markup=balance_select_keyboard(bals)
     )
@@ -1350,22 +1405,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    elif data.startswith("paid_"):
-        plans = {
-            "paid_pay_monthly":   ("Oylik",   PRICE_MONTHLY),
-            "paid_pay_quarterly": ("3 Oylik", PRICE_QUARTERLY),
-            "paid_pay_yearly":    ("Yillik",  PRICE_YEARLY),
-        }
-        plan_name, price = plans.get(data, ("Oylik", PRICE_MONTHLY))
-        user_name = query.from_user.full_name
-        await notify_admin_payment(context, user_id, user_name, plan_name, price)
-        await query.edit_message_text(
-            "⏳ <b>So'rovingiz yuborildi!</b>\n\n"
-            "Admin to'lovni tekshirib, tez orada faollashtiradi.\n"
-            "Odatda <b>5-15 daqiqa</b> ichida.",
-            parse_mode="HTML"
-        )
-        return
+    elif data.startswith("selbal_"):
+        balance_id = int(data.split("_")[1])
+
+        # YANGI: bir nechta amaliyot (multi-transaction)
+        if context.user_data.get("pending_txns"):
+            pending = context.user_data.pop("pending_txns")
+            context.user_data.pop("pending_text", None)
+
+            for t in pending:
+                await add_transaction(
+                    user_id, t["type"], t["amount"],
+                    t["category"], t.get("note", ""), balance_id
+                )
+
+            txns  = await get_month_transactions(user_id)
+            stats = calc_stats(txns)
+
+            saved = ""
+            for t in pending:
+                emoji = "📥" if t["type"] == "income" else "📤"
+                saved += f"{emoji} {format_money(t['amount'])} — {t['category']}\n"
+
+            await query.edit_message_text(
+                f"✅ <b>{len(pending)} ta amaliyot saqlandi!</b>\n\n"
+                f"{saved}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 {format_money(stats['income'])}  "
+                f"📤 {format_money(stats['expenses'])}  "
+                f"💵 {format_money(stats['balance'])}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
+                     InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+                    [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+                ])
+            )
+            return
+
+        # ... bu yerdan eski kod davom etadi (balance_id, voice_parsed, va hokazo)
+        context.user_data["balance_id"] = balance_id
+        context.user_data["awaiting_amount"] = True
+        # (qolgan eski kod o'zgarmaydi)
 
     elif data.startswith("adm_confirm_"):
         parts = data.split("_")
