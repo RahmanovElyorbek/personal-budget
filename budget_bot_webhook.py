@@ -85,43 +85,18 @@ MONTH_NAMES = {
 }
 
 async def transcribe_voice(file_path: str) -> str:
-    """Ovozni matnga aylantiradi.
-    1. Avval gpt-4o-mini-transcribe (o'zbek tilini yaxshi biladi)
-    2. Agar ishlamasa, whisper-1 ga qaytamiz (language siz)"""
+    """Ovozni matnga aylantiradi (whisper-1 + tr til kodi)."""
 
     whisper_prompt = (
         "Bu o'zbek tilidagi moliyaviy ovoz xabari. "
-        "Raqamlar: ming, million, so'm. "
-        "Misol: Bozordan yuz ming so'm xarid qildim. "
-        "Sardorga ikki yuz ming so'm qarz berdim."
+        "Raqamlar so'mda: ming, ikki ming, besh ming, o'n ming, "
+        "ellik ming, yuz ming, ikki yuz ming, uch yuz ming, "
+        "to'rt yuz ming, besh yuz ming, olti yuz ming, million. "
+        "Misol: Bozordan olti yuz ming so'mga xarid qildim. "
+        "Sardorga to'rt yuz ming so'm qarz berdim. "
+        "Mashinaga ikki yuz ming yoqilg'i quydirdim."
     )
 
-    # 1-urinish: gpt-4o-mini-transcribe (o'zbek tilini yaxshi biladi)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            with open(file_path, "rb") as f:
-                response = await client.post(
-                    "https://api.openai.com/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    files={"file": ("voice.ogg", f, "audio/ogg")},
-                    data={
-                        "model": "gpt-4o-mini-transcribe",
-                        "language": "uz",
-                        "prompt": whisper_prompt,
-                        "temperature": 0,
-                    }
-                )
-            if response.status_code == 200:
-                text = response.json().get("text", "")
-                logger.info(f"🎤 gpt-4o-mini-transcribe: '{text}'")
-                if text:
-                    return text
-            else:
-                logger.warning(f"gpt-4o-mini-transcribe xato: {response.text}")
-    except Exception as e:
-        logger.warning(f"gpt-4o-mini-transcribe exception: {e}")
-
-    # 2-urinish: whisper-1 (language siz, chunki uz ni qo'llab-quvvatlamaydi)
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             with open(file_path, "rb") as f:
@@ -131,21 +106,46 @@ async def transcribe_voice(file_path: str) -> str:
                     files={"file": ("voice.ogg", f, "audio/ogg")},
                     data={
                         "model": "whisper-1",
+                        "language": "uz",  # avval uz bilan urinib ko'ramiz
                         "prompt": whisper_prompt,
                         "temperature": 0,
                     }
                 )
             if response.status_code == 200:
                 text = response.json().get("text", "")
-                logger.info(f"🎤 whisper-1 fallback: '{text}'")
+                logger.info(f"🎤 whisper-1 (uz): '{text}'")
+                if text and len(text.strip()) > 3:
+                    return text
+            else:
+                logger.warning(f"whisper-1 uz xato: {response.text}")
+    except Exception as e:
+        logger.warning(f"whisper-1 uz exception: {e}")
+
+    # Fallback: turk tili bilan urinib ko'ramiz (akustik o'xshashlik)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            with open(file_path, "rb") as f:
+                response = await client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    files={"file": ("voice.ogg", f, "audio/ogg")},
+                    data={
+                        "model": "whisper-1",
+                        "language": "tr",
+                        "prompt": whisper_prompt,
+                        "temperature": 0,
+                    }
+                )
+            if response.status_code == 200:
+                text = response.json().get("text", "")
+                logger.info(f"🎤 whisper-1 (tr fallback): '{text}'")
                 return text
             else:
-                logger.error(f"whisper-1 ham xato: {response.text}")
+                logger.error(f"whisper-1 tr ham xato: {response.text}")
                 return ""
     except Exception as e:
         logger.error(f"Transcribe to'liq xato: {e}")
         return ""
-
 
 async def parse_voice_transactions(text: str) -> list:
     """GPT-4o-mini orqali matndan BIR YOKI BIR NECHTA amaliyotni ajratadi.
@@ -166,7 +166,22 @@ async def parse_voice_transactions(text: str) -> list:
         "   - 'maosh/tushdi/kirdi/daromad/ishlab topdim' = income\n"
         "   - 'qarz berdim/qarzga berdim' = debt_gave\n"
         "   - 'qarz oldim/qarzga oldim' = debt_took\n"
-        "2. amount: butun son (so'mda). 'ming'=1000, 'million'=1000000\n"
+        "2. amount: butun son (so'mda). RAQAMLAR JADVALI:\n"
+        "   - 'ming' = 1000\n"
+        "   - 'ikki ming' = 2000\n"
+        "   - 'besh ming' = 5000\n"
+        "   - 'o'n ming' = 10000\n"
+        "   - 'ellik ming' = 50000\n"
+        "   - 'yuz ming' = 100000\n"
+        "   - 'ikki yuz ming' / 'ikiz min' / 'iki yuz min' = 200000\n"
+        "   - 'uch yuz ming' / 'üçüz min' / 'uchz min' = 300000\n"
+        "   - 'to'rt yuz ming' / 'dörüz min' / 'dört yüz min' = 400000\n"
+        "   - 'besh yuz ming' / 'beşüz min' = 500000\n"
+        "   - 'olti yuz ming' / 'altıyüz min' = 600000\n"
+        "   - 'million' / 'milyon' = 1000000\n"
+        "   MUHIM: Whisper turkcha-ozarbayjon tilida transkripsiya qilishi mumkin. "
+        "   'üçüz min' = uch yuz ming (300000), 'dörüz min' = to'rt yuz ming (400000), "
+        "   'beşüz min' = besh yuz ming (500000). Bu xato emas, transliteratsiya.\n"
         "3. category: faqat expense/income uchun. Quyidagidan ANIQ BIRI:\n"
         f"   Xarajat: {expense_cats}\n"
         f"   Daromad: {income_cats}\n"
