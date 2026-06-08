@@ -496,26 +496,92 @@ async def set_budget(telegram_id: int, amount: float):
 
 async def add_transaction(telegram_id: int, txn_type: str,
                           amount: float, category: str, note: str,
-                          balance_id: int = None):
-    """Tranzaksiya qo'shish + balansni yangilash."""
+                          balance_id: int = None) -> int:
+    """Tranzaksiya qo'shish + balansni yangilash. id qaytaradi."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("""
+            tx_id = await conn.fetchval("""
                 INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id)
                 VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id
             """, telegram_id, txn_type, amount, category, note, balance_id)
 
             if balance_id:
                 if txn_type == "income":
                     await conn.execute(
                         "UPDATE balances SET amount = amount + $1 WHERE id = $2",
-                        amount, balance_id
-                    )
+                        amount, balance_id)
                 else:
                     await conn.execute(
                         "UPDATE balances SET amount = amount - $1 WHERE id = $2",
-                        amount, balance_id
-                    )
+                        amount, balance_id)
+            return tx_id
+async def get_transaction(telegram_id: int, tx_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, type, amount, category, note, balance_id "
+            "FROM transactions WHERE id = $1 AND telegram_id = $2",
+            tx_id, telegram_id)
+
+async def delete_transaction(telegram_id: int, tx_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            tx = await conn.fetchrow(
+                "SELECT type, amount, balance_id FROM transactions "
+                "WHERE id = $1 AND telegram_id = $2", tx_id, telegram_id)
+            if not tx:
+                return False
+            # balans effektini orqaga qaytaramiz
+            if tx["balance_id"]:
+                if tx["type"] == "income":
+                    await conn.execute("UPDATE balances SET amount = amount - $1 WHERE id = $2",
+                                       tx["amount"], tx["balance_id"])
+                else:
+                    await conn.execute("UPDATE balances SET amount = amount + $1 WHERE id = $2",
+                                       tx["amount"], tx["balance_id"])
+            await conn.execute("DELETE FROM transactions WHERE id = $1 AND telegram_id = $2",
+                               tx_id, telegram_id)
+            return True
+
+async def update_transaction(telegram_id: int, tx_id: int,
+                             new_amount=None, new_type=None, new_category=None) -> bool:
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            tx = await conn.fetchrow(
+                "SELECT type, amount, category, balance_id FROM transactions "
+                "WHERE id = $1 AND telegram_id = $2", tx_id, telegram_id)
+            if not tx:
+                return False
+
+            old_type, old_amt, bal_id = tx["type"], float(tx["amount"]), tx["balance_id"]
+            f_type = new_type or old_type
+            f_amt  = float(new_amount) if new_amount is not None else old_amt
+            f_cat  = new_category if new_category is not None else tx["category"]
+
+            if bal_id:
+                # eski effektni qaytar
+                if old_type == "income":
+                    await conn.execute("UPDATE balances SET amount = amount - $1 WHERE id = $2", old_amt, bal_id)
+                else:
+                    await conn.execute("UPDATE balances SET amount = amount + $1 WHERE id = $2", old_amt, bal_id)
+                # yangi effektni qo'lla
+                if f_type == "income":
+                    await conn.execute("UPDATE balances SET amount = amount + $1 WHERE id = $2", f_amt, bal_id)
+                else:
+                    await conn.execute("UPDATE balances SET amount = amount - $1 WHERE id = $2", f_amt, bal_id)
+
+            await conn.execute(
+                "UPDATE transactions SET type = $1, amount = $2, category = $3 "
+                "WHERE id = $4 AND telegram_id = $5",
+                f_type, f_amt, f_cat, tx_id, telegram_id)
+            return True
+
+async def get_recent_transactions(telegram_id: int, limit: int = 8):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, type, amount, category, note, date FROM transactions "
+            "WHERE telegram_id = $1 ORDER BY date DESC LIMIT $2", telegram_id, limit)
+        return [dict(r) for r in rows]            
 
 async def get_month_transactions(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
