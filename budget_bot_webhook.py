@@ -1493,6 +1493,94 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_payment_screen(update, context)
         return
 
+    # ---------- TRANZAKSIYANI TAHRIRLASH ----------
+    elif data.startswith("txedit:"):
+        tx_id = int(data.split(":")[1])
+        tx = await get_transaction(user_id, tx_id)
+        if not tx:
+            await query.edit_message_text("❌ Amaliyot topilmadi (o'chirilgan).")
+            return
+        emoji  = "📥" if tx["type"] == "income" else "📤"
+        type_t = "Daromad" if tx["type"] == "income" else "Xarajat"
+        await query.edit_message_text(
+            f"✏️ <b>Tahrirlash</b>\n\n"
+            f"{emoji} {type_t}: <b>{format_money(float(tx['amount']))}</b>\n"
+            f"🏷 {tx['category']}\n\nNimani o'zgartiramiz?",
+            parse_mode="HTML", reply_markup=tx_edit_keyboard(tx_id))
+
+    elif data.startswith("txback:"):
+        tx_id = int(data.split(":")[1])
+        text, kb = await render_tx_card(user_id, tx_id)
+        if text:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await query.edit_message_text("❌ Amaliyot topilmadi.")
+
+    elif data.startswith("txdel:"):
+        tx_id = int(data.split(":")[1])
+        ok = await delete_transaction(user_id, tx_id)
+        await query.edit_message_text(
+            "🗑 <b>Amaliyot o'chirildi, balans tiklandi.</b>" if ok else "❌ Amaliyot topilmadi.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]]))
+
+    elif data.startswith("txamt:"):
+        tx_id = int(data.split(":")[1])
+        context.user_data["awaiting_edit_amount"] = True
+        context.user_data["edit_tx_id"] = tx_id
+        await query.edit_message_text(
+            "💰 Yangi summani kiriting (faqat raqam):\n<i>Masalan: 50000</i>",
+            parse_mode="HTML")
+
+    elif data.startswith("txtype:"):
+        tx_id = int(data.split(":")[1])
+        tx = await get_transaction(user_id, tx_id)
+        if not tx:
+            await query.edit_message_text("❌ Amaliyot topilmadi.")
+            return
+        if tx["type"] == "expense":
+            new_type, new_cat = "income", "📦 Boshqa daromad"
+        else:
+            new_type, new_cat = "expense", "📦 Boshqa"
+        await update_transaction(user_id, tx_id, new_type=new_type, new_category=new_cat)
+        text, kb = await render_tx_card(user_id, tx_id)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
+    elif data.startswith("txcat:"):
+        tx_id = int(data.split(":")[1])
+        tx = await get_transaction(user_id, tx_id)
+        if not tx:
+            await query.edit_message_text("❌ Amaliyot topilmadi.")
+            return
+        cats = INCOME_CATEGORIES if tx["type"] == "income" else EXPENSE_CATEGORIES
+        buttons, row = [], []
+        for i, c in enumerate(cats):
+            row.append(InlineKeyboardButton(c, callback_data=f"txsetcat:{tx_id}:{i}"))
+            if len(row) == 2:
+                buttons.append(row); row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("⬅️ Orqaga", callback_data=f"txedit:{tx_id}")])
+        await query.edit_message_text(
+            "🏷 <b>Yangi kategoriyani tanlang:</b>",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("txsetcat:"):
+        _, tx_id_s, idx_s = data.split(":")
+        tx_id = int(tx_id_s)
+        tx = await get_transaction(user_id, tx_id)
+        if not tx:
+            await query.edit_message_text("❌ Amaliyot topilmadi.")
+            return
+        cats = INCOME_CATEGORIES if tx["type"] == "income" else EXPENSE_CATEGORIES
+        await update_transaction(user_id, tx_id, new_category=cats[int(idx_s)])
+        text, kb = await render_tx_card(user_id, tx_id)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
+    elif data == "recent":
+        await _show_recent(user_id, query=query)
+
     # ---------- ASOSIY HANDLERLAR ----------
     if data == "add_income":
         context.user_data["txn_type"] = "income"
@@ -2496,7 +2584,7 @@ async def _save_transaction(user_id, context, note="",
     if not amount:
         return
 
-    await add_transaction(user_id, txn_type, amount, category, note, balance_id)
+    tx_id = await add_transaction(user_id, txn_type, amount, category, note, balance_id)
     txns   = await get_month_transactions(user_id)
     stats  = calc_stats(txns)
     budget = await get_budget(user_id)
