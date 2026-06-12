@@ -5,3 +5,4 @@ httpx
 reportlab
 apscheduler
 pytz
+matplotlib

@@ -41,6 +41,14 @@ from reportlab.lib.units import cm
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    _MPL_OK = True
+except ImportError:
+    _MPL_OK = False
+
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL    = os.environ.get("WEBHOOK_URL", "")
@@ -713,6 +721,85 @@ async def update_balance(balance_id: int, amount: float):
 async def delete_balance(balance_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM balances WHERE id = $1", balance_id)
+
+# ===================== DONUT CHART =====================
+
+def generate_donut_chart(
+    cat_stats: dict,
+    total_expenses: float,
+    total_income: float,
+    period_label: str = "",
+) -> "io.BytesIO | None":
+    if not _MPL_OK or not cat_stats or total_expenses <= 0:
+        return None
+
+    PALETTE = [
+        '#FF6B6B', '#4ECDC4', '#45B7D1', '#A8E6CF', '#FFD93D',
+        '#C3A6FF', '#FF9A9E', '#A1C4FD', '#96E6A1', '#FFECD2',
+        '#FD7F6F', '#B2E4FF',
+    ]
+    BG, FG, SUB = '#111827', '#FFFFFF', '#9CA3AF'
+
+    sorted_cats = sorted(cat_stats.items(), key=lambda x: -x[1])
+    sizes  = [c[1] for c in sorted_cats]
+    n      = len(sorted_cats)
+    colors = PALETTE[:n]
+
+    donut_h  = 4.0
+    legend_h = 0.42 * n
+    total_h  = donut_h + legend_h
+
+    fig = plt.figure(figsize=(5.5, total_h), facecolor=BG)
+    leg_frac   = legend_h / total_h
+    donut_frac = donut_h  / total_h
+
+    # ── Donut ─────────────────────────────────────────
+    ax = fig.add_axes([0.05, leg_frac, 0.9, donut_frac])
+    ax.set_facecolor(BG)
+    ax.pie(
+        sizes,
+        colors=colors,
+        startangle=90,
+        wedgeprops=dict(width=0.50, edgecolor=BG, linewidth=3),
+        counterclock=False,
+    )
+    ax.text(0,  0.10, f"-{total_expenses:,.0f}",
+            ha='center', va='center', fontsize=14, fontweight='bold', color=FG)
+    ax.text(0, -0.20, "UZS",
+            ha='center', va='center', fontsize=9, color=SUB)
+    if period_label:
+        ax.text(0.5, 1.0, period_label,
+                ha='center', va='bottom', fontsize=8, color=SUB,
+                transform=ax.transAxes)
+    ax.axis('off')
+
+    # ── Legend ────────────────────────────────────────
+    ax_l = fig.add_axes([0.0, 0.0, 1.0, leg_frac])
+    ax_l.set_facecolor(BG)
+    ax_l.set_xlim(0, 1)
+    ax_l.set_ylim(0, 1)
+    ax_l.axis('off')
+
+    for i, (cat, amt) in enumerate(sorted_cats):
+        pct = int(amt / total_expenses * 100) if total_expenses else 0
+        yc  = 1.0 - (i + 0.5) / n
+        ax_l.plot([0.04], [yc], 'o',
+                  color=colors[i], markersize=9,
+                  transform=ax_l.transAxes, markeredgewidth=0)
+        cat_text = cat.split(' ', 1)[-1] if ' ' in cat else cat
+        ax_l.text(0.09, yc, cat_text,
+                  ha='left', va='center', fontsize=8, color=FG,
+                  transform=ax_l.transAxes)
+        ax_l.text(0.97, yc, f"{amt:,.0f} UZS ({pct}%)",
+                  ha='right', va='center', fontsize=8, color=FG,
+                  transform=ax_l.transAxes)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor=BG)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
 
 # ===================== PDF =====================
 
@@ -1934,39 +2021,68 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cat = t.get("category", "Boshqa")
                 cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
 
-        msg = f"📊 <b>Statistika — {datetime.now().strftime('%B %Y')}</b>\n\n"
-        msg += "┌─────────────────────────┐\n"
-        msg += f"│ 📥 Daromad : {format_money(stats['income']):>12} │\n"
-        msg += f"│ 📤 Xarajat : {format_money(stats['expenses']):>12} │\n"
-        msg += f"│ 💵 Balans  : {format_money(stats['balance']):>12} │\n"
-        msg += "└─────────────────────────┘\n"
+        month_str = datetime.now().strftime("%B %Y")
+        stats_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📄 PDF yuklab olish", callback_data="stats_pdf")],
+            [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]
+        ])
 
-        if budget > 0:
-            used = int(stats['expenses'] / budget * 100) if budget else 0
-            rem  = budget - stats['expenses']
-            pct  = min(int(stats["expenses"] / budget * 10), 10)
-            bar  = "🟥" * pct + "⬜" * (10 - pct)
-            msg += f"\n🎯 <b>Budget:</b>\n"
-            msg += f"  {bar} {used}%\n"
-            msg += f"  Belgilangan : {format_money(budget)}\n"
-            msg += f"  Sarflangan  : {format_money(stats['expenses'])}\n"
-            msg += f"  Qolgan      : {format_money(max(rem, 0))}\n"
-            if rem < 0:
-                msg += f"  ⚠️ {format_money(abs(rem))} oshib ketdi!\n"
-
-        if cat_stats:
-            msg += f"\n🏆 <b>Top xarajatlar:</b>\n"
-            msg += "─" * 30 + "\n"
-            for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1])[:5]:
-                pct = int(amt / stats['expenses'] * 100) if stats['expenses'] else 0
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                msg += f"{cat}\n  {bar} {pct}%  {format_money(amt)}\n"
-
-        await safe_edit(msg, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📄 PDF yuklab olish", callback_data="stats_pdf")],
-                [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]
-            ]))
+        chart_buf = generate_donut_chart(
+            cat_stats, stats['expenses'], stats['income'], month_str
+        )
+        if chart_buf:
+            caption = (
+                f"📊 <b>Statistika — {month_str}</b>\n\n"
+                f"📥 Daromad: <b>{format_money(stats['income'])}</b>\n"
+                f"📤 Xarajat: <b>{format_money(stats['expenses'])}</b>\n"
+                f"💵 Balans:  <b>{format_money(stats['balance'])}</b>"
+            )
+            if budget > 0:
+                used = int(stats['expenses'] / budget * 100) if budget else 0
+                rem  = budget - stats['expenses']
+                caption += (
+                    f"\n\n🎯 Budget: {format_money(budget)} ({used}% sarflandi)"
+                )
+                if rem < 0:
+                    caption += f"\n⚠️ {format_money(abs(rem))} oshib ketdi!"
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=chart_buf,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=stats_kb,
+            )
+        else:
+            msg = f"📊 <b>Statistika — {month_str}</b>\n\n"
+            msg += "┌─────────────────────────┐\n"
+            msg += f"│ 📥 Daromad : {format_money(stats['income']):>12} │\n"
+            msg += f"│ 📤 Xarajat : {format_money(stats['expenses']):>12} │\n"
+            msg += f"│ 💵 Balans  : {format_money(stats['balance']):>12} │\n"
+            msg += "└─────────────────────────┘\n"
+            if budget > 0:
+                used = int(stats['expenses'] / budget * 100) if budget else 0
+                rem  = budget - stats['expenses']
+                pct  = min(int(stats["expenses"] / budget * 10), 10)
+                bar  = "🟥" * pct + "⬜" * (10 - pct)
+                msg += f"\n🎯 <b>Budget:</b>\n"
+                msg += f"  {bar} {used}%\n"
+                msg += f"  Belgilangan : {format_money(budget)}\n"
+                msg += f"  Sarflangan  : {format_money(stats['expenses'])}\n"
+                msg += f"  Qolgan      : {format_money(max(rem, 0))}\n"
+                if rem < 0:
+                    msg += f"  ⚠️ {format_money(abs(rem))} oshib ketdi!\n"
+            if cat_stats:
+                msg += f"\n🏆 <b>Top xarajatlar:</b>\n"
+                msg += "─" * 30 + "\n"
+                for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1])[:5]:
+                    pct = int(amt / stats['expenses'] * 100) if stats['expenses'] else 0
+                    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                    msg += f"{cat}\n  {bar} {pct}%  {format_money(amt)}\n"
+            await safe_edit(msg, parse_mode="HTML", reply_markup=stats_kb)
 
     elif data == "stats_pdf":
         txns   = await get_month_transactions(user_id)
@@ -2172,41 +2288,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cat = t.get("category", "Boshqa")
                 cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
 
-        msg = (
-            f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
-            "┌─────────────────────────┐\n"
-            f"│ 📥 Daromad : {format_money(income):>12} │\n"
-            f"│ 📤 Xarajat : {format_money(expenses):>12} │\n"
-            f"│ 💵 Balans  : {format_money(balance):>12} │\n"
-            "└─────────────────────────┘\n"
-        )
+        range_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
+            InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+        ]])
 
-        if cat_stats:
-            msg += f"\n🏆 <b>Xarajatlar bo'yicha:</b>\n"
-            msg += "─" * 28 + "\n"
-            for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
-                pct = int(amt / expenses * 100) if expenses else 0
-                msg += f"  {cat}: <b>{format_money(amt)}</b> ({pct}%)\n"
-
-        msg += f"\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n"
-        msg += "─" * 28 + "\n"
+        txn_lines = ""
         for t in txns[:20]:
             emoji    = "📥" if t["type"] == "income" else "📤"
             date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
             bal      = f" | 💳 {t['balance_name']}" if t.get("balance_name") else ""
             note     = f" — {t['note']}" if t.get("note") else ""
-            msg     += f"{emoji} <b>{format_money(float(t['amount']))}</b> · {t.get('category','Boshqa')}{bal} | {date_str}{note}\n"
-
+            txn_lines += f"{emoji} <b>{format_money(float(t['amount']))}</b> · {t.get('category','Boshqa')}{bal} | {date_str}{note}\n"
         if len(txns) > 20:
-            msg += f"\n<i>...va yana {len(txns) - 20} ta amaliyot</i>\n"
+            txn_lines += f"\n<i>...va yana {len(txns) - 20} ta amaliyot</i>\n"
 
-        await query.edit_message_text(
-            msg, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
-                InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
-            ]])
+        chart_buf = generate_donut_chart(
+            cat_stats, expenses, income, f"{start_str} — {end_str}"
         )
+        if chart_buf:
+            caption = (
+                f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
+                f"📥 Daromad: <b>{format_money(income)}</b>\n"
+                f"📤 Xarajat: <b>{format_money(expenses)}</b>\n"
+                f"💵 Balans:  <b>{format_money(balance)}</b>"
+            )
+            if txn_lines:
+                caption += f"\n\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n" + txn_lines
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=chart_buf,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=range_kb,
+            )
+        else:
+            msg = (
+                f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
+                "┌─────────────────────────┐\n"
+                f"│ 📥 Daromad : {format_money(income):>12} │\n"
+                f"│ 📤 Xarajat : {format_money(expenses):>12} │\n"
+                f"│ 💵 Balans  : {format_money(balance):>12} │\n"
+                "└─────────────────────────┘\n"
+            )
+            if cat_stats:
+                msg += f"\n🏆 <b>Xarajatlar bo'yicha:</b>\n"
+                msg += "─" * 28 + "\n"
+                for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
+                    pct = int(amt / expenses * 100) if expenses else 0
+                    msg += f"  {cat}: <b>{format_money(amt)}</b> ({pct}%)\n"
+            msg += f"\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n"
+            msg += "─" * 28 + "\n" + txn_lines
+            await query.edit_message_text(
+                msg, parse_mode="HTML", reply_markup=range_kb
+            )
 
     # ---------- QARZLAR ----------
     elif data == "debts":
