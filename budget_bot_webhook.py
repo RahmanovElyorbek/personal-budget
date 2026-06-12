@@ -21,6 +21,7 @@ import httpx
 import io
 import base64
 import json
+import calendar as cal_module
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -979,6 +980,53 @@ def history_months_keyboard(months: list):
     if row:
         buttons.append(row)
     buttons.append([InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+def generate_calendar_keyboard(year: int, month: int, start_date=None, end_date=None):
+    weeks = cal_module.monthcalendar(year, month)
+    month_name = MONTH_NAMES[month]
+
+    prev_year  = year if month > 1 else year - 1
+    prev_month = month - 1 if month > 1 else 12
+    next_year  = year if month < 12 else year + 1
+    next_month = month + 1 if month < 12 else 1
+
+    buttons = []
+    buttons.append([
+        InlineKeyboardButton("◀️", callback_data=f"cal_p_{prev_year}_{prev_month}"),
+        InlineKeyboardButton(f"{month_name} {year}", callback_data="cal_x"),
+        InlineKeyboardButton("▶️", callback_data=f"cal_n_{next_year}_{next_month}"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(d, callback_data="cal_x")
+        for d in ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
+    ])
+
+    for week in weeks:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="cal_x"))
+            else:
+                current = date(year, month, day)
+                label = str(day)
+                if start_date and current == start_date:
+                    label = f"[{day}"
+                elif end_date and current == end_date:
+                    label = f"{day}]"
+                elif start_date and end_date and start_date < current < end_date:
+                    label = f"·{day}·"
+                row.append(InlineKeyboardButton(label, callback_data=f"cal_d_{year}_{month}_{day}"))
+        buttons.append(row)
+
+    if start_date and end_date:
+        buttons.append([
+            InlineKeyboardButton("✅ Tasdiqlash", callback_data="cal_confirm"),
+            InlineKeyboardButton("🔄 Qayta tanlash", callback_data="date_range_report"),
+        ])
+    else:
+        buttons.append([InlineKeyboardButton("❌ Bekor", callback_data="back_main")])
+
     return InlineKeyboardMarkup(buttons)
 
 def debt_direction_keyboard():
@@ -1996,15 +2044,167 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- SANA ORALIG'I HISOBOTI ----------
     elif data == "date_range_report":
-        context.user_data["awaiting_date_range_start"] = True
-        context.user_data.pop("awaiting_date_range_end", None)
+        for k in ("date_range_start", "date_range_end", "cal_year", "cal_month"):
+            context.user_data.pop(k, None)
+        now = datetime.now()
+        year, month = now.year, now.month
+        context.user_data["cal_year"] = year
+        context.user_data["cal_month"] = month
         await query.edit_message_text(
             "📅 <b>Sana oralig'i hisoboti</b>\n\n"
-            "Boshlanish sanasini kiriting:\n"
-            "<i>Masalan: 05.06.2026</i>",
+            "Boshlanish sanasini tanlang 👇",
             parse_mode="HTML",
+            reply_markup=generate_calendar_keyboard(year, month)
+        )
+
+    elif data == "cal_x":
+        await query.answer()
+
+    elif data.startswith("cal_p_") or data.startswith("cal_n_"):
+        parts = data.split("_")
+        year, month = int(parts[2]), int(parts[3])
+        context.user_data["cal_year"] = year
+        context.user_data["cal_month"] = month
+        start = context.user_data.get("date_range_start")
+        end   = context.user_data.get("date_range_end")
+        if start and end:
+            header = (
+                f"📅 <b>Sana oralig'i tanlandi:</b>\n"
+                f"▶️ Boshlanish: <b>{start.strftime('%d.%m.%Y')}</b>\n"
+                f"⏹ Tugash: <b>{end.strftime('%d.%m.%Y')}</b>\n\n"
+                f"✅ Tasdiqlang yoki boshqa oraliq tanlang"
+            )
+        elif start:
+            header = (
+                f"📅 <b>Tugash sanasini tanlang:</b>\n"
+                f"▶️ Boshlanish: <b>{start.strftime('%d.%m.%Y')}</b>"
+            )
+        else:
+            header = "📅 <b>Boshlanish sanasini tanlang:</b>"
+        await query.edit_message_text(
+            header, parse_mode="HTML",
+            reply_markup=generate_calendar_keyboard(year, month, start, end)
+        )
+
+    elif data.startswith("cal_d_"):
+        parts = data.split("_")
+        year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
+        selected = date(year, month, day)
+        start = context.user_data.get("date_range_start")
+        end   = context.user_data.get("date_range_end")
+        cal_year  = context.user_data.get("cal_year", year)
+        cal_month = context.user_data.get("cal_month", month)
+
+        if not start:
+            context.user_data["date_range_start"] = selected
+            start = selected
+            header = (
+                f"📅 <b>Tugash sanasini tanlang:</b>\n"
+                f"▶️ Boshlanish: <b>{start.strftime('%d.%m.%Y')}</b>"
+            )
+        elif not end:
+            if selected == start:
+                await query.answer("Boshqa kun tanlang")
+                return
+            if selected < start:
+                selected, start = start, selected
+                context.user_data["date_range_start"] = start
+            context.user_data["date_range_end"] = selected
+            end = selected
+            header = (
+                f"📅 <b>Sana oralig'i tanlandi:</b>\n"
+                f"▶️ Boshlanish: <b>{start.strftime('%d.%m.%Y')}</b>\n"
+                f"⏹ Tugash: <b>{end.strftime('%d.%m.%Y')}</b>\n\n"
+                f"✅ Tasdiqlang yoki boshqa oraliq tanlang"
+            )
+        else:
+            context.user_data["date_range_start"] = selected
+            context.user_data.pop("date_range_end", None)
+            start, end = selected, None
+            header = (
+                f"📅 <b>Tugash sanasini tanlang:</b>\n"
+                f"▶️ Boshlanish: <b>{start.strftime('%d.%m.%Y')}</b>"
+            )
+
+        await query.edit_message_text(
+            header, parse_mode="HTML",
+            reply_markup=generate_calendar_keyboard(cal_year, cal_month, start, end)
+        )
+
+    elif data == "cal_confirm":
+        start = context.user_data.pop("date_range_start", None)
+        end   = context.user_data.pop("date_range_end", None)
+        for k in ("cal_year", "cal_month"):
+            context.user_data.pop(k, None)
+
+        if not start or not end:
+            await query.answer("❌ Ikkala sana ham tanlanmagan!")
+            return
+
+        await query.edit_message_text(
+            f"⏳ <b>{start.strftime('%d.%m.%Y')} — {end.strftime('%d.%m.%Y')}</b> hisobot tayyorlanmoqda...",
+            parse_mode="HTML"
+        )
+
+        txns = await get_transactions_by_date_range(user_id, start, end)
+        start_str = start.strftime("%d.%m.%Y")
+        end_str   = end.strftime("%d.%m.%Y")
+
+        if not txns:
+            await query.edit_message_text(
+                f"📋 <b>{start_str} — {end_str}</b>\n\n"
+                f"Bu sana oralig'ida tranzaksiyalar topilmadi.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
+                    InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+                ]])
+            )
+            return
+
+        income   = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+        expenses = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+        balance  = income - expenses
+
+        cat_stats = {}
+        for t in txns:
+            if t["type"] == "expense":
+                cat = t.get("category", "Boshqa")
+                cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
+
+        msg = (
+            f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
+            "┌─────────────────────────┐\n"
+            f"│ 📥 Daromad : {format_money(income):>12} │\n"
+            f"│ 📤 Xarajat : {format_money(expenses):>12} │\n"
+            f"│ 💵 Balans  : {format_money(balance):>12} │\n"
+            "└─────────────────────────┘\n"
+        )
+
+        if cat_stats:
+            msg += f"\n🏆 <b>Xarajatlar bo'yicha:</b>\n"
+            msg += "─" * 28 + "\n"
+            for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
+                pct = int(amt / expenses * 100) if expenses else 0
+                msg += f"  {cat}: <b>{format_money(amt)}</b> ({pct}%)\n"
+
+        msg += f"\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n"
+        msg += "─" * 28 + "\n"
+        for t in txns[:20]:
+            emoji    = "📥" if t["type"] == "income" else "📤"
+            date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
+            bal      = f" | 💳 {t['balance_name']}" if t.get("balance_name") else ""
+            note     = f" — {t['note']}" if t.get("note") else ""
+            msg     += f"{emoji} <b>{format_money(float(t['amount']))}</b> · {t.get('category','Boshqa')}{bal} | {date_str}{note}\n"
+
+        if len(txns) > 20:
+            msg += f"\n<i>...va yana {len(txns) - 20} ta amaliyot</i>\n"
+
+        await query.edit_message_text(
+            msg, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Bekor", callback_data="back_main")
+                InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
+                InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
             ]])
         )
 
@@ -2405,8 +2605,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_receipt_amount"),
         context.user_data.get("awaiting_receipt_note"),
         context.user_data.get("awaiting_edit_amount"),
-        context.user_data.get("awaiting_date_range_start"),
-        context.user_data.get("awaiting_date_range_end"),
     ]):
         premium = await is_user_premium(user_id)
         if not premium:
@@ -2634,110 +2832,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Amaliyot topilmadi.")
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
-
-    elif context.user_data.get("awaiting_date_range_start"):
-        try:
-            start_date = datetime.strptime(text, "%d.%m.%Y").date()
-            context.user_data["date_range_start"] = start_date
-            context.user_data.pop("awaiting_date_range_start")
-            context.user_data["awaiting_date_range_end"] = True
-            await update.message.reply_text(
-                f"📅 Boshlanish: <b>{start_date.strftime('%d.%m.%Y')}</b>\n\n"
-                f"Tugash sanasini kiriting:\n"
-                f"<i>Masalan: 10.06.2026</i>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ Bekor", callback_data="back_main")
-                ]])
-            )
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Sana formati noto'g'ri.\n<i>Masalan: 05.06.2026</i>",
-                parse_mode="HTML"
-            )
-
-    elif context.user_data.get("awaiting_date_range_end"):
-        try:
-            end_date = datetime.strptime(text, "%d.%m.%Y").date()
-            start_date = context.user_data.pop("date_range_start", None)
-            context.user_data.pop("awaiting_date_range_end")
-
-            if end_date < start_date:
-                await update.message.reply_text(
-                    "❌ Tugash sanasi boshlanish sanasidan oldin bo'lishi mumkin emas.\n"
-                    "<i>Iltimos, to'g'ri sana kiriting.</i>",
-                    parse_mode="HTML"
-                )
-                context.user_data["date_range_start"] = start_date
-                context.user_data["awaiting_date_range_end"] = True
-                return
-
-            txns = await get_transactions_by_date_range(user_id, start_date, end_date)
-            start_str = start_date.strftime("%d.%m.%Y")
-            end_str = end_date.strftime("%d.%m.%Y")
-
-            if not txns:
-                await update.message.reply_text(
-                    f"📋 <b>{start_str} — {end_str}</b>\n\n"
-                    f"Bu sana oralig'ida tranzaksiyalar topilmadi.",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
-                        InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
-                    ]])
-                )
-                return
-
-            income   = sum(float(t["amount"]) for t in txns if t["type"] == "income")
-            expenses = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
-            balance  = income - expenses
-
-            cat_stats = {}
-            for t in txns:
-                if t["type"] == "expense":
-                    cat = t.get("category", "Boshqa")
-                    cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
-
-            msg = (
-                f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
-                "┌─────────────────────────┐\n"
-                f"│ 📥 Daromad : {format_money(income):>12} │\n"
-                f"│ 📤 Xarajat : {format_money(expenses):>12} │\n"
-                f"│ 💵 Balans  : {format_money(balance):>12} │\n"
-                "└─────────────────────────┘\n"
-            )
-
-            if cat_stats:
-                msg += f"\n🏆 <b>Xarajatlar bo'yicha:</b>\n"
-                msg += "─" * 28 + "\n"
-                for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
-                    pct = int(amt / expenses * 100) if expenses else 0
-                    msg += f"  {cat}: <b>{format_money(amt)}</b> ({pct}%)\n"
-
-            msg += f"\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n"
-            msg += "─" * 28 + "\n"
-            for t in txns[:20]:
-                emoji = "📥" if t["type"] == "income" else "📤"
-                date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
-                bal = f" | 💳 {t['balance_name']}" if t.get("balance_name") else ""
-                note = f" — {t['note']}" if t.get("note") else ""
-                msg += f"{emoji} <b>{format_money(float(t['amount']))}</b> · {t.get('category','Boshqa')}{bal} | {date_str}{note}\n"
-
-            if len(txns) > 20:
-                msg += f"\n<i>...va yana {len(txns) - 20} ta amaliyot</i>\n"
-
-            await update.message.reply_text(
-                msg, parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
-                    InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
-                ]])
-            )
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Sana formati noto'g'ri.\n<i>Masalan: 10.06.2026</i>",
-                parse_mode="HTML"
-            )
 
 async def _save_debt(user_id, context, due_date=None, reply_fn=None, via_query=None):
     person    = context.user_data.get("debt_person", "")
