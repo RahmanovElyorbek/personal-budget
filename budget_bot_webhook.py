@@ -623,6 +623,19 @@ async def get_available_months(telegram_id: int) -> list:
         """, telegram_id)
         return [dict(r) for r in rows]
 
+async def get_transactions_by_date_range(telegram_id: int, start_date, end_date) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT t.type, t.amount, t.category, t.note, t.date, b.name AS balance_name
+            FROM transactions t
+            LEFT JOIN balances b ON t.balance_id = b.id
+            WHERE t.telegram_id = $1
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3
+            ORDER BY t.date DESC
+        """, telegram_id, start_date, end_date)
+        return [dict(r) for r in rows]
+
 async def clear_month_transactions(telegram_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -917,6 +930,7 @@ def main_keyboard(user_id=None):
          InlineKeyboardButton("💰 Budget belgilash", callback_data="set_budget")],
         [InlineKeyboardButton("📋 Tarix", callback_data="history"),
          InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
+        [InlineKeyboardButton("📅 Sana oralig'i hisoboti", callback_data="date_range_report")],
         [InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
          InlineKeyboardButton("💳 Balanslar", callback_data="balances")],
         [InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_month"),
@@ -1980,6 +1994,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔙 Oylar", callback_data="history"),
                 InlineKeyboardButton("🏠 Menyu", callback_data="back_main")]]))
 
+    # ---------- SANA ORALIG'I HISOBOTI ----------
+    elif data == "date_range_report":
+        context.user_data["awaiting_date_range_start"] = True
+        context.user_data.pop("awaiting_date_range_end", None)
+        await query.edit_message_text(
+            "📅 <b>Sana oralig'i hisoboti</b>\n\n"
+            "Boshlanish sanasini kiriting:\n"
+            "<i>Masalan: 05.06.2026</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Bekor", callback_data="back_main")
+            ]])
+        )
+
     # ---------- QARZLAR ----------
     elif data == "debts":
         debts = await get_debts(user_id)
@@ -2377,6 +2405,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_receipt_amount"),
         context.user_data.get("awaiting_receipt_note"),
         context.user_data.get("awaiting_edit_amount"),
+        context.user_data.get("awaiting_date_range_start"),
+        context.user_data.get("awaiting_date_range_end"),
     ]):
         premium = await is_user_premium(user_id)
         if not premium:
@@ -2604,6 +2634,110 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Amaliyot topilmadi.")
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
+
+    elif context.user_data.get("awaiting_date_range_start"):
+        try:
+            start_date = datetime.strptime(text, "%d.%m.%Y").date()
+            context.user_data["date_range_start"] = start_date
+            context.user_data.pop("awaiting_date_range_start")
+            context.user_data["awaiting_date_range_end"] = True
+            await update.message.reply_text(
+                f"📅 Boshlanish: <b>{start_date.strftime('%d.%m.%Y')}</b>\n\n"
+                f"Tugash sanasini kiriting:\n"
+                f"<i>Masalan: 10.06.2026</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Bekor", callback_data="back_main")
+                ]])
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Sana formati noto'g'ri.\n<i>Masalan: 05.06.2026</i>",
+                parse_mode="HTML"
+            )
+
+    elif context.user_data.get("awaiting_date_range_end"):
+        try:
+            end_date = datetime.strptime(text, "%d.%m.%Y").date()
+            start_date = context.user_data.pop("date_range_start", None)
+            context.user_data.pop("awaiting_date_range_end")
+
+            if end_date < start_date:
+                await update.message.reply_text(
+                    "❌ Tugash sanasi boshlanish sanasidan oldin bo'lishi mumkin emas.\n"
+                    "<i>Iltimos, to'g'ri sana kiriting.</i>",
+                    parse_mode="HTML"
+                )
+                context.user_data["date_range_start"] = start_date
+                context.user_data["awaiting_date_range_end"] = True
+                return
+
+            txns = await get_transactions_by_date_range(user_id, start_date, end_date)
+            start_str = start_date.strftime("%d.%m.%Y")
+            end_str = end_date.strftime("%d.%m.%Y")
+
+            if not txns:
+                await update.message.reply_text(
+                    f"📋 <b>{start_str} — {end_str}</b>\n\n"
+                    f"Bu sana oralig'ida tranzaksiyalar topilmadi.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
+                        InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+                    ]])
+                )
+                return
+
+            income   = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+            expenses = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+            balance  = income - expenses
+
+            cat_stats = {}
+            for t in txns:
+                if t["type"] == "expense":
+                    cat = t.get("category", "Boshqa")
+                    cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
+
+            msg = (
+                f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
+                "┌─────────────────────────┐\n"
+                f"│ 📥 Daromad : {format_money(income):>12} │\n"
+                f"│ 📤 Xarajat : {format_money(expenses):>12} │\n"
+                f"│ 💵 Balans  : {format_money(balance):>12} │\n"
+                "└─────────────────────────┘\n"
+            )
+
+            if cat_stats:
+                msg += f"\n🏆 <b>Xarajatlar bo'yicha:</b>\n"
+                msg += "─" * 28 + "\n"
+                for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
+                    pct = int(amt / expenses * 100) if expenses else 0
+                    msg += f"  {cat}: <b>{format_money(amt)}</b> ({pct}%)\n"
+
+            msg += f"\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n"
+            msg += "─" * 28 + "\n"
+            for t in txns[:20]:
+                emoji = "📥" if t["type"] == "income" else "📤"
+                date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
+                bal = f" | 💳 {t['balance_name']}" if t.get("balance_name") else ""
+                note = f" — {t['note']}" if t.get("note") else ""
+                msg += f"{emoji} <b>{format_money(float(t['amount']))}</b> · {t.get('category','Boshqa')}{bal} | {date_str}{note}\n"
+
+            if len(txns) > 20:
+                msg += f"\n<i>...va yana {len(txns) - 20} ta amaliyot</i>\n"
+
+            await update.message.reply_text(
+                msg, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📅 Yangi oraliq", callback_data="date_range_report"),
+                    InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+                ]])
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Sana formati noto'g'ri.\n<i>Masalan: 10.06.2026</i>",
+                parse_mode="HTML"
+            )
 
 async def _save_debt(user_id, context, due_date=None, reply_fn=None, via_query=None):
     person    = context.user_data.get("debt_person", "")
