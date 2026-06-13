@@ -21,6 +21,7 @@ import httpx
 import io
 import base64
 import json
+import secrets
 import calendar as cal_module
 from datetime import datetime, timedelta, date
 from aiohttp import web
@@ -430,6 +431,15 @@ async def init_db():
                 created_at  TIMESTAMP DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS mcp_tokens (
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                token      TEXT UNIQUE NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -721,6 +731,29 @@ async def update_balance(balance_id: int, amount: float):
 async def delete_balance(balance_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM balances WHERE id = $1", balance_id)
+
+async def create_mcp_token(telegram_id: int) -> str:
+    token      = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    async with db_pool.acquire() as conn:
+        # Clean up expired tokens for this user first
+        await conn.execute(
+            "DELETE FROM mcp_tokens WHERE user_id = $1 AND expires_at <= NOW()",
+            telegram_id
+        )
+        await conn.execute(
+            "INSERT INTO mcp_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)",
+            telegram_id, token, expires_at
+        )
+    return token
+
+async def validate_mcp_token(token: str) -> "int | None":
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM mcp_tokens WHERE token = $1 AND expires_at > NOW()",
+            token
+        )
+    return row["user_id"] if row else None
 
 # ===================== DONUT CHART =====================
 
@@ -1604,6 +1637,27 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_payment_screen(update, context)
         return
     await _show_recent(user_id, reply_fn=update.message.reply_text)
+
+async def mcp_token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mcp_token — 24 soatlik MCP Bearer token generatsiya qiladi."""
+    user_id = update.effective_user.id
+    if not await is_user_premium(user_id):
+        await update.message.reply_text(
+            "❌ Bu funksiya faqat premium foydalanuvchilar uchun.",
+            parse_mode="HTML",
+        )
+        return
+    token = await create_mcp_token(user_id)
+    await update.message.reply_text(
+        "🔑 <b>MCP API Token</b>\n\n"
+        f"<code>{token}</code>\n\n"
+        "⏰ <b>24 soat</b> davomida amal qiladi.\n"
+        "🔒 Bu tokenni hech kim bilan ulashmang!\n\n"
+        "<b>Ishlatish:</b>\n"
+        "<code>Authorization: Bearer &lt;token&gt;</code>\n\n"
+        f"📋 Manifest: <code>{WEBHOOK_URL}/.well-known/mcp.json</code>",
+        parse_mode="HTML",
+    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
@@ -3565,6 +3619,195 @@ async def send_daily_reminders(bot):
     except Exception as e:
         logger.error(f"❌ Eslatma funksiyasida xato: {e}")
 
+# ===================== MCP SERVER =====================
+
+MCP_MANIFEST = {
+    "schema_version": "v1",
+    "name": "Oson Byudjet",
+    "description": "Personal budget management — transactions, summary, debts",
+    "tools": [
+        {
+            "name": "get_transactions",
+            "description": "Get transactions for the current month or a custom date range",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "start_date": {"type": "string", "format": "date", "description": "YYYY-MM-DD"},
+                    "end_date":   {"type": "string", "format": "date", "description": "YYYY-MM-DD"},
+                },
+            },
+        },
+        {
+            "name": "add_transaction",
+            "description": "Add a new income or expense transaction",
+            "inputSchema": {
+                "type": "object",
+                "required": ["type", "amount", "category"],
+                "properties": {
+                    "type":     {"type": "string", "enum": ["income", "expense"]},
+                    "amount":   {"type": "number", "description": "Positive amount in UZS"},
+                    "category": {"type": "string", "description": "Category name"},
+                    "note":     {"type": "string", "description": "Optional note"},
+                },
+            },
+        },
+        {
+            "name": "get_summary",
+            "description": "Get financial summary for the current month (income, expenses, balance, categories)",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "get_debts",
+            "description": "Get list of active (unpaid) debts",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+    ],
+}
+
+
+async def _mcp_get_transactions(user_id: int, params: dict) -> dict:
+    start_raw = params.get("start_date")
+    end_raw   = params.get("end_date")
+    if start_raw and end_raw:
+        try:
+            txns = await get_transactions_by_date_range(
+                user_id,
+                date.fromisoformat(start_raw),
+                date.fromisoformat(end_raw),
+            )
+        except ValueError:
+            return {"error": "Invalid date format. Use YYYY-MM-DD"}
+    else:
+        txns = await get_month_transactions(user_id)
+
+    return {
+        "transactions": [
+            {
+                "id":       t["id"],
+                "type":     t["type"],
+                "amount":   float(t["amount"]),
+                "category": t.get("category", ""),
+                "note":     t.get("note", ""),
+                "date":     t["date"].isoformat() if hasattr(t["date"], "isoformat") else str(t["date"]),
+            }
+            for t in txns
+        ],
+        "count": len(txns),
+    }
+
+
+async def _mcp_add_transaction(user_id: int, params: dict) -> dict:
+    txn_type = params.get("type")
+    amount   = params.get("amount")
+    category = params.get("category", "Boshqa")
+    note     = params.get("note", "")
+
+    if txn_type not in ("income", "expense"):
+        return {"error": "type must be 'income' or 'expense'"}
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return {"error": "amount must be a positive number"}
+    if amount <= 0:
+        return {"error": "amount must be positive"}
+
+    balances   = await get_balances(user_id)
+    balance_id = balances[0]["id"] if balances else None
+
+    tx_id = await add_transaction(user_id, txn_type, amount, category, note, balance_id)
+    return {"success": True, "transaction_id": tx_id}
+
+
+async def _mcp_get_summary(user_id: int, params: dict) -> dict:
+    txns   = await get_month_transactions(user_id)
+    stats  = calc_stats(txns)
+    budget = await get_budget(user_id)
+
+    cat_stats: dict = {}
+    for t in txns:
+        if t["type"] == "expense":
+            cat = t.get("category", "Boshqa")
+            cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
+
+    return {
+        "month":      datetime.now().strftime("%B %Y"),
+        "income":     stats["income"],
+        "expenses":   stats["expenses"],
+        "balance":    stats["balance"],
+        "budget":     budget,
+        "categories": [
+            {
+                "category": cat,
+                "amount":   amt,
+                "pct":      int(amt / stats["expenses"] * 100) if stats["expenses"] else 0,
+            }
+            for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1])
+        ],
+    }
+
+
+async def _mcp_get_debts(user_id: int, params: dict) -> dict:
+    debts = await get_debts(user_id)
+    return {
+        "debts": [
+            {
+                "id":          d["id"],
+                "person_name": d["person_name"],
+                "amount":      float(d["amount"]),
+                "direction":   d["direction"],
+                "due_date":    d["due_date"].isoformat() if d.get("due_date") else None,
+                "note":        d.get("note", ""),
+            }
+            for d in debts
+        ],
+        "count": len(debts),
+    }
+
+
+_MCP_TOOLS = {
+    "get_transactions": _mcp_get_transactions,
+    "add_transaction":  _mcp_add_transaction,
+    "get_summary":      _mcp_get_summary,
+    "get_debts":        _mcp_get_debts,
+}
+
+
+async def mcp_manifest_handler(request: web.Request) -> web.Response:
+    return web.json_response(MCP_MANIFEST)
+
+
+async def mcp_tool_handler(request: web.Request) -> web.Response:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    user_id = await validate_mcp_token(auth[7:])
+    if not user_id:
+        return web.json_response({"error": "Invalid or expired token"}, status=401)
+
+    tool_name = request.match_info["tool_name"]
+    handler   = _MCP_TOOLS.get(tool_name)
+    if handler is None:
+        return web.json_response(
+            {"error": f"Unknown tool: {tool_name}",
+             "available": list(_MCP_TOOLS.keys())},
+            status=404,
+        )
+
+    try:
+        params = await request.json()
+    except Exception:
+        params = {}
+
+    try:
+        result = await handler(user_id, params)
+    except Exception as e:
+        logger.exception("MCP tool error: %s", tool_name)
+        return web.json_response({"error": str(e)}, status=500)
+
+    return web.json_response(result)
+
+
 # ===================== WEBHOOK =====================
 
 async def health(request):
@@ -3583,6 +3826,7 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("oxirgi", recent_command))
+    app.add_handler(CommandHandler("mcp_token", mcp_token_command))
     app.add_handler(CommandHandler("testreminder", admin_test_reminder))
     app.add_handler(CommandHandler("adminstats", admin_stats))
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -3633,6 +3877,8 @@ async def main():
     web_app = web.Application()
     web_app.router.add_get("/", health)
     web_app.router.add_post(webhook_path, lambda r: webhook_handler(r, app))
+    web_app.router.add_get("/.well-known/mcp.json", mcp_manifest_handler)
+    web_app.router.add_post("/mcp/tools/{tool_name}", mcp_tool_handler)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
