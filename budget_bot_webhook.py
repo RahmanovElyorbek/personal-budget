@@ -3808,6 +3808,118 @@ async def mcp_tool_handler(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+# ── Proper MCP Streamable HTTP endpoint (JSON-RPC 2.0) ──────────────────────
+# Compatible with Claude Desktop 0.7+, Claude Code, and any MCP client.
+# Config: { "url": "https://your-app.render.com/mcp",
+#           "headers": { "Authorization": "Bearer <token>" } }
+
+_MCP_TOOLS_SCHEMA = [
+    {
+        "name": "get_transactions",
+        "description": "Get transactions for the current month or a custom date range",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "format": "date", "description": "Start date YYYY-MM-DD (optional)"},
+                "end_date":   {"type": "string", "format": "date", "description": "End date YYYY-MM-DD (optional)"},
+            },
+        },
+    },
+    {
+        "name": "add_transaction",
+        "description": "Add a new income or expense transaction",
+        "inputSchema": {
+            "type": "object",
+            "required": ["type", "amount", "category"],
+            "properties": {
+                "type":     {"type": "string", "enum": ["income", "expense"]},
+                "amount":   {"type": "number", "description": "Positive amount in UZS"},
+                "category": {"type": "string"},
+                "note":     {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "get_summary",
+        "description": "Get financial summary for the current month (income, expenses, balance, top categories)",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_debts",
+        "description": "Get list of active (unpaid) debts",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def _jsonrpc_ok(req_id, result):
+    return web.json_response({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+def _jsonrpc_err(req_id, code, message):
+    return web.json_response(
+        {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+    )
+
+
+async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return web.Response(
+            text='{"error":"Unauthorized"}',
+            content_type="application/json",
+            status=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_id = await validate_mcp_token(auth[7:])
+    if not user_id:
+        return _jsonrpc_err(None, -32000, "Invalid or expired token")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _jsonrpc_err(None, -32700, "Parse error")
+
+    method  = body.get("method", "")
+    req_id  = body.get("id")
+    params  = body.get("params") or {}
+
+    # ── initialize ─────────────────────────────────────────────────────────
+    if method == "initialize":
+        return _jsonrpc_ok(req_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities":    {"tools": {}},
+            "serverInfo":      {"name": "Oson Byudjet", "version": "1.0.0"},
+        })
+
+    # ── notifications (fire-and-forget, no response body needed) ───────────
+    if method.startswith("notifications/"):
+        return web.Response(status=204)
+
+    # ── tools/list ─────────────────────────────────────────────────────────
+    if method == "tools/list":
+        return _jsonrpc_ok(req_id, {"tools": _MCP_TOOLS_SCHEMA})
+
+    # ── tools/call ─────────────────────────────────────────────────────────
+    if method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments") or {}
+        handler   = _MCP_TOOLS.get(tool_name)
+        if handler is None:
+            return _jsonrpc_err(req_id, -32601, f"Unknown tool: {tool_name}")
+        try:
+            tool_result = await handler(user_id, arguments)
+            return _jsonrpc_ok(req_id, {
+                "content": [{"type": "text", "text": json.dumps(tool_result, ensure_ascii=False, indent=2)}]
+            })
+        except Exception as e:
+            logger.exception("MCP tools/call error: %s", tool_name)
+            return _jsonrpc_err(req_id, -32000, str(e))
+
+    return _jsonrpc_err(req_id, -32601, f"Method not found: {method}")
+
+
 # ===================== WEBHOOK =====================
 
 async def health(request):
@@ -3879,6 +3991,7 @@ async def main():
     web_app.router.add_post(webhook_path, lambda r: webhook_handler(r, app))
     web_app.router.add_get("/.well-known/mcp.json", mcp_manifest_handler)
     web_app.router.add_post("/mcp/tools/{tool_name}", mcp_tool_handler)
+    web_app.router.add_post("/mcp", mcp_jsonrpc_handler)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
