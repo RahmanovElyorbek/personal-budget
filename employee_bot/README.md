@@ -1,105 +1,112 @@
-# 🤖 Ishchilar Telegram Boti
+# Ishchilar Telegram Boti
 
-Ishchilar uchun Telegram bot — davomat belgilash, yangiliklar va ro'yxatdan o'tish.
+Telegram bot — davomat belgilash, yangiliklar va ishchi ro'yxati, barchasi Google Sheets bilan sinxronlashadi.
 
 ## Imkoniyatlar
 
-| Funksiya | Tavsif |
-|---|---|
-| ✅ Keldi | Ishga kelganda belgilash — Google Sheetsga saqlanadi |
-| 🚪 Ketdi | Ishdan ketganda belgilash — Google Sheetsga saqlanadi |
-| 📝 Ro'yxatdan o'tish | Yangi ishchi ma'lumotlarini kiritish (ism, lavozim, telefon) |
-| 📢 Broadcast | Admin barcha ishchilarga xabar yuboradi |
-| 👥 Ishchilar ro'yxati | Admin uchun: barcha ishchilarni ko'rish |
+| | Funksiya | Tavsif |
+|---|---|---|
+| ✅ | Keldi | Ishchi ishga kelganini belgilaydi → Sheetsga saqlanadi |
+| 🚪 | Ketdi | Ishchi ishdan ketganini belgilaydi → Sheetsga saqlanadi |
+| 📝 | Ro'yxatdan o'tish | Yangi ishchi ism/familiya/lavozim/telefon kiritadi → Sheetsga saqlanadi |
+| 📢 | Broadcast | Admin barcha ishchilarga xabar yuboradi |
+| 👥 | Ishchilar | Admin ishchilar ro'yxatini ko'radi |
+| 📊 | Bugungi davomat | Admin bugun kim keldi/ketdi — barchasini bir joyda ko'radi |
+
+---
 
 ## O'rnatish
 
-### 1. Telegram Bot yaratish
+### 1-qadam — Bot token olish
 
-1. [@BotFather](https://t.me/BotFather) ga o'ting
-2. `/newbot` buyrug'ini yuboring
-3. Bot nomini kiriting
-4. Token ni nusxalab oling
+1. Telegramda [@BotFather](https://t.me/BotFather) ni oching
+2. `/newbot` yuboring, bot nomini kiriting
+3. Tokenni nusxalab saqlang (keyinroq kerak bo'ladi)
 
-### 2. Google Sheets va Service Account
+### 2-qadam — Google tayyorlash
 
 1. [Google Cloud Console](https://console.cloud.google.com/) ga kiring
-2. Yangi loyiha yarating yoki mavjudini tanlang
-3. **APIs & Services → Enable APIs** ga o'ting:
-   - Google Sheets API
-   - Google Drive API
+2. Yangi loyiha yarating (yoki mavjudini tanlang)
+3. **APIs & Services → Enable APIs** orqali yoqing:
+   - **Google Sheets API**
+   - **Google Drive API**
 4. **APIs & Services → Credentials → Create Credentials → Service Account** yarating
-5. Service Account uchun JSON kalit yarating va `credentials.json` nomi bilan bot papkasiga saqlang
+5. Service account → **Keys → Add Key → JSON** — faylni yuklab, `credentials.json` nomi bilan bot papkasiga saqlang
 6. [Google Sheets](https://sheets.google.com/) da yangi jadval yarating
-7. Jadval URL dan ID ni oling: `https://docs.google.com/spreadsheets/d/**SPREADSHEET_ID**/edit`
-8. Jadvalni service account emaili bilan ulashing (Editor huquqi bilan)
+7. Jadval URL dan ID ni oling:
+   ```
+   https://docs.google.com/spreadsheets/d/  →SHUBU←  /edit
+   ```
+8. Jadvalni service account emaili bilan ulashing (**Editor** huquqi bilan):
+   - Jadval → Share → service account emailini kiriting (masalan: `bot@project.iam.gserviceaccount.com`)
 
-### 3. Muhit o'zgaruvchilarini sozlash
+### 3-qadam — Admin ID ni bilish
+
+[@userinfobot](https://t.me/userinfobot) ga `/start` yuboring — u sizning ID ingizni ko'rsatadi.
+
+### 4-qadam — Fayllarni sozlash
 
 ```bash
-cp .env.example .env
+cd employee_bot
+
+# O'rnatish
+bash setup.sh
+
+# .env faylini oching va to'ldiring
+nano .env
 ```
 
-`.env` faylini tahrirlang:
-
-```env
-BOT_TOKEN=7123456789:AAFxxxxxxxxxxxxxxxxxxxxxx
+`.env` ichida:
+```
+BOT_TOKEN=7123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxx
 ADMIN_ID=123456789
 SPREADSHEET_ID=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms
 GOOGLE_CREDENTIALS_FILE=credentials.json
 ```
 
-> **ADMIN_ID** ni bilish uchun [@userinfobot](https://t.me/userinfobot) ga `/start` yuboring.
-
-### 4. Python muhitini sozlash
+### 5-qadam — Ishga tushirish
 
 ```bash
-cd employee_bot
-python -m venv venv
-source venv/bin/activate        # Linux/Mac
-# yoki
-venv\Scripts\activate           # Windows
-
-pip install -r requirements.txt
+bash run.sh
 ```
 
-### 5. Botni ishga tushirish
-
-```bash
-python bot.py
-```
+---
 
 ## Google Sheets tuzilmasi
 
-Bot avtomatik ravishda 2 ta varaq (sheet) yaratadi:
+Bot avtomatik ravishda 2 ta varaq yaratadi:
 
-### 📋 Davomat varag'i
+**Davomat** varag'i:
 | Telegram ID | Ism Familiya | Holat | Sana | Vaqt |
 |---|---|---|---|---|
 | 123456789 | Ali Valiyev | Keldi | 2025-01-15 | 09:02:34 |
 | 123456789 | Ali Valiyev | Ketdi | 2025-01-15 | 18:05:11 |
 
-### 👥 Ishchilar varag'i
+**Ishchilar** varag'i:
 | Telegram ID | Ism | Familiya | Lavozim | Telefon | Ro'yxatdan o'tgan sana |
 |---|---|---|---|---|---|
 | 123456789 | Ali | Valiyev | Dasturchi | +998901234567 | 2025-01-10 |
 
+---
+
 ## Bot buyruqlari
 
-| Buyruq | Kim uchun | Tavsif |
-|---|---|---|
-| `/start` | Hammasi | Botni ishga tushirish |
-| `/keldi` | Ishchilar | Ishga kelganini belgilash |
-| `/ketdi` | Ishchilar | Ishdan ketganini belgilash |
-| `/royxat` | Yangi ishchilar | Ro'yxatdan o'tish |
-| `/broadcast` | Faqat Admin | Barcha ishchilarga xabar yuborish |
-| `/ishchilar` | Faqat Admin | Ishchilar ro'yxatini ko'rish |
+| Buyruq | Kim uchun |
+|---|---|
+| `/start` | Hammaga |
+| `/royxat` | Yangi ishchilar |
+| `/keldi` | Ishchilar |
+| `/ketdi` | Ishchilar |
+| `/broadcast` | Faqat Admin |
+| `/ishchilar` | Faqat Admin |
+| `/davomat` | Faqat Admin |
+| `/cancel` | Amaliyotni bekor qilish |
 
-## Server da ishlatish (ixtiyoriy)
+---
 
-### systemd service (Linux)
+## Server da doimiy ishlatish (Linux)
 
-`/etc/systemd/system/employee-bot.service` faylini yarating:
+`/etc/systemd/system/employee-bot.service`:
 
 ```ini
 [Unit]
@@ -119,6 +126,7 @@ WantedBy=multi-user.target
 ```
 
 ```bash
+sudo systemctl daemon-reload
 sudo systemctl enable employee-bot
 sudo systemctl start employee-bot
 sudo systemctl status employee-bot
