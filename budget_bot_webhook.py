@@ -440,6 +440,10 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            ALTER TABLE debts ADD COLUMN IF NOT EXISTS
+                balance_id INTEGER REFERENCES balances(id) ON DELETE SET NULL
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -664,28 +668,44 @@ async def clear_month_transactions(telegram_id: int):
         """, telegram_id)
 
 async def add_debt(telegram_id: int, person_name: str, amount: float,
-                   direction: str, due_date=None, note: str = ""):
+                   direction: str, due_date=None, note: str = "", balance_id: int = None):
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO debts (telegram_id, person_name, amount, direction, due_date, note)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """, telegram_id, person_name, amount, direction, due_date, note)
+        async with conn.transaction():
+            await conn.execute("""
+                INSERT INTO debts (telegram_id, person_name, amount, direction, due_date, note, balance_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """, telegram_id, person_name, amount, direction, due_date, note, balance_id)
+            if balance_id:
+                delta = -amount if direction == "gave" else amount
+                await conn.execute(
+                    "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                    delta, balance_id, telegram_id
+                )
 
 async def get_debts(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, person_name, amount, direction, due_date, is_paid, note, created_at
+            SELECT id, person_name, amount, direction, due_date, is_paid, note, created_at, balance_id
             FROM debts
             WHERE telegram_id = $1 AND is_paid = FALSE
             ORDER BY due_date ASC NULLS LAST, created_at DESC
         """, telegram_id)
         return [dict(r) for r in rows]
 
-async def mark_debt_paid(debt_id: int):
+async def mark_debt_paid(debt_id: int, return_balance_id: int = None):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE debts SET is_paid = TRUE WHERE id = $1", debt_id
-        )
+        async with conn.transaction():
+            debt = await conn.fetchrow(
+                "SELECT amount, direction FROM debts WHERE id = $1", debt_id
+            )
+            await conn.execute("UPDATE debts SET is_paid = TRUE WHERE id = $1", debt_id)
+            if return_balance_id and debt:
+                # "gave" → they return → I receive → add; "took" → I return → I pay → deduct
+                delta = float(debt["amount"]) if debt["direction"] == "gave" else -float(debt["amount"])
+                await conn.execute(
+                    "UPDATE balances SET amount = amount + $1 WHERE id = $2",
+                    delta, return_balance_id
+                )
 
 async def check_due_debts(telegram_id: int) -> list:
     """/start ekranida qarz eslatmasi ko'rsatish uchun.
@@ -2473,6 +2493,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("mark_paid_"):
         debt_id = int(data.split("_")[2])
+        debts = await get_debts(user_id)
+        debt = next((d for d in debts if d["id"] == debt_id), None)
+        if not debt:
+            await query.answer("❌ Qarz topilmadi")
+            return
+        balances = await get_balances(user_id)
+        direction = debt["direction"]
+        amount    = float(debt["amount"])
+        person    = debt["person_name"]
+        emoji     = "🔴" if direction == "gave" else "🟢"
+        action    = "qaytaradi → qo'shamiz" if direction == "gave" else "qaytaramiz → yechilamiz"
+
+        msg = (
+            f"{emoji} <b>{person}</b> — <b>{format_money(amount)}</b>\n\n"
+            f"💳 Qaysi balansga <b>{action}</b>?"
+        )
+        buttons = []
+        for b in balances:
+            type_emoji = BALANCE_TYPES.get(b["type"], "📦").split()[0]
+            label = f"{type_emoji} {b['name']} — {format_money(float(b['amount']))}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"debt_ret_bal_{debt_id}_{b['id']}")])
+        buttons.append([InlineKeyboardButton("⏭️ Balanssiz belgilash", callback_data=f"debt_ret_no_bal_{debt_id}")])
+        buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="debt_paid_list")])
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("debt_ret_bal_"):
+        parts     = data.split("_")
+        debt_id   = int(parts[3])
+        bal_id    = int(parts[4])
+        await mark_debt_paid(debt_id, return_balance_id=bal_id)
+        async with db_pool.acquire() as conn:
+            bal = await conn.fetchrow("SELECT name, amount FROM balances WHERE id = $1", bal_id)
+        bal_text = f"\n💳 Balans: <b>{bal['name']}</b> — {format_money(float(bal['amount']))}" if bal else ""
+        await query.edit_message_text(
+            f"✅ <b>Qarz to'landi!</b>{bal_text}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Qarzlar", callback_data="debts")]]))
+
+    elif data.startswith("debt_ret_no_bal_"):
+        debt_id = int(data.split("_")[4])
         await mark_debt_paid(debt_id)
         await query.edit_message_text(
             "✅ <b>Qarz to'landi deb belgilandi!</b>",
@@ -2578,7 +2639,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _save_transaction(user_id, context, note="", via_query=query)
 
     elif data == "debt_skip_date":
-        await _save_debt(user_id, context, due_date=None, via_query=query)
+        await _ask_debt_balance(user_id, context, due_date=None, via_query=query)
+
+    elif data == "debt_skip_bal":
+        await _save_debt(user_id, context, balance_id=None, via_query=query)
+
+    elif data.startswith("debt_sel_bal_"):
+        balance_id = int(data.split("_")[3])
+        await _save_debt(user_id, context, balance_id=balance_id, via_query=query)
 
     # ---------- ADMIN PANEL ----------
     elif data == "admin_panel":
@@ -2925,8 +2993,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.user_data.get("awaiting_debt_date"):
         try:
             due_date = datetime.strptime(text, "%d.%m.%Y").date()
-            await _save_debt(user_id, context, due_date=due_date,
-                             reply_fn=update.message.reply_text)
+            context.user_data.pop("awaiting_debt_date")
+            await _ask_debt_balance(user_id, context, due_date=due_date,
+                                    reply_fn=update.message.reply_text)
         except ValueError:
             await update.message.reply_text(
                 "❌ Sana formati noto'g'ri.\n<i>Masalan: 15.05.2026</i>",
@@ -3026,25 +3095,63 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
 
-async def _save_debt(user_id, context, due_date=None, reply_fn=None, via_query=None):
+async def _ask_debt_balance(user_id, context, due_date, reply_fn=None, via_query=None):
+    """Qarzni saqlashdan oldin qaysi balansdan yechishni so'raydi."""
+    context.user_data["debt_due_date"] = due_date
+    balances = await get_balances(user_id)
+    direction = context.user_data.get("debt_direction", "gave")
+    amount    = context.user_data.get("debt_amount", 0)
+    person    = context.user_data.get("debt_person", "")
+    emoji     = "🔴" if direction == "gave" else "🟢"
+    action    = "yechiladi" if direction == "gave" else "qo'shiladi"
+
+    msg = (
+        f"{emoji} <b>{person}</b> — <b>{format_money(amount)}</b>\n\n"
+        f"💳 Qaysi balansdan <b>{action}</b>?"
+    )
+    buttons = []
+    for b in balances:
+        type_emoji = BALANCE_TYPES.get(b["type"], "📦").split()[0]
+        label = f"{type_emoji} {b['name']} — {format_money(float(b['amount']))}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"debt_sel_bal_{b['id']}")])
+    buttons.append([InlineKeyboardButton("⏭️ Balanssiz saqlash", callback_data="debt_skip_bal")])
+    buttons.append([InlineKeyboardButton("❌ Bekor", callback_data="back_main")])
+    markup = InlineKeyboardMarkup(buttons)
+
+    if via_query:
+        await via_query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
+    elif reply_fn:
+        await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
+
+async def _save_debt(user_id, context, balance_id=None, reply_fn=None, via_query=None):
     person    = context.user_data.get("debt_person", "")
     amount    = context.user_data.get("debt_amount", 0)
     direction = context.user_data.get("debt_direction", "gave")
+    due_date  = context.user_data.get("debt_due_date")
 
-    for k in ("debt_person", "debt_amount", "debt_direction", "awaiting_debt_date"):
+    for k in ("debt_person", "debt_amount", "debt_direction", "debt_due_date",
+              "awaiting_debt_date"):
         context.user_data.pop(k, None)
 
-    await add_debt(user_id, person, amount, direction, due_date)
+    await add_debt(user_id, person, amount, direction, due_date, balance_id=balance_id)
 
     direction_text = "bergan" if direction == "gave" else "olgan"
     due_text = f"\n📅 Qaytarish: {due_date.strftime('%d.%m.%Y')}" if due_date else ""
     emoji = "🔴" if direction == "gave" else "🟢"
 
+    bal_text = ""
+    if balance_id:
+        async with db_pool.acquire() as conn:
+            bal = await conn.fetchrow("SELECT name, amount FROM balances WHERE id = $1", balance_id)
+            if bal:
+                action = "yechildi" if direction == "gave" else "qo'shildi"
+                bal_text = f"\n💳 Balans: <b>{bal['name']}</b> — {format_money(float(bal['amount']))} ({action})"
+
     msg = (
         f"✅ <b>Qarz saqlandi!</b>\n\n"
         f"{emoji} Men <b>{direction_text}</b>\n"
         f"👤 Ism: <b>{person}</b>\n"
-        f"💰 Miqdor: <b>{format_money(amount)}</b>{due_text}"
+        f"💰 Miqdor: <b>{format_money(amount)}</b>{due_text}{bal_text}"
     )
     markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
