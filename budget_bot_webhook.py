@@ -854,6 +854,71 @@ def generate_donut_chart(
     return buf
 
 
+# ===================== AI MASLAHAT =====================
+
+async def get_ai_financial_advice(transactions: list, period_name: str, user_name: str) -> str:
+    if not transactions:
+        return None
+
+    income   = sum(float(t["amount"]) for t in transactions if t["type"] == "income")
+    expenses = sum(float(t["amount"]) for t in transactions if t["type"] == "expense")
+    balance  = income - expenses
+
+    cat_stats = {}
+    for t in transactions:
+        if t["type"] == "expense":
+            cat = t.get("category", "Boshqa")
+            cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
+
+    cat_lines = "\n".join(
+        f"  - {cat}: {format_money(amt)} ({int(amt / expenses * 100) if expenses else 0}%)"
+        for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1])
+    ) if cat_stats else "  - Xarajatlar yo'q"
+
+    exp_count = sum(1 for t in transactions if t["type"] == "expense")
+    inc_count = len(transactions) - exp_count
+
+    prompt = (
+        f"Sen moliyaviy maslahatchi assistantsan. "
+        f"Foydalanuvchining quyidagi moliyaviy ma'lumotlarini tahlil qilib, o'zbek tilida foydali maslahat ber.\n\n"
+        f"Foydalanuvchi: {user_name}\n"
+        f"Davr: {period_name}\n\n"
+        f"MOLIYAVIY KO'RSATKICHLAR:\n"
+        f"- Jami daromad: {format_money(income)} ({inc_count} ta)\n"
+        f"- Jami xarajat: {format_money(expenses)} ({exp_count} ta)\n"
+        f"- Sof balans: {format_money(balance)}\n\n"
+        f"XARAJATLAR KATEGORIYALAR BO'YICHA:\n{cat_lines}\n\n"
+        f"VAZIFANG:\n"
+        f"1. Xarajat tuzilmasini qisqacha tahlil qil\n"
+        f"2. Haddan oshib ketgan yoki e'tibor talab qiladigan sohalarni ko'rsat\n"
+        f"3. 2-3 ta konkret va amaliy tejash yoki moliyaviy maslahat ber\n"
+        f"4. Ijobiy yutuqlarni ham qayd et\n"
+        f"5. O'zbek tilida, 200-250 so'z, oddiy va iliq uslubda yoz"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "max_tokens": 550,
+                },
+            )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        logger.warning(f"AI maslahat API xato: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"AI maslahat exception: {e}")
+    return None
+
+
 # ===================== PDF =====================
 
 def generate_stats_pdf(user_name, stats, cat_stats, budget, month_str, transactions=None):
@@ -1072,6 +1137,8 @@ def main_keyboard(user_id=None):
         [InlineKeyboardButton("📋 Tarix", callback_data="history"),
          InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
         [InlineKeyboardButton("📅 Sana oralig'i hisoboti", callback_data="date_range_report")],
+        [InlineKeyboardButton("🤖 AI Maslahat", callback_data="ai_advice"),
+         InlineKeyboardButton("📈 Oylik AI Xulosa", callback_data="ai_monthly")],
         [InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
          InlineKeyboardButton("💳 Balanslar", callback_data="balances")],
         [InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_month"),
@@ -2185,6 +2252,104 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
                  InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
                 [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+            ])
+        )
+
+    # ---------- AI MASLAHAT ----------
+    elif data == "ai_advice":
+        await query.edit_message_text(
+            "🤖 <b>AI tahlil qilinmoqda...</b>\n\n<i>Bir daqiqa sabr qiling...</i>",
+            parse_mode="HTML"
+        )
+        txns      = await get_month_transactions(user_id)
+        period    = datetime.now().strftime("%B %Y")
+        user_name = query.from_user.full_name
+
+        if not txns:
+            await query.edit_message_text(
+                f"📊 <b>{period}</b>\n\nBu oy hali tranzaksiyalar yo'q.\n"
+                f"Daromad va xarajatlaringizni kiritiing, keyin AI tahlil qila oladi.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+            )
+            return
+
+        advice = await get_ai_financial_advice(txns, period, user_name)
+        income   = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+        expenses = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+
+        msg = (
+            f"🤖 <b>AI Moliyaviy Maslahat — {period}</b>\n\n"
+            f"📥 Daromad: <b>{format_money(income)}</b>  |  "
+            f"📤 Xarajat: <b>{format_money(expenses)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{advice or 'AI vaqtincha javob bermadi. Keyinroq urinib ko`ring.'}"
+        )
+        await query.edit_message_text(
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Yangilash", callback_data="ai_advice")],
+                [InlineKeyboardButton("📈 Oylik AI Xulosa", callback_data="ai_monthly"),
+                 InlineKeyboardButton("🏠 Menyu", callback_data="back_main")],
+            ])
+        )
+
+    elif data == "ai_monthly":
+        await query.edit_message_text(
+            "📈 <b>Oylik AI xulosa tayyorlanmoqda...</b>\n\n<i>Bir daqiqa sabr qiling...</i>",
+            parse_mode="HTML"
+        )
+        now = datetime.now()
+        prev_month = now.month - 1 if now.month > 1 else 12
+        prev_year  = now.year if now.month > 1 else now.year - 1
+        txns_cur   = await get_month_transactions(user_id)
+        txns_prev  = await get_transactions_by_month(user_id, prev_year, prev_month)
+        user_name  = query.from_user.full_name
+        cur_period  = now.strftime("%B %Y")
+        prev_period = f"{MONTH_NAMES[prev_month]} {prev_year}"
+
+        if not txns_cur and not txns_prev:
+            await query.edit_message_text(
+                "📊 Tahlil uchun yetarli ma'lumot yo'q.\nAvval daromad va xarajatlaringizni kiriting.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+            )
+            return
+
+        target_txns   = txns_cur if txns_cur else txns_prev
+        target_period = cur_period if txns_cur else prev_period
+
+        advice = await get_ai_financial_advice(target_txns, target_period, user_name)
+
+        income   = sum(float(t["amount"]) for t in target_txns if t["type"] == "income")
+        expenses = sum(float(t["amount"]) for t in target_txns if t["type"] == "expense")
+
+        # Oldingi oy bilan taqqoslash
+        compare_text = ""
+        if txns_cur and txns_prev:
+            prev_exp = sum(float(t["amount"]) for t in txns_prev if t["type"] == "expense")
+            diff     = expenses - prev_exp
+            arrow    = "📈" if diff > 0 else "📉"
+            compare_text = (
+                f"\n{arrow} O'tgan oy ({prev_period}) xarajat: <b>{format_money(prev_exp)}</b>\n"
+                f"Farq: <b>{'+'if diff>0 else ''}{format_money(diff)}</b>\n"
+            )
+
+        msg = (
+            f"📈 <b>Oylik AI Xulosa — {target_period}</b>\n\n"
+            f"📥 Daromad: <b>{format_money(income)}</b>\n"
+            f"📤 Xarajat: <b>{format_money(expenses)}</b>"
+            f"{compare_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{advice or 'AI vaqtincha javob bermadi. Keyinroq urinib ko`ring.'}"
+        )
+        await query.edit_message_text(
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🤖 Joriy oy maslahat", callback_data="ai_advice")],
                 [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
             ])
         )
@@ -3492,6 +3657,32 @@ async def send_weekly_reports(bot):
                         [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
                     ])
                 )
+
+                # AI haftalik xulosa
+                week_txns = [
+                    {"type": r["type"], "amount": r["amount"],
+                     "category": r.get("category", "Boshqa")}
+                    for r in rows
+                ]
+                period_str = (
+                    f"{last_monday.strftime('%d.%m')} – {last_sunday.strftime('%d.%m.%Y')}"
+                )
+                advice = await get_ai_financial_advice(week_txns, period_str, name)
+                if advice:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"🤖 <b>AI haftalik xulosa</b>\n\n"
+                            f"📅 {period_str}\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"{advice}"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🤖 AI Maslahat", callback_data="ai_advice"),
+                            InlineKeyboardButton("🏠 Menyu", callback_data="back_main"),
+                        ]])
+                    )
                 sent += 1
             except Exception as e:
                 failed += 1
@@ -3506,6 +3697,76 @@ async def send_weekly_reports(bot):
 
     except Exception as e:
         logger.error(f"❌ Haftalik hisobot xato: {e}")
+
+
+# ===================== OYLIK AI XULOSA =====================
+
+async def send_monthly_ai_summaries(bot):
+    """Har oyning 1-sanasida o'tgan oyning AI xulosasini yuboradi."""
+    try:
+        now         = datetime.now(pytz.timezone("Asia/Tashkent"))
+        prev_month  = now.month - 1 if now.month > 1 else 12
+        prev_year   = now.year if now.month > 1 else now.year - 1
+        period_str  = f"{MONTH_NAMES[prev_month]} {prev_year}"
+
+        async with db_pool.acquire() as conn:
+            users = await conn.fetch("SELECT telegram_id, name FROM users")
+
+        sent = 0; failed = 0; skipped = 0
+
+        for user in users:
+            user_id   = user["telegram_id"]
+            user_name = user["name"] or "Foydalanuvchi"
+
+            try:
+                premium = await is_user_premium(user_id)
+                if not premium:
+                    skipped += 1
+                    continue
+
+                txns = await get_transactions_by_month(user_id, prev_year, prev_month)
+                if not txns:
+                    skipped += 1
+                    continue
+
+                advice = await get_ai_financial_advice(txns, period_str, user_name)
+                if not advice:
+                    skipped += 1
+                    continue
+
+                income   = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+                expenses = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"📈 <b>Oylik AI Xulosa — {period_str}</b>\n\n"
+                        f"📥 Daromad: <b>{format_money(income)}</b>\n"
+                        f"📤 Xarajat: <b>{format_money(expenses)}</b>\n"
+                        f"💵 Balans: <b>{format_money(income - expenses)}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"{advice}"
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🤖 AI Maslahat", callback_data="ai_advice"),
+                        InlineKeyboardButton("🏠 Menyu", callback_data="back_main"),
+                    ]])
+                )
+                sent += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f"⚠️ Oylik AI xulosa xato {user_id}: {e}")
+
+            await asyncio.sleep(0.3)
+
+        logger.info(
+            f"✅ Oylik AI xulosa: {sent} yuborildi | "
+            f"❌ {failed} xato | ⏭️ {skipped} o'tkazildi"
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Oylik AI xulosa xato: {e}")
 
 
 # ===================== KUNLIK ESLATMA =====================
@@ -4088,6 +4349,16 @@ async def main():
         minute=1,
         args=[app.bot],
         id="weekly_report",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        send_monthly_ai_summaries,
+        trigger="cron",
+        day=1,
+        hour=9,
+        minute=2,
+        args=[app.bot],
+        id="monthly_ai_summary",
         replace_existing=True,
     )
     scheduler.start()
