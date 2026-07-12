@@ -1189,7 +1189,9 @@ def history_months_keyboard(months: list):
     buttons.append([InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
-def generate_calendar_keyboard(year: int, month: int, start_date=None, end_date=None):
+def _build_calendar_grid(year: int, month: int, pfx: str, mark_date=None,
+                          start_date=None, end_date=None) -> list:
+    """Kalendar tugmalar qatorlarini yaratadi (umumiy yordamchi)."""
     weeks = cal_module.monthcalendar(year, month)
     month_name = MONTH_NAMES[month]
 
@@ -1200,32 +1202,37 @@ def generate_calendar_keyboard(year: int, month: int, start_date=None, end_date=
 
     buttons = []
     buttons.append([
-        InlineKeyboardButton("◀️", callback_data=f"cal_p_{prev_year}_{prev_month}"),
-        InlineKeyboardButton(f"{month_name} {year}", callback_data="cal_x"),
-        InlineKeyboardButton("▶️", callback_data=f"cal_n_{next_year}_{next_month}"),
+        InlineKeyboardButton("◀️", callback_data=f"{pfx}p_{prev_year}_{prev_month}"),
+        InlineKeyboardButton(f"{month_name} {year}", callback_data=f"{pfx}x"),
+        InlineKeyboardButton("▶️", callback_data=f"{pfx}n_{next_year}_{next_month}"),
     ])
     buttons.append([
-        InlineKeyboardButton(d, callback_data="cal_x")
+        InlineKeyboardButton(d, callback_data=f"{pfx}x")
         for d in ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
     ])
-
     for week in weeks:
         row = []
         for day in week:
             if day == 0:
-                row.append(InlineKeyboardButton(" ", callback_data="cal_x"))
+                row.append(InlineKeyboardButton(" ", callback_data=f"{pfx}x"))
             else:
-                current = date(year, month, day)
+                cur = date(year, month, day)
                 label = str(day)
-                if start_date and current == start_date:
+                if mark_date and cur == mark_date:
+                    label = f"✔{day}"
+                elif start_date and cur == start_date:
                     label = f"[{day}"
-                elif end_date and current == end_date:
+                elif end_date and cur == end_date:
                     label = f"{day}]"
-                elif start_date and end_date and start_date < current < end_date:
+                elif start_date and end_date and start_date < cur < end_date:
                     label = f"·{day}·"
-                row.append(InlineKeyboardButton(label, callback_data=f"cal_d_{year}_{month}_{day}"))
+                row.append(InlineKeyboardButton(label, callback_data=f"{pfx}d_{year}_{month}_{day}"))
         buttons.append(row)
+    return buttons
 
+
+def generate_calendar_keyboard(year: int, month: int, start_date=None, end_date=None):
+    buttons = _build_calendar_grid(year, month, "cal_", start_date=start_date, end_date=end_date)
     if start_date and end_date:
         buttons.append([
             InlineKeyboardButton("✅ Tasdiqlash", callback_data="cal_confirm"),
@@ -1233,7 +1240,22 @@ def generate_calendar_keyboard(year: int, month: int, start_date=None, end_date=
         ])
     else:
         buttons.append([InlineKeyboardButton("❌ Bekor", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
 
+
+def generate_debt_date_keyboard(year: int, month: int, selected: date = None):
+    buttons = _build_calendar_grid(year, month, "dbt_", mark_date=selected)
+    if selected:
+        buttons.append([
+            InlineKeyboardButton(
+                f"✅ {selected.strftime('%d.%m.%Y')} — Tasdiqlash",
+                callback_data=f"dbt_confirm_{year}_{month}"
+            ),
+        ])
+    buttons.append([
+        InlineKeyboardButton("⏭️ Sana yo'q", callback_data="debt_skip_date"),
+        InlineKeyboardButton("❌ Bekor", callback_data="back_main"),
+    ])
     return InlineKeyboardMarkup(buttons)
 
 def debt_direction_keyboard():
@@ -2803,7 +2825,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "skip_note":
         await _save_transaction(user_id, context, note="", via_query=query)
 
+    elif data == "dbt_x":
+        await query.answer()
+
+    elif data.startswith("dbt_p_") or data.startswith("dbt_n_"):
+        parts = data.split("_")
+        year, month = int(parts[2]), int(parts[3])
+        context.user_data["dbt_cal_year"]  = year
+        context.user_data["dbt_cal_month"] = month
+        selected = context.user_data.get("dbt_selected_date")
+        amount   = context.user_data.get("debt_amount", 0)
+        person   = context.user_data.get("debt_person", "")
+        await query.edit_message_text(
+            f"💰 Miqdor: <b>{format_money(amount)}</b>  👤 <b>{person}</b>\n\n"
+            f"📅 Qaytarish sanasini tanlang:",
+            parse_mode="HTML",
+            reply_markup=generate_debt_date_keyboard(year, month, selected)
+        )
+
+    elif data.startswith("dbt_d_"):
+        parts = data.split("_")
+        year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
+        selected = date(year, month, day)
+        context.user_data["dbt_selected_date"] = selected
+        cal_year  = context.user_data.get("dbt_cal_year", year)
+        cal_month = context.user_data.get("dbt_cal_month", month)
+        amount = context.user_data.get("debt_amount", 0)
+        person = context.user_data.get("debt_person", "")
+        await query.edit_message_text(
+            f"💰 Miqdor: <b>{format_money(amount)}</b>  👤 <b>{person}</b>\n\n"
+            f"📅 Tanlangan sana: <b>{selected.strftime('%d.%m.%Y')}</b>\n\n"
+            f"Tasdiqlash yoki boshqa sana tanlang:",
+            parse_mode="HTML",
+            reply_markup=generate_debt_date_keyboard(cal_year, cal_month, selected)
+        )
+
+    elif data.startswith("dbt_confirm_"):
+        selected = context.user_data.pop("dbt_selected_date", None)
+        for k in ("dbt_cal_year", "dbt_cal_month"):
+            context.user_data.pop(k, None)
+        if not selected:
+            await query.answer("❌ Sana tanlanmagan!")
+            return
+        await _ask_debt_balance(user_id, context, due_date=selected, via_query=query)
+
     elif data == "debt_skip_date":
+        for k in ("dbt_selected_date", "dbt_cal_year", "dbt_cal_month"):
+            context.user_data.pop(k, None)
         await _ask_debt_balance(user_id, context, due_date=None, via_query=query)
 
     elif data == "debt_skip_bal":
@@ -3023,7 +3091,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_budget"),
         context.user_data.get("awaiting_debt_person"),
         context.user_data.get("awaiting_debt_amount"),
-        context.user_data.get("awaiting_debt_date"),
         context.user_data.get("awaiting_balance_name"),
         context.user_data.get("awaiting_balance_amount"),
         context.user_data.get("awaiting_balance_update"),
@@ -3142,30 +3209,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise ValueError
             context.user_data["debt_amount"] = amount
             context.user_data.pop("awaiting_debt_amount")
-            context.user_data["awaiting_debt_date"] = True
+            now = datetime.now()
+            context.user_data["dbt_cal_year"]  = now.year
+            context.user_data["dbt_cal_month"] = now.month
             await update.message.reply_text(
                 f"💰 Miqdor: <b>{format_money(amount)}</b>\n\n"
-                f"📅 Qaytarish sanasini kiriting:\n"
-                f"<i>Masalan: 15.05.2026</i>",
+                f"📅 Qaytarish sanasini tanlang:",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⏭️ Sana yo'q", callback_data="debt_skip_date")
-                ]])
+                reply_markup=generate_debt_date_keyboard(now.year, now.month)
             )
         except ValueError:
             await update.message.reply_text("❌ Faqat musbat raqam kiriting.")
-
-    elif context.user_data.get("awaiting_debt_date"):
-        try:
-            due_date = datetime.strptime(text, "%d.%m.%Y").date()
-            context.user_data.pop("awaiting_debt_date")
-            await _ask_debt_balance(user_id, context, due_date=due_date,
-                                    reply_fn=update.message.reply_text)
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Sana formati noto'g'ri.\n<i>Masalan: 15.05.2026</i>",
-                parse_mode="HTML"
-            )
 
     elif context.user_data.get("awaiting_amount"):
         try:
