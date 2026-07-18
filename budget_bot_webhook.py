@@ -387,6 +387,8 @@ async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with db_pool.acquire() as conn:
+        # DDL migrations uchun server-side statement timeout o'chiriladi
+        await conn.execute("SET statement_timeout = 0")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id   BIGINT PRIMARY KEY,
@@ -441,10 +443,13 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        await conn.execute("""
-            ALTER TABLE debts ADD COLUMN IF NOT EXISTS
-                balance_id INTEGER REFERENCES balances(id) ON DELETE SET NULL
-        """)
+        try:
+            await conn.execute("""
+                ALTER TABLE debts ADD COLUMN IF NOT EXISTS
+                    balance_id INTEGER REFERENCES balances(id) ON DELETE SET NULL
+            """)
+        except Exception as e:
+            logger.warning(f"ALTER TABLE debts (balance_id): {e}")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS login_codes (
                 id         SERIAL PRIMARY KEY,
