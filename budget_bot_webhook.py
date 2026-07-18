@@ -57,6 +57,7 @@ PORT           = int(os.environ.get("PORT", 8080))
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 ADMIN_ID       = int(os.environ.get("ADMIN_ID", "8008645253"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+DASHBOARD_URL  = os.environ.get("DASHBOARD_URL", "")
 
 # Qo'llanma videosi (file_id /getfile komandasi orqali olinadi)
 GUIDE_VIDEO_FILE_ID = os.environ.get("GUIDE_VIDEO_FILE_ID", "")
@@ -444,6 +445,16 @@ async def init_db():
             ALTER TABLE debts ADD COLUMN IF NOT EXISTS
                 balance_id INTEGER REFERENCES balances(id) ON DELETE SET NULL
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS login_codes (
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                code       TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                used       BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -600,6 +611,19 @@ async def update_transaction(telegram_id: int, tx_id: int,
                 "WHERE id = $4 AND telegram_id = $5",
                 f_type, f_amt, f_cat, tx_id, telegram_id)
             return True
+
+async def create_login_code(telegram_id: int) -> str:
+    code = str(secrets.randbelow(900000) + 100000)
+    expires_at = datetime.now() + timedelta(minutes=10)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM login_codes WHERE user_id = $1 AND used = FALSE", telegram_id
+        )
+        await conn.execute("""
+            INSERT INTO login_codes (user_id, code, expires_at)
+            VALUES ($1, $2, $3)
+        """, telegram_id, code, expires_at)
+    return code
 
 async def get_recent_transactions(telegram_id: int, limit: int = 8):
     async with db_pool.acquire() as conn:
@@ -1143,6 +1167,7 @@ def main_keyboard(user_id=None):
          InlineKeyboardButton("💳 Balanslar", callback_data="balances")],
         [InlineKeyboardButton("🗑️ Tozalash", callback_data="clear_month"),
          InlineKeyboardButton("📖 Qo'llanma", callback_data="guide")],
+        [InlineKeyboardButton("🌐 Web-kabinet", callback_data="web_cabinet")],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
@@ -3069,6 +3094,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
         return
+
+    elif data == "web_cabinet":
+        premium = await is_user_premium(user_id)
+        if not premium and user_id != ADMIN_ID:
+            await query.edit_message_text(
+                "🌐 <b>Web Kabinet</b>\n\n"
+                "Bu funksiya faqat <b>premium</b> foydalanuvchilar uchun.\n\n"
+                "Premium obuna orqali moliyangizni web saytda keng ko'rinishda kuzating!",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 Premium olish", callback_data="premium")],
+                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+                ])
+            )
+            return
+        if not DASHBOARD_URL:
+            await query.answer("⚠️ Dashboard hali sozlanmagan", show_alert=True)
+            return
+        code = await create_login_code(user_id)
+        await query.edit_message_text(
+            f"🌐 <b>Web Kabinet</b>\n\n"
+            f"Quyidagi ma'lumotlar bilan kiring:\n\n"
+            f"🔗 <b>Havola:</b> {DASHBOARD_URL}\n\n"
+            f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+            f"🔑 <b>Kirish kodi:</b> <code>{code}</code>\n\n"
+            f"⏱ Kod <b>10 daqiqa</b> amal qiladi va faqat bir marta ishlatiladi.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Yangi kod", callback_data="web_cabinet")],
+                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+            ])
+        )
 
     elif data == "back_main":
         txns  = await get_month_transactions(user_id)
