@@ -3098,7 +3098,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "web_cabinet":
         premium = await is_user_premium(user_id)
         if not premium and user_id != ADMIN_ID:
-            await query.edit_message_text(
+            await safe_edit(
                 "🌐 <b>Web Kabinet</b>\n\n"
                 "Bu funksiya faqat <b>premium</b> foydalanuvchilar uchun.\n\n"
                 "Premium obuna orqali moliyangizni web saytda keng ko'rinishda kuzating!",
@@ -3110,10 +3110,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if not DASHBOARD_URL:
-            await query.answer("⚠️ Dashboard hali sozlanmagan", show_alert=True)
+            await safe_edit(
+                "🌐 <b>Web Kabinet</b>\n\n"
+                "⚠️ Dashboard hali sozlanmagan.\n\n"
+                "Admin sozlamalarida <b>DASHBOARD_URL</b> ni kiriting.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+                ])
+            )
             return
-        code = await create_login_code(user_id)
-        await query.edit_message_text(
+        try:
+            code = await create_login_code(user_id)
+        except Exception as e:
+            logger.error(f"create_login_code xatolik: {e}")
+            await safe_edit(
+                "🌐 <b>Web Kabinet</b>\n\n"
+                "❌ Kod yaratishda xatolik yuz berdi. Iltimos qaytadan urinib ko'ring.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Qayta urinish", callback_data="web_cabinet")],
+                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+                ])
+            )
+            return
+        await safe_edit(
             f"🌐 <b>Web Kabinet</b>\n\n"
             f"Quyidagi ma'lumotlar bilan kiring:\n\n"
             f"🔗 <b>Havola:</b> {DASHBOARD_URL}\n\n"
