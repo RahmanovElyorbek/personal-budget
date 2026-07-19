@@ -70,7 +70,7 @@ PRICE_YEARLY    = 199000
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    stream=sys.stdout,
+    stream=sys.stderr,
 )
 logger = logging.getLogger(__name__)
 
@@ -4445,16 +4445,15 @@ async def webhook_handler(request, application):
     return web.Response(status=200)
 
 async def main():
-    # Render port detection uchun: portni BIRINCHI ochamiz
-    # Bot tayyor bo'lguncha webhook so'rovlar 503 qaytaradi
-    bot_ref = {"app": None}
     webhook_path = f"/webhook/{BOT_TOKEN}"
+    bot_ref = {"app": None}
 
     async def dynamic_webhook(request):
         if bot_ref["app"] is None:
             return web.Response(status=503, text="Bot initializing, retry shortly")
         return await webhook_handler(request, bot_ref["app"])
 
+    # 1. Portni BIRINCHI ochamiz — Render shu yerda portni aniqlaydi
     web_app = web.Application()
     web_app.router.add_get("/", health)
     web_app.router.add_post(webhook_path, dynamic_webhook)
@@ -4466,54 +4465,75 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"🚀 Port {PORT} ochildi — bot ishga tushmoqda...")
+    print(f"🚀 Port {PORT} ochildi — bot ishga tushmoqda...", flush=True)
 
-    async def _startup():
-        try:
-            logger.info("🔄 [1/5] DB ulanmoqda...")
-            await init_db()
-            logger.info("✅ [2/5] DB tayyor — bot qurilmoqda...")
+    # 2. DB — 45 soniya timeout
+    try:
+        print("🔄 [1/5] DB ulanmoqda...", flush=True)
+        await asyncio.wait_for(init_db(), timeout=45)
+        print("✅ [2/5] DB tayyor!", flush=True)
+    except asyncio.TimeoutError:
+        print("❌ [1/5] DB ulanishi 45 soniyada timeout!", flush=True)
+        await asyncio.Event().wait()
+        return
+    except Exception as e:
+        print(f"❌ [1/5] DB xatolik: {e}", flush=True)
+        await asyncio.Event().wait()
+        return
 
-            app = Application.builder().token(BOT_TOKEN).build()
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(CommandHandler("help", help_command))
-            app.add_handler(CommandHandler("oxirgi", recent_command))
-            app.add_handler(CommandHandler("mcp_token", mcp_token_command))
-            app.add_handler(CommandHandler("testreminder", admin_test_reminder))
-            app.add_handler(CommandHandler("adminstats", admin_stats))
-            app.add_handler(CallbackQueryHandler(button_handler))
-            app.add_handler(MessageHandler(filters.VOICE, voice_handler))
-            app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-            app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, video_handler))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # 3. Bot handlers
+    print("🔄 [3/5] Telegram bot qurilmoqda...", flush=True)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("oxirgi", recent_command))
+    app.add_handler(CommandHandler("mcp_token", mcp_token_command))
+    app.add_handler(CommandHandler("testreminder", admin_test_reminder))
+    app.add_handler(CommandHandler("adminstats", admin_stats))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, video_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-            logger.info("🔄 [3/5] Telegram ulanmoqda...")
-            await app.initialize()
-            await app.start()
-            logger.info("✅ [4/5] Telegram bot tayyor — webhook sozlanmoqda...")
+    # 4. Telegram ulanishi — 30 soniya timeout
+    try:
+        print("🔄 [4/5] Telegram ulanmoqda...", flush=True)
+        await asyncio.wait_for(app.initialize(), timeout=30)
+        await asyncio.wait_for(app.start(), timeout=30)
+        print("✅ [4/5] Telegram tayyor!", flush=True)
+    except asyncio.TimeoutError:
+        print("❌ [4/5] Telegram ulanishi 30 soniyada timeout!", flush=True)
+        await asyncio.Event().wait()
+        return
+    except Exception as e:
+        print(f"❌ [4/5] Telegram xatolik: {e}", flush=True)
+        await asyncio.Event().wait()
+        return
 
-            bot_ref["app"] = app  # endi webhook so'rovlar qabul qilinadi
+    bot_ref["app"] = app  # endi 200 qaytariladi
 
-            await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
-            logger.info(f"✅ [5/5] Webhook set: {WEBHOOK_URL}{webhook_path}")
+    # 5. Webhook va scheduler
+    try:
+        await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
+        print(f"✅ [5/5] Webhook set: {WEBHOOK_URL}{webhook_path}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Webhook xatolik (bot ishlaydi): {e}", flush=True)
 
-            scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Tashkent"))
-            scheduler.add_job(send_daily_reminders, trigger="cron", hour=20, minute=0,
-                              args=[app.bot], id="daily_reminder", replace_existing=True)
-            scheduler.add_job(send_debt_reminders, trigger="cron", hour=9, minute=0,
-                              args=[app.bot], id="debt_reminder", replace_existing=True)
-            scheduler.add_job(send_weekly_reports, trigger="cron", day_of_week="mon",
-                              hour=9, minute=1, args=[app.bot], id="weekly_report",
-                              replace_existing=True)
-            scheduler.add_job(send_monthly_ai_summaries, trigger="cron", day=1, hour=9,
-                              minute=2, args=[app.bot], id="monthly_ai_summary",
-                              replace_existing=True)
-            scheduler.start()
-            logger.info("🎉 Bot to'liq ishga tushdi! Scheduler: kunlik 20:00 + qarz 9:00 + haftalik 9:01")
-        except Exception as e:
-            logger.error(f"❌ Bot ishga tushishda xatolik: {e}", exc_info=True)
+    scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Tashkent"))
+    scheduler.add_job(send_daily_reminders, trigger="cron", hour=20, minute=0,
+                      args=[app.bot], id="daily_reminder", replace_existing=True)
+    scheduler.add_job(send_debt_reminders, trigger="cron", hour=9, minute=0,
+                      args=[app.bot], id="debt_reminder", replace_existing=True)
+    scheduler.add_job(send_weekly_reports, trigger="cron", day_of_week="mon",
+                      hour=9, minute=1, args=[app.bot], id="weekly_report",
+                      replace_existing=True)
+    scheduler.add_job(send_monthly_ai_summaries, trigger="cron", day=1, hour=9,
+                      minute=2, args=[app.bot], id="monthly_ai_summary",
+                      replace_existing=True)
+    scheduler.start()
+    print("🎉 Bot to'liq ishga tushdi!", flush=True)
 
-    asyncio.create_task(_startup())
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
