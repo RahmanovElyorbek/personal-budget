@@ -387,7 +387,13 @@ db_pool = None
 
 async def init_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        connect_timeout=30,
+        command_timeout=60,
+    )
     async with db_pool.acquire() as conn:
         # DDL migrations uchun server-side statement timeout o'chiriladi
         await conn.execute("SET statement_timeout = 0")
@@ -4462,72 +4468,52 @@ async def main():
     await site.start()
     logger.info(f"🚀 Port {PORT} ochildi — bot ishga tushmoqda...")
 
-    # Port ochildi, endi DB va bot sozlanadi
-    await init_db()
+    async def _startup():
+        try:
+            logger.info("🔄 [1/5] DB ulanmoqda...")
+            await init_db()
+            logger.info("✅ [2/5] DB tayyor — bot qurilmoqda...")
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("oxirgi", recent_command))
-    app.add_handler(CommandHandler("mcp_token", mcp_token_command))
-    app.add_handler(CommandHandler("testreminder", admin_test_reminder))
-    app.add_handler(CommandHandler("adminstats", admin_stats))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.VOICE, voice_handler))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, video_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+            app = Application.builder().token(BOT_TOKEN).build()
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("help", help_command))
+            app.add_handler(CommandHandler("oxirgi", recent_command))
+            app.add_handler(CommandHandler("mcp_token", mcp_token_command))
+            app.add_handler(CommandHandler("testreminder", admin_test_reminder))
+            app.add_handler(CommandHandler("adminstats", admin_stats))
+            app.add_handler(CallbackQueryHandler(button_handler))
+            app.add_handler(MessageHandler(filters.VOICE, voice_handler))
+            app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+            app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, video_handler))
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    await app.initialize()
-    await app.start()
+            logger.info("🔄 [3/5] Telegram ulanmoqda...")
+            await app.initialize()
+            await app.start()
+            logger.info("✅ [4/5] Telegram bot tayyor — webhook sozlanmoqda...")
 
-    bot_ref["app"] = app  # endi webhook so'rovlar qabul qilinadi
+            bot_ref["app"] = app  # endi webhook so'rovlar qabul qilinadi
 
-    await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
-    logger.info(f"✅ Webhook set: {WEBHOOK_URL}{webhook_path}")
+            await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
+            logger.info(f"✅ [5/5] Webhook set: {WEBHOOK_URL}{webhook_path}")
 
-    scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Tashkent"))
-    scheduler.add_job(
-        send_daily_reminders,
-        trigger="cron",
-        hour=20,
-        minute=0,
-        args=[app.bot],
-        id="daily_reminder",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        send_debt_reminders,
-        trigger="cron",
-        hour=9,
-        minute=0,
-        args=[app.bot],
-        id="debt_reminder",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        send_weekly_reports,
-        trigger="cron",
-        day_of_week="mon",
-        hour=9,
-        minute=1,
-        args=[app.bot],
-        id="weekly_report",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        send_monthly_ai_summaries,
-        trigger="cron",
-        day=1,
-        hour=9,
-        minute=2,
-        args=[app.bot],
-        id="monthly_ai_summary",
-        replace_existing=True,
-    )
-    scheduler.start()
-    logger.info("🔔 Scheduler: kunlik 20:00 + qarz 9:00 + haftalik Dushanba 9:01 (Asia/Tashkent)")
+            scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Tashkent"))
+            scheduler.add_job(send_daily_reminders, trigger="cron", hour=20, minute=0,
+                              args=[app.bot], id="daily_reminder", replace_existing=True)
+            scheduler.add_job(send_debt_reminders, trigger="cron", hour=9, minute=0,
+                              args=[app.bot], id="debt_reminder", replace_existing=True)
+            scheduler.add_job(send_weekly_reports, trigger="cron", day_of_week="mon",
+                              hour=9, minute=1, args=[app.bot], id="weekly_report",
+                              replace_existing=True)
+            scheduler.add_job(send_monthly_ai_summaries, trigger="cron", day=1, hour=9,
+                              minute=2, args=[app.bot], id="monthly_ai_summary",
+                              replace_existing=True)
+            scheduler.start()
+            logger.info("🎉 Bot to'liq ishga tushdi! Scheduler: kunlik 20:00 + qarz 9:00 + haftalik 9:01")
+        except Exception as e:
+            logger.error(f"❌ Bot ishga tushishda xatolik: {e}", exc_info=True)
 
+    asyncio.create_task(_startup())
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
