@@ -391,7 +391,7 @@ async def init_db():
         DATABASE_URL,
         min_size=1,
         max_size=5,
-        connect_timeout=30,
+        timeout=30,
         command_timeout=60,
     )
     async with db_pool.acquire() as conn:
