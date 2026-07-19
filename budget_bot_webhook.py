@@ -103,8 +103,9 @@ async def transcribe_voice(file_path: str) -> str:
     gpt-4o-mini-transcribe -> whisper-1 fallback zanjiri orqali."""
 
     whisper_prompt = (
-        "Bu o'zbek tilidagi moliyaviy ovoz xabari. Foydalanuvchi kunlik xarajat, "
-        "daromad yoki qarz haqida gapiradi. Raqamlar so'zma-so'z aytiladi.\n"
+        "Bu o'zbek tilida aytilgan moliyaviy ovoz xabari. Foydalanuvchi kunlik "
+        "xarajat, daromad yoki qarz haqida o'zbek tilida gapiradi. Raqamlar "
+        "so'zma-so'z aytiladi.\n"
         "Misollar: 'Bozordan olti yuz ming so'mga bozorlik qildim.' "
         "'Sardorga to'rt yuz ming so'm qarz berdim.' "
         "'Mashinaga o'n besh ming so'mlik benzin quydim.' "
@@ -113,29 +114,33 @@ async def transcribe_voice(file_path: str) -> str:
     )
 
     for model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"):
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                with open(file_path, "rb") as f:
-                    response = await client.post(
-                        "https://api.openai.com/v1/audio/transcriptions",
-                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                        files={"file": ("voice.ogg", f, "audio/ogg")},
-                        data={
-                            "model": model,
-                            "language": "uz",
-                            "prompt": whisper_prompt,
-                            "temperature": 0,
-                        }
-                    )
-                if response.status_code == 200:
-                    text = response.json().get("text", "")
-                    logger.info(f"🎤 {model}: '{text}'")
-                    if text and len(text.strip()) > 3:
-                        return text
-                else:
-                    logger.warning(f"{model} xato: {response.text}")
-        except Exception as e:
-            logger.warning(f"{model} exception: {e}")
+        # "uz" tili kodi OpenAI validatsiyasida rad etilishi mumkin — shu holatda
+        # language parametrisiz (avtomatik aniqlash + prompt orqali til maslahati)
+        # bilan qayta urinamiz.
+        for use_language in (True, False):
+            try:
+                data = {"model": model, "prompt": whisper_prompt, "temperature": 0}
+                if use_language:
+                    data["language"] = "uz"
+                async with httpx.AsyncClient(timeout=30) as client:
+                    with open(file_path, "rb") as f:
+                        response = await client.post(
+                            "https://api.openai.com/v1/audio/transcriptions",
+                            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                            files={"file": ("voice.ogg", f, "audio/ogg")},
+                            data=data,
+                        )
+                    if response.status_code == 200:
+                        text = response.json().get("text", "")
+                        logger.info(f"🎤 {model} (lang={use_language}): '{text}'")
+                        if text and len(text.strip()) > 3:
+                            return text
+                    else:
+                        logger.warning(f"{model} (lang={use_language}) xato: {response.text}")
+                        if "language" not in response.text.lower():
+                            break  # boshqa turdagi xato — language'siz qayta urinish foydasiz
+            except Exception as e:
+                logger.warning(f"{model} (lang={use_language}) exception: {e}")
 
     logger.error("Transcribe: barcha modellar muvaffaqiyatsiz")
     return ""
