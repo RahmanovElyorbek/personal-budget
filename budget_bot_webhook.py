@@ -99,67 +99,46 @@ MONTH_NAMES = {
 }
 
 async def transcribe_voice(file_path: str) -> str:
-    """Ovozni matnga aylantiradi (whisper-1 + tr til kodi)."""
+    """Ovozni matnga aylantiradi. gpt-4o-transcribe (o'zbek tilida aniqroq) ->
+    gpt-4o-mini-transcribe -> whisper-1 fallback zanjiri orqali."""
 
     whisper_prompt = (
-        "Bu o'zbek tilidagi moliyaviy ovoz xabari. "
-        "Raqamlar so'mda: ming, ikki ming, besh ming, o'n ming, "
-        "ellik ming, yuz ming, ikki yuz ming, uch yuz ming, "
-        "to'rt yuz ming, besh yuz ming, olti yuz ming, million. "
-        "Misol: Bozordan olti yuz ming so'mga xarid qildim. "
-        "Sardorga to'rt yuz ming so'm qarz berdim. "
-        "Mashinaga ikki yuz ming yoqilg'i quydirdim."
+        "Bu o'zbek tilidagi moliyaviy ovoz xabari. Foydalanuvchi kunlik xarajat, "
+        "daromad yoki qarz haqida gapiradi. Raqamlar so'zma-so'z aytiladi.\n"
+        "Misollar: 'Bozordan olti yuz ming so'mga bozorlik qildim.' "
+        "'Sardorga to'rt yuz ming so'm qarz berdim.' "
+        "'Mashinaga o'n besh ming so'mlik benzin quydim.' "
+        "'Qizimga o'n ming so'm berdim.' "
+        "'Oyligimni oldim, uch million besh yuz ming so'm.'"
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            with open(file_path, "rb") as f:
-                response = await client.post(
-                    "https://api.openai.com/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    files={"file": ("voice.ogg", f, "audio/ogg")},
-                    data={
-                        "model": "whisper-1",
-                        "language": "uz",  # avval uz bilan urinib ko'ramiz
-                        "prompt": whisper_prompt,
-                        "temperature": 0,
-                    }
-                )
-            if response.status_code == 200:
-                text = response.json().get("text", "")
-                logger.info(f"🎤 whisper-1 (uz): '{text}'")
-                if text and len(text.strip()) > 3:
-                    return text
-            else:
-                logger.warning(f"whisper-1 uz xato: {response.text}")
-    except Exception as e:
-        logger.warning(f"whisper-1 uz exception: {e}")
+    for model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                with open(file_path, "rb") as f:
+                    response = await client.post(
+                        "https://api.openai.com/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                        files={"file": ("voice.ogg", f, "audio/ogg")},
+                        data={
+                            "model": model,
+                            "language": "uz",
+                            "prompt": whisper_prompt,
+                            "temperature": 0,
+                        }
+                    )
+                if response.status_code == 200:
+                    text = response.json().get("text", "")
+                    logger.info(f"🎤 {model}: '{text}'")
+                    if text and len(text.strip()) > 3:
+                        return text
+                else:
+                    logger.warning(f"{model} xato: {response.text}")
+        except Exception as e:
+            logger.warning(f"{model} exception: {e}")
 
-    # Fallback: turk tili bilan urinib ko'ramiz (akustik o'xshashlik)
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            with open(file_path, "rb") as f:
-                response = await client.post(
-                    "https://api.openai.com/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    files={"file": ("voice.ogg", f, "audio/ogg")},
-                    data={
-                        "model": "whisper-1",
-                        "language": "tr",
-                        "prompt": whisper_prompt,
-                        "temperature": 0,
-                    }
-                )
-            if response.status_code == 200:
-                text = response.json().get("text", "")
-                logger.info(f"🎤 whisper-1 (tr fallback): '{text}'")
-                return text
-            else:
-                logger.error(f"whisper-1 tr ham xato: {response.text}")
-                return ""
-    except Exception as e:
-        logger.error(f"Transcribe to'liq xato: {e}")
-        return ""
+    logger.error("Transcribe: barcha modellar muvaffaqiyatsiz")
+    return ""
 
 async def parse_voice_transactions(text: str) -> list:
     """GPT-4o-mini orqali matndan BIR YOKI BIR NECHTA amaliyotni ajratadi.
@@ -170,44 +149,52 @@ async def parse_voice_transactions(text: str) -> list:
 
     system_prompt = (
         "Sen o'zbek tilidagi moliyaviy ovoz xabarlarini tahlil qiluvchi yordamchisan.\n"
-        "Foydalanuvchi BITTA gapda BIR YOKI BIR NECHTA moliyaviy amaliyotni aytishi mumkin.\n"
-        "Har bir alohida amaliyotni ajrat.\n\n"
+        "Foydalanuvchi BITTA gapda BIR, IKKI YOKI UCHTA moliyaviy amaliyotni ketma-ket "
+        "aytishi mumkin (odatda vergul, 'va', 'hamda', 'keyin', 'so'ngra' bilan ajratiladi). "
+        "Har bir alohida amaliyotni topib, alohida obyekt sifatida chiqar — hech birini "
+        "tushirib qoldirma.\n\n"
         "MUHIM: Har doim shu formatda JSON qaytar:\n"
         '{\"transactions\": [ {...}, {...} ]}\n\n'
         "Har bir amaliyot uchun:\n"
         "1. type: 'income' | 'expense' | 'debt_gave' | 'debt_took'\n"
-        "   - 'sarfladim/berdim/to'ladim/oldim (mahsulot)/xarjladim' = expense\n"
-        "   - 'maosh/tushdi/kirdi/daromad/ishlab topdim' = income\n"
-        "   - 'qarz berdim/qarzga berdim' = debt_gave\n"
-        "   - 'qarz oldim/qarzga oldim' = debt_took\n"
-        "2. amount: butun son (so'mda). RAQAMLAR JADVALI:\n"
-        "   - 'ming' = 1000\n"
-        "   - 'ikki ming' = 2000\n"
-        "   - 'besh ming' = 5000\n"
-        "   - 'o'n ming' = 10000\n"
-        "   - 'ellik ming' = 50000\n"
-        "   - 'yuz ming' = 100000\n"
-        "   - 'ikki yuz ming' / 'ikiz min' / 'iki yuz min' = 200000\n"
-        "   - 'uch yuz ming' / 'üçüz min' / 'uchz min' = 300000\n"
-        "   - 'to'rt yuz ming' / 'dörüz min' / 'dört yüz min' = 400000\n"
-        "   - 'besh yuz ming' / 'beşüz min' = 500000\n"
-        "   - 'olti yuz ming' / 'altıyüz min' = 600000\n"
-        "   - 'million' / 'milyon' = 1000000\n"
-        "   MUHIM: Whisper turkcha-ozarbayjon tilida transkripsiya qilishi mumkin. "
-        "   'üçüz min' = uch yuz ming (300000), 'dörüz min' = to'rt yuz ming (400000), "
-        "   'beşüz min' = besh yuz ming (500000). Bu xato emas, transliteratsiya.\n"
+        "   - 'sarfladim/(mahsulot uchun) berdim/to'ladim/xarjladim/oldim (sotib)' = expense\n"
+        "   - 'maosh/tushdi/kirdi/daromad/ishlab topdim/sotdim' = income\n"
+        "   - 'qarz berdim/qarzga berdim/qarz qildim (biror kishiga)' = debt_gave\n"
+        "   - 'qarz oldim/qarzga oldim/qarzimni qaytardim' = debt_took\n"
+        "   MUHIM: 'qarz' so'zi ANIQ aytilmagan bo'lsa, buni debt deb hisoblama — "
+        "   oddiy 'berdim' (masalan qizimga/o'g'limga pul berish) odatda EXPENSE bo'ladi, "
+        "   debt EMAS.\n"
+        "2. amount: butun son (so'mda). O'zbekcha sonlarni QISMLARDAN QO'SHIB hisobla:\n"
+        "   - 'ming'=1 000, 'o'n ming'=10 000, 'yigirma ming'=20 000, 'ellik ming'=50 000\n"
+        "   - 'yuz ming'=100 000, 'ikki yuz ming'=200 000, 'uch yuz ming'=300 000\n"
+        "   - 'yuz ellik ming'=150 000 ('yuz'+'ellik ming' qo'shiladi)\n"
+        "   - 'million'=1 000 000, 'bir yarim million'=1 500 000\n"
+        "   QOIDA: har bir son so'zini alohida qiymatga aylantirib, ULARNI QO'SH "
+        "   (masalan 'ikki yuz o'n besh ming' = 200000+10000+5000 = 215000).\n"
+        "   Agar audio matni buzilgan yoki tanish bo'lmagan tovushga o'xshasa (masalan "
+        "   'üçüz', 'dörüz', 'beşüz' kabi turkcha aralashgan so'zlar chiqsa), buni mos "
+        "   o'zbekcha songa mosla: üçüz≈uch yuz, dörüz≈to'rt yuz, beşüz≈besh yuz — "
+        "   FAQAT boshqa aniqroq talqin topilmaganda ishlat.\n"
         "3. category: faqat expense/income uchun. Quyidagidan ANIQ BIRI:\n"
         f"   Xarajat: {expense_cats}\n"
         f"   Daromad: {income_cats}\n"
         "4. note: qisqa izoh (3-8 so'z)\n"
         "5. person: faqat debt uchun — kim (masalan 'Sardor'). Aks holda null\n\n"
-        "MISOL kirish: 'bozordan 600 ming bozorlik qildim, mashinaga 200 ming "
-        "yoqilg'i quydirdim, Sardorga 300 ming qarz berdim'\n"
-        "MISOL chiqish:\n"
+        "MISOL 1 kirish: 'bozordan olti yuz ming bozorlik qildim, mashinaga ikki yuz ming "
+        "yoqilg'i quydirdim, Sardorga uch yuz ming qarz berdim'\n"
+        "MISOL 1 chiqish:\n"
         '{\"transactions\": ['
         '{\"type\":\"expense\",\"amount\":600000,\"category\":\"🍔 Oziq-ovqat\",\"note\":\"Bozorlik\",\"person\":null},'
         '{\"type\":\"expense\",\"amount\":200000,\"category\":\"🚌 Transport\",\"note\":\"Yoqilg\'i\",\"person\":null},'
         '{\"type\":\"debt_gave\",\"amount\":300000,\"category\":null,\"note\":\"Qarz berildi\",\"person\":\"Sardor\"}'
+        ']}\n\n'
+        "MISOL 2 kirish: 'qizimga o'n ming so'm berdim, mashinaga ellik ming so'mlik benzin "
+        "quydim, oyligimni oldim uch million so'm'\n"
+        "MISOL 2 chiqish (bu yerda 3 ta amaliyot bor, 'qarz' so'zi yo'q — hammasi expense/income):\n"
+        '{\"transactions\": ['
+        '{\"type\":\"expense\",\"amount\":10000,\"category\":\"📦 Boshqa\",\"note\":\"Qizimga berildi\",\"person\":null},'
+        '{\"type\":\"expense\",\"amount\":50000,\"category\":\"🚌 Transport\",\"note\":\"Benzin\",\"person\":null},'
+        '{\"type\":\"income\",\"amount\":3000000,\"category\":\"💼 Maosh\",\"note\":\"Oylik maosh\",\"person\":null}'
         ']}\n\n'
         "Tushunarsiz bo'lsa: {\"transactions\": []}\n"
         "FAQAT JSON qaytar, boshqa hech narsa yozma!"
