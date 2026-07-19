@@ -14,6 +14,7 @@
 
 import logging
 import os
+import sys
 import asyncio
 import asyncpg
 import tempfile
@@ -68,7 +69,8 @@ PRICE_YEARLY    = 199000
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
