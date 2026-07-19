@@ -4437,6 +4437,30 @@ async def webhook_handler(request, application):
     return web.Response(status=200)
 
 async def main():
+    # Render port detection uchun: portni BIRINCHI ochamiz
+    # Bot tayyor bo'lguncha webhook so'rovlar 503 qaytaradi
+    bot_ref = {"app": None}
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+
+    async def dynamic_webhook(request):
+        if bot_ref["app"] is None:
+            return web.Response(status=503, text="Bot initializing, retry shortly")
+        return await webhook_handler(request, bot_ref["app"])
+
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    web_app.router.add_post(webhook_path, dynamic_webhook)
+    web_app.router.add_get("/.well-known/mcp.json", mcp_manifest_handler)
+    web_app.router.add_post("/mcp/tools/{tool_name}", mcp_tool_handler)
+    web_app.router.add_post("/mcp", mcp_jsonrpc_handler)
+
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🚀 Port {PORT} ochildi — bot ishga tushmoqda...")
+
+    # Port ochildi, endi DB va bot sozlanadi
     await init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -4455,7 +4479,8 @@ async def main():
     await app.initialize()
     await app.start()
 
-    webhook_path = f"/webhook/{BOT_TOKEN}"
+    bot_ref["app"] = app  # endi webhook so'rovlar qabul qilinadi
+
     await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
     logger.info(f"✅ Webhook set: {WEBHOOK_URL}{webhook_path}")
 
@@ -4500,19 +4525,6 @@ async def main():
     )
     scheduler.start()
     logger.info("🔔 Scheduler: kunlik 20:00 + qarz 9:00 + haftalik Dushanba 9:01 (Asia/Tashkent)")
-
-    web_app = web.Application()
-    web_app.router.add_get("/", health)
-    web_app.router.add_post(webhook_path, lambda r: webhook_handler(r, app))
-    web_app.router.add_get("/.well-known/mcp.json", mcp_manifest_handler)
-    web_app.router.add_post("/mcp/tools/{tool_name}", mcp_tool_handler)
-    web_app.router.add_post("/mcp", mcp_jsonrpc_handler)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"🚀 Server started on port {PORT}")
 
     await asyncio.Event().wait()
 
