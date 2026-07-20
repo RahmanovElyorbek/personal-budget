@@ -2774,17 +2774,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "Hali balans qo'shilmagan."
 
         buttons = []
-        if bals:
-            bal_buttons = []
-            for b in bals:
-                bal_buttons.append(
-                    InlineKeyboardButton(f"✏️ {b['name']}", callback_data=f"bal_edit_{b['id']}")
-                )
-                if len(bal_buttons) == 2:
-                    buttons.append(bal_buttons)
-                    bal_buttons = []
-            if bal_buttons:
-                buttons.append(bal_buttons)
+        for b in bals:
+            buttons.append([
+                InlineKeyboardButton(f"✏️ {b['name']}", callback_data=f"bal_edit_{b['id']}"),
+                InlineKeyboardButton("🗑️", callback_data=f"bal_delconfirm_{b['id']}"),
+            ])
 
         buttons.append([InlineKeyboardButton("➕ Yangi balans", callback_data="add_balance")])
         buttons.append([InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")])
@@ -2821,6 +2815,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🗑️ O'chirish", callback_data=f"bal_delete_{bal_id}"),
                 InlineKeyboardButton("🔙 Orqaga", callback_data="balances")
+            ]])
+        )
+
+    elif data.startswith("bal_delconfirm_"):
+        bal_id = int(data.split("_")[2])
+        bals = await get_balances(user_id)
+        bal = next((b for b in bals if b["id"] == bal_id), None)
+        if not bal:
+            await query.answer("❌ Balans topilmadi", show_alert=True)
+            return
+        type_name = BALANCE_TYPES.get(bal["type"], "📦 Boshqa")
+        await query.edit_message_text(
+            f"❗ <b>{type_name} — {bal['name']}</b> balansini o'chirmoqchimisiz?\n\n"
+            f"💵 Undagi mablag': {format_money(float(bal['amount']))}\n\n"
+            f"<i>Tranzaksiya tarixi saqlanib qoladi, faqat balans o'zi o'chadi.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"bal_delete_{bal_id}"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data="balances"),
             ]])
         )
 
