@@ -3556,7 +3556,7 @@ async def _show_recent(telegram_id, reply_fn=None, query=None):
 
 # ===================== HAFTALIK PDF =====================
 
-def generate_weekly_pdf(user_name, week_data, week_start, week_end):
+def generate_weekly_pdf(user_name, week_data, week_start, week_end, transactions=None):
     """Haftalik hisobot uchun chiroyli PDF yaratadi."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4,
@@ -3579,6 +3579,11 @@ def generate_weekly_pdf(user_name, week_data, week_start, week_end):
     heading_style = ParagraphStyle(
         'Heading', parent=styles['Heading2'],
         fontSize=13, spaceAfter=10, textColor=colors.HexColor('#2255A8')
+    )
+    cat_heading_style = ParagraphStyle(
+        'CatHeading', parent=styles['Heading3'],
+        fontSize=12, spaceAfter=8, spaceBefore=10,
+        textColor=colors.HexColor('#2255A8')
     )
 
     elements = []
@@ -3674,6 +3679,71 @@ def generate_weekly_pdf(user_name, week_data, week_start, week_end):
         ]))
         elements.append(daily_table)
 
+    if transactions:
+        cat_txns = {}
+        for t in transactions:
+            cat = t.get("category") or "📦 Boshqa"
+            cat_txns.setdefault(cat, []).append(t)
+
+        def _detail_table(txns, ttype, header_bg, header_fg):
+            detail_data = [["Sana", "Miqdor", "Izoh"]]
+            for t in txns:
+                if t["type"] != ttype:
+                    continue
+                date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
+                note = t.get("note", "") or "—"
+                if len(note) > 50:
+                    note = note[:47] + "..."
+                detail_data.append([date_str, f"{float(t['amount']):,.0f} so'm", note])
+            if len(detail_data) == 1:
+                return None
+            tbl = Table(detail_data, colWidths=[2.5*cm, 4*cm, 10.5*cm])
+            tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), header_bg),
+                ('TEXTCOLOR', (0, 0), (-1, 0), header_fg),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('GRID', (0, 0), (-1, -1), 0.3, colors.lightgrey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#FAFBFD')]),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            return tbl
+
+        expense_cats = sorted(
+            [(c, ts) for c, ts in cat_txns.items() if any(t["type"] == "expense" for t in ts)],
+            key=lambda x: -sum(float(t["amount"]) for t in x[1] if t["type"] == "expense")
+        )
+        if expense_cats:
+            elements.append(Spacer(1, 0.7*cm))
+            elements.append(Paragraph("Batafsil xarajatlar (izohlar bilan):", heading_style))
+            for cat, txns in expense_cats:
+                cat_total = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+                tbl = _detail_table(txns, "expense", colors.HexColor('#E8EDF5'), colors.HexColor('#2255A8'))
+                if tbl is None:
+                    continue
+                elements.append(Paragraph(f"{cat} — {cat_total:,.0f} so'm", cat_heading_style))
+                elements.append(tbl)
+                elements.append(Spacer(1, 0.3*cm))
+
+        income_cats = sorted(
+            [(c, ts) for c, ts in cat_txns.items() if any(t["type"] == "income" for t in ts)],
+            key=lambda x: -sum(float(t["amount"]) for t in x[1] if t["type"] == "income")
+        )
+        if income_cats:
+            elements.append(Spacer(1, 0.3*cm))
+            elements.append(Paragraph("Batafsil daromadlar (izohlar bilan):", heading_style))
+            for cat, txns in income_cats:
+                cat_total = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+                tbl = _detail_table(txns, "income", colors.HexColor('#E8F5E9'), colors.HexColor('#2E7D32'))
+                if tbl is None:
+                    continue
+                elements.append(Paragraph(f"{cat} — {cat_total:,.0f} so'm", cat_heading_style))
+                elements.append(tbl)
+                elements.append(Spacer(1, 0.3*cm))
+
     elements.append(Spacer(1, 1*cm))
     footer_style = ParagraphStyle(
         'Footer', parent=styles['Normal'],
@@ -3716,7 +3786,7 @@ async def send_weekly_reports(bot):
 
             async with db_pool.acquire() as conn:
                 rows = await conn.fetch("""
-                    SELECT type, amount, category, date
+                    SELECT type, amount, category, note, date
                     FROM transactions
                     WHERE telegram_id = $1
                       AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
@@ -3774,11 +3844,13 @@ async def send_weekly_reports(bot):
                 "categories": categories,
                 "daily": daily,
             }
+            week_transactions = [dict(r) for r in rows]
 
             try:
                 pdf_bytes = generate_weekly_pdf(
                     name, week_data,
-                    last_monday, last_sunday
+                    last_monday, last_sunday,
+                    transactions=week_transactions,
                 )
 
                 balance = income - expense
