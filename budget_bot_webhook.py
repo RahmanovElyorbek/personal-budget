@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+import statistics
 import asyncio
 import asyncpg
 import tempfile
@@ -820,6 +821,133 @@ async def get_balances(telegram_id: int) -> list:
         """, telegram_id)
         return [dict(r) for r in rows]
 
+# ===================== OYLIK PROGNOZ (BOSQICH 3, deterministik) =====================
+
+def _forecast_local_day(tx: dict) -> int:
+    tz = pytz.timezone("Asia/Tashkent")
+    return tx["date"].astimezone(tz).day
+
+def _forecast_find_match(cands: list, ttype: str, category: str, amount: float):
+    """Tur+kategoriya bir xil va summa ±20% ichida bo'lgan birinchi nomzodni topadi."""
+    if amount == 0:
+        return None
+    for c in cands:
+        if c["type"] != ttype or c["category"] != category:
+            continue
+        camt = float(c["amount"])
+        if abs(camt - amount) / amount <= 0.20:
+            return c
+    return None
+
+async def calculate_monthly_forecast(telegram_id: int) -> dict:
+    """Oy oxiri balans prognozini hisoblaydi — TO'LIQ deterministik (Python),
+    LLM ishlatilmaydi. Qaytadi:
+    {"available": False, "reason": "too_early"|"not_enough_history"} yoki
+    {"available": True, "low": .., "high": .., "daily_median": .., "remaining_days": ..}
+    """
+    tz = pytz.timezone("Asia/Tashkent")
+    today = datetime.now(tz).date()
+
+    if today.day <= 10:
+        return {"available": False, "reason": "too_early"}
+
+    available_months = await get_available_months(telegram_id)
+    if len(available_months) < 2:
+        return {"available": False, "reason": "not_enough_history"}
+
+    # Oxirgi 3 to'liq oy (joriy oy kirmaydi): months[0] = eng so'nggisi (M-1)
+    months = []
+    y, m = today.year, today.month
+    for _ in range(3):
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+        months.append((y, m))
+
+    m1_txns = await get_transactions_by_month(telegram_id, *months[0])
+    m2_txns = await get_transactions_by_month(telegram_id, *months[1])
+    m3_txns = await get_transactions_by_month(telegram_id, *months[2])
+
+    # 1) Takrorlanuvchi tranzaksiyalarni aniqlash: M-1 dagi har bir amaliyot
+    # uchun M-2 va M-3 da (±20% summa, ±5 kun) mos tushuvchi juftlik izlaymiz.
+    recurring = []
+    for t in m1_txns:
+        ttype, cat, amt = t["type"], t["category"], float(t["amount"])
+        if amt == 0:
+            continue
+        match2 = _forecast_find_match(m2_txns, ttype, cat, amt)
+        match3 = _forecast_find_match(m3_txns, ttype, cat, amt)
+        if not match2 or not match3:
+            continue
+        d1, d2, d3 = _forecast_local_day(t), _forecast_local_day(match2), _forecast_local_day(match3)
+        if abs(d1 - d2) <= 5 and abs(d1 - d3) <= 5:
+            recurring.append({"type": ttype, "category": cat, "amount": amt, "target_day": d1})
+
+    # Dublikatlarni olib tashlash (bir xil tur+kategoriya+summa oralig'i)
+    seen = set()
+    unique_recurring = []
+    for r in recurring:
+        key = (r["type"], r["category"], round(r["amount"] / 1000))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_recurring.append(r)
+
+    # 2) Joriy oyda takrorlanuvchilar allaqachon sodir bo'lganmi tekshiramiz;
+    # bo'lmagan va kutilayotgan kuni hali kelmagan bo'lsa — prognozga qo'shamiz.
+    cur_txns = await get_month_transactions(telegram_id)
+    days_in_month = cal_module.monthrange(today.year, today.month)[1]
+
+    matched_current_ids = set()
+    remaining_income = 0.0
+    remaining_expense = 0.0
+    for r in unique_recurring:
+        match_cur = _forecast_find_match(cur_txns, r["type"], r["category"], r["amount"])
+        if match_cur:
+            matched_current_ids.add(id(match_cur))
+            continue
+        target_day = min(r["target_day"], days_in_month)
+        if target_day >= today.day:
+            if r["type"] == "income":
+                remaining_income += r["amount"]
+            else:
+                remaining_expense += r["amount"]
+
+    # 3) Kunlik oqim: takrorlanuvchilardan tashqari xarajatlar, kun bo'yicha
+    daily_totals = {}
+    for t in cur_txns:
+        if t["type"] != "expense" or id(t) in matched_current_ids:
+            continue
+        d = _forecast_local_day(t)
+        daily_totals[d] = daily_totals.get(d, 0.0) + float(t["amount"])
+
+    series = [daily_totals.get(d, 0.0) for d in range(1, today.day + 1)]
+    daily_median = statistics.median(series) if series else 0.0
+    daily_stdev  = statistics.stdev(series) if len(series) >= 2 else 0.0
+
+    remaining_days = days_in_month - today.day
+
+    bals = await get_balances(telegram_id)
+    total_balance = sum(float(b["amount"]) for b in bals)
+
+    forecast_mid = (
+        total_balance + remaining_income - remaining_expense
+        - (daily_median * remaining_days)
+    )
+    margin = daily_stdev * (remaining_days ** 0.5)
+    low, high = forecast_mid - margin, forecast_mid + margin
+    if low > high:
+        low, high = high, low
+
+    return {
+        "available": True,
+        "low": low,
+        "high": high,
+        "daily_median": daily_median,
+        "remaining_days": remaining_days,
+    }
+
 async def add_balance(telegram_id: int, name: str, bal_type: str, amount: float):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -1387,6 +1515,7 @@ def ai_keyboard():
         [InlineKeyboardButton("🤖 AI Maslahat", callback_data="ai_advice")],
         [InlineKeyboardButton("📅 Haftalik AI hisobot", callback_data="ai_weekly")],
         [InlineKeyboardButton("📈 Oylik AI xulosa", callback_data="ai_monthly")],
+        [InlineKeyboardButton("📊 Oy oxiri prognozi", callback_data="monthly_forecast")],
         [InlineKeyboardButton("◀️ Orqaga", callback_data="back_main")],
     ])
 
@@ -2724,6 +2853,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 Yangilash", callback_data="ai_weekly")],
                 [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
             ])
+        )
+
+    elif data == "monthly_forecast":
+        forecast = await calculate_monthly_forecast(user_id)
+
+        if not forecast["available"]:
+            if forecast["reason"] == "too_early":
+                text = (
+                    "📊 <b>Oy oxiri prognozi</b>\n\n"
+                    "Bu funksiya oyning <b>10-kunidan keyin</b> ishlay boshlaydi — "
+                    "hozircha ishonchli prognoz uchun yetarli ma'lumot yo'q."
+                )
+            else:
+                text = (
+                    "📊 <b>Oy oxiri prognozi</b>\n\n"
+                    "Prognoz uchun kamida <b>2 oylik</b> tarix kerak. "
+                    "Xarajat/daromadlaringizni kiritishda davom eting — "
+                    "yaqinda bu funksiya ochiladi!"
+                )
+            await query.edit_message_text(
+                text, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+            )
+            return
+
+        text = (
+            f"📊 <b>Oy oxiri prognozi</b>\n\n"
+            f"Agar shu sur'at davom etsa:\n"
+            f"<b>{format_money(forecast['low'])} – {format_money(forecast['high'])}</b>\n\n"
+            f"💵 Kunlik o'rtacha xarajat: <b>{format_money(forecast['daily_median'])}</b>\n"
+            f"📅 Qolgan kunlar: <b>{forecast['remaining_days']}</b>\n\n"
+            f"<i>Bu taxminiy oraliq — takrorlanuvchi (maosh, ijara) va "
+            f"kundalik xarajatlar tahliliga asoslangan.</i>"
+        )
+        await query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
         )
 
     # ---------- TARIX ----------
