@@ -27,7 +27,10 @@ import secrets
 import calendar as cal_module
 from datetime import datetime, timedelta, date
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -741,6 +744,39 @@ async def get_debts(telegram_id: int) -> list:
         """, telegram_id)
         return [dict(r) for r in rows]
 
+async def build_debts_screen(telegram_id: int):
+    """Qarzlar ro'yxati matni + tugmalari (callback va ReplyKeyboard yo'lidan
+    bir xilda qayta ishlatiladi)."""
+    debts = await get_debts(telegram_id)
+    gave  = [d for d in debts if d["direction"] == "gave"]
+    took  = [d for d in debts if d["direction"] == "took"]
+
+    msg = "💸 <b>Qarzlar ro'yxati</b>\n\n"
+    if gave:
+        total_gave = sum(float(d["amount"]) for d in gave)
+        msg += f"🔴 <b>Men berganlar</b>:\n"
+        msg += f"Jami: <b>{format_money(total_gave)}</b>\n\n"
+        for d in gave:
+            due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
+            msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
+        msg += "\n"
+    if took:
+        total_took = sum(float(d["amount"]) for d in took)
+        msg += f"🟢 <b>Men olganlar</b>:\n"
+        msg += f"Jami: <b>{format_money(total_took)}</b>\n\n"
+        for d in took:
+            due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
+            msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
+    if not debts:
+        msg += "✅ Hozircha qarz yo'q!"
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Yangi qarz", callback_data="add_debt")],
+        [InlineKeyboardButton("✅ Qarz to'landi", callback_data="debt_paid_list")],
+        [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")],
+    ])
+    return msg, markup
+
 async def mark_debt_paid(debt_id: int, return_balance_id: int = None):
     async with db_pool.acquire() as conn:
         async with conn.transaction():
@@ -1220,13 +1256,18 @@ ONBOARDING_TIP = (
     "Sinab ko'ring 👇"
 )
 
-async def maybe_send_onboarding_tip(bot, telegram_id: int, batch_count: int = 1):
+async def maybe_send_onboarding_tip(bot, telegram_id: int, batch_count: int = 1, context=None):
     """Foydalanuvchining ENG BIRINCHI tranzaksiyasidan keyin bir martalik
-    maslahat xabarini yuboradi (matnli/ovozli tez kiritish haqida)."""
+    maslahat xabarini yuboradi (matnli/ovozli tez kiritish haqida) va
+    to'liq (ReplyKeyboard) menyuni ochadi."""
     total = await count_transactions(telegram_id)
     if total <= batch_count:
         try:
-            await bot.send_message(chat_id=telegram_id, text=ONBOARDING_TIP)
+            await bot.send_message(
+                chat_id=telegram_id, text=ONBOARDING_TIP,
+                reply_markup=main_reply_keyboard())
+            if context is not None:
+                context.user_data["_reply_kb_shown"] = True
         except Exception as e:
             logger.warning(f"Onboarding maslahati yuborilmadi ({telegram_id}): {e}")
 
@@ -1313,6 +1354,51 @@ def main_keyboard(user_id=None):
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(buttons)
+
+# ----- BOSQICH 2: 2 qavatli menyu (YANGI) -----
+# Asosiy navigatsiya endi doimiy pastki ReplyKeyboard orqali, ichki
+# bo'limlar (Hisobot/AI/Sozlamalar) esa inline klaviatura sifatida ochiladi.
+
+def main_reply_keyboard():
+    """Doimiy pastki menyu — 3 qator x 2 ustun."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("💰 Daromad"), KeyboardButton("💸 Xarajat")],
+            [KeyboardButton("📊 Hisobot"), KeyboardButton("💳 Qarzlar")],
+            [KeyboardButton("🤖 AI"), KeyboardButton("⚙️ Sozlamalar")],
+        ],
+        resize_keyboard=True,
+    )
+
+def hisobot_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton("💰 Budjet belgilash", callback_data="set_budget")],
+        [InlineKeyboardButton("📋 Tarix", callback_data="history")],
+        [InlineKeyboardButton("📅 Sana oralig'i hisoboti", callback_data="date_range_report")],
+        [InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
+        [InlineKeyboardButton("🌐 Web-kabinet", callback_data="web_cabinet")],
+        [InlineKeyboardButton("◀️ Orqaga", callback_data="back_main")],
+    ])
+
+def ai_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 AI Maslahat", callback_data="ai_advice")],
+        [InlineKeyboardButton("📅 Haftalik AI hisobot", callback_data="ai_weekly")],
+        [InlineKeyboardButton("📈 Oylik AI xulosa", callback_data="ai_monthly")],
+        [InlineKeyboardButton("◀️ Orqaga", callback_data="back_main")],
+    ])
+
+def sozlamalar_keyboard(user_id=None):
+    buttons = [
+        [InlineKeyboardButton("💳 Balanslar", callback_data="balances")],
+        [InlineKeyboardButton("📖 Qo'llanma", callback_data="guide")],
+        [InlineKeyboardButton("🗑️ Ma'lumotlarni tozalash", callback_data="clear_month")],
+    ]
+    if user_id == ADMIN_ID:
+        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+    buttons.append([InlineKeyboardButton("◀️ Orqaga", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 
 def category_keyboard(categories, txn_type):
@@ -1637,35 +1723,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Qolgan : <b>{format_money(max(remaining, 0))}</b>\n"
         )
     text += "\nKerakli amalni tanlang 👇"
+    context.user_data["_reply_kb_shown"] = True
     await update.message.reply_text(
-        text, parse_mode="HTML", reply_markup=main_keyboard(user.id))
+        text, parse_mode="HTML", reply_markup=main_reply_keyboard())
 
-async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    premium = await is_user_premium(user_id)
-    if not premium:
-        await show_payment_screen(update, context)
-        return
-
-    msg = await update.message.reply_text("🎤 Ovoz tanilmoqda...")
-
-    voice = update.message.voice
-    file  = await context.bot.get_file(voice.file_id)
-
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        await file.download_to_drive(tmp.name)
-        text = await transcribe_voice(tmp.name)
-
-    if not text:
-        await msg.edit_text("❌ Ovozni tanib bo'lmadi. Qaytadan urinib ko'ring.")
-        return
-
+async def _process_parsed_text(user_id, context, text, status_msg, label="Tanildi", emoji_prefix="🎤"):
+    """Ovozdan yoki erkin matndan (masalan '20 ming taksi') ajratilgan
+    amaliyotlarni qayta ishlaydi: qarzlarni darhol saqlaydi, pul
+    amaliyotlarini balans tanlashga yuboradi. voice_handler va matnli
+    tez-kiritish (message_handler) uchun umumiy."""
     transactions = await parse_voice_transactions(text)
 
     if not transactions:
-        await msg.edit_text(
-            f"🎤 <b>Tanildi:</b> {text}\n\n"
+        await status_msg.edit_text(
+            f"{emoji_prefix} <b>{label}:</b> {text}\n\n"
             f"❌ Amaliyot aniqlanmadi.\n"
             f"<i>Masalan: 'Non uchun 5000 so'm'</i>",
             parse_mode="HTML"
@@ -1693,8 +1764,8 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Agar faqat qarz bo'lsa
     if not money_txns:
-        await msg.edit_text(
-            f"🎤 <b>Tanildi:</b> {text}\n\n"
+        await status_msg.edit_text(
+            f"{emoji_prefix} <b>{label}:</b> {text}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ <b>Qarz(lar) saqlandi!</b>\n\n{debt_summary}",
             parse_mode="HTML",
@@ -1710,7 +1781,7 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pending_text"] = text
 
     # Xulosa ko'rsatish
-    summary = f"🎤 <b>Tanildi:</b> {text}\n\n━━━━━━━━━━━━━━━━━━━━\n"
+    summary = f"{emoji_prefix} <b>{label}:</b> {text}\n\n━━━━━━━━━━━━━━━━━━━━\n"
     if debt_summary:
         summary += debt_summary + "\n"
     summary += f"📋 <b>{len(money_txns)} ta amaliyot topildi:</b>\n\n"
@@ -1720,11 +1791,34 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary += "\nHammasi qaysi balansga?"
 
     bals = await get_balances(user_id)
-    await msg.edit_text(
+    await status_msg.edit_text(
         summary,
         parse_mode="HTML",
         reply_markup=balance_select_keyboard(bals)
     )
+
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    premium = await is_user_premium(user_id)
+    if not premium:
+        await show_payment_screen(update, context)
+        return
+
+    msg = await update.message.reply_text("🎤 Ovoz tanilmoqda...")
+
+    voice = update.message.voice
+    file  = await context.bot.get_file(voice.file_id)
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        text = await transcribe_voice(tmp.name)
+
+    if not text:
+        await msg.edit_text("❌ Ovozni tanib bo'lmadi. Qaytadan urinib ko'ring.")
+        return
+
+    await _process_parsed_text(user_id, context, text, msg, label="Tanildi", emoji_prefix="🎤")
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2229,7 +2323,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
                 ])
             )
-            await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending))
+            await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending), context=context)
             return
 
         # 2) Bitta amaliyot (voice_parsed — chek tasdiqi ham shu yerga keladi)
@@ -2257,7 +2351,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 reply_markup=tx_confirm_keyboard(tx_id, fresh=True)
             )
-            await maybe_send_onboarding_tip(context.bot, user_id)
+            await maybe_send_onboarding_tip(context.bot, user_id, context=context)
             return
 
         # 3) Qo'lda kiritish (cat_ tugmasidan keyin — miqdor so'raladi)
@@ -2592,6 +2686,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
 
+    elif data == "ai_weekly":
+        await query.edit_message_text(
+            "📅 <b>Haftalik AI hisobot tayyorlanmoqda...</b>\n\n<i>Bir daqiqa sabr qiling...</i>",
+            parse_mode="HTML"
+        )
+        today      = datetime.now(pytz.timezone("Asia/Tashkent")).date()
+        week_start = today - timedelta(days=6)
+        txns       = await get_transactions_by_date_range(user_id, week_start, today)
+        user_name  = query.from_user.full_name
+        period_str = f"{week_start.strftime('%d.%m')} - {today.strftime('%d.%m.%Y')}"
+
+        if not txns:
+            await query.edit_message_text(
+                f"📅 <b>{period_str}</b>\n\nBu hafta hali tranzaksiyalar yo'q.\n"
+                f"Daromad va xarajatlaringizni kiriting, keyin AI tahlil qila oladi.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+            )
+            return
+
+        advice   = await get_ai_financial_advice(txns, period_str, user_name)
+        income   = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+        expenses = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+
+        msg = (
+            f"📅 <b>Haftalik AI Hisobot — {period_str}</b>\n\n"
+            f"📥 Daromad: <b>{format_money(income)}</b>  |  "
+            f"📤 Xarajat: <b>{format_money(expenses)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{advice or 'AI vaqtincha javob bermadi. Keyinroq urinib ko`ring.'}"
+        )
+        await query.edit_message_text(
+            msg, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Yangilash", callback_data="ai_weekly")],
+                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+            ])
+        )
+
     # ---------- TARIX ----------
     elif data == "history":
         months = await get_available_months(user_id)
@@ -2826,34 +2960,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- QARZLAR ----------
     elif data == "debts":
-        debts = await get_debts(user_id)
-        gave  = [d for d in debts if d["direction"] == "gave"]
-        took  = [d for d in debts if d["direction"] == "took"]
-
-        msg = "💸 <b>Qarzlar ro'yxati</b>\n\n"
-        if gave:
-            total_gave = sum(float(d["amount"]) for d in gave)
-            msg += f"🔴 <b>Men berganlar</b>:\n"
-            msg += f"Jami: <b>{format_money(total_gave)}</b>\n\n"
-            for d in gave:
-                due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
-                msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
-            msg += "\n"
-        if took:
-            total_took = sum(float(d["amount"]) for d in took)
-            msg += f"🟢 <b>Men olganlar</b>:\n"
-            msg += f"Jami: <b>{format_money(total_took)}</b>\n\n"
-            for d in took:
-                due = f" | 📅 {d['due_date'].strftime('%d.%m.%Y')}" if d["due_date"] else ""
-                msg += f"👤 {d['person_name']} — <b>{format_money(float(d['amount']))}</b>{due}\n"
-        if not debts:
-            msg += "✅ Hozircha qarz yo'q!"
-
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Yangi qarz", callback_data="add_debt")],
-            [InlineKeyboardButton("✅ Qarz to'landi", callback_data="debt_paid_list")],
-            [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")],
-        ])
+        msg, markup = await build_debts_screen(user_id)
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
 
     elif data == "add_debt":
@@ -3361,11 +3468,71 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📥 {format_money(stats['income'])}\n"
             f"📤 {format_money(stats['expenses'])}\n"
             f"💵 {format_money(stats['balance'])}",
-            parse_mode="HTML", reply_markup=main_keyboard(user_id))
+            parse_mode="HTML", reply_markup=None)
+        # Doimiy pastki menyu (ReplyKeyboard) faqat bir marta yuboriladi —
+        # Telegram uni suhbatda saqlab qoladi, qayta-qayta xabar shart emas.
+        if not context.user_data.get("_reply_kb_shown"):
+            context.user_data["_reply_kb_shown"] = True
+            await context.bot.send_message(
+                chat_id=user_id, text="Kerakli amalni tanlang 👇",
+                reply_markup=main_reply_keyboard())
+
+# ----- BOSQICH 2: ReplyKeyboard matn yo'naltirish -----
+
+async def show_income_menu(update, context):
+    context.user_data["txn_type"] = "income"
+    await update.message.reply_text(
+        "📥 <b>Daromad kategoriyasini tanlang:</b>",
+        parse_mode="HTML",
+        reply_markup=category_keyboard(INCOME_CATEGORIES, "income"))
+
+async def show_expense_menu(update, context):
+    context.user_data["txn_type"] = "expense"
+    await update.message.reply_text(
+        "📤 <b>Xarajat kategoriyasini tanlang:</b>",
+        parse_mode="HTML",
+        reply_markup=category_keyboard(EXPENSE_CATEGORIES, "expense"))
+
+async def show_hisobot_menu(update, context):
+    await update.message.reply_text(
+        "📊 <b>Hisobot</b>\n\nKerakli bo'limni tanlang:",
+        parse_mode="HTML", reply_markup=hisobot_keyboard())
+
+async def show_qarzlar_menu(update, context):
+    msg, markup = await build_debts_screen(update.effective_user.id)
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=markup)
+
+async def show_ai_menu(update, context):
+    await update.message.reply_text(
+        "🤖 <b>AI</b>\n\nKerakli bo'limni tanlang:",
+        parse_mode="HTML", reply_markup=ai_keyboard())
+
+async def show_sozlamalar_menu(update, context):
+    await update.message.reply_text(
+        "⚙️ <b>Sozlamalar</b>\n\nKerakli bo'limni tanlang:",
+        parse_mode="HTML", reply_markup=sozlamalar_keyboard(update.effective_user.id))
+
+MAIN_MENU_TEXT_ROUTES = {
+    "💰 Daromad": show_income_menu,
+    "💸 Xarajat": show_expense_menu,
+    "📊 Hisobot": show_hisobot_menu,
+    "💳 Qarzlar": show_qarzlar_menu,
+    "🤖 AI": show_ai_menu,
+    "⚙️ Sozlamalar": show_sozlamalar_menu,
+}
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text    = update.message.text.strip()
+
+    # ---------- BOSQICH 2: doimiy pastki menyu tugmalari ----------
+    if text in MAIN_MENU_TEXT_ROUTES:
+        premium = await is_user_premium(user_id)
+        if not premium:
+            await show_payment_screen(update, context)
+            return
+        await MAIN_MENU_TEXT_ROUTES[text](update, context)
+        return
 
     if not any([
         context.user_data.get("awaiting_amount"),
@@ -3385,7 +3552,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not premium:
             await show_payment_screen(update, context)
             return
-        await update.message.reply_text("👇 Boshlash uchun /start yuboring.")
+        # Erkin matnli tez kiritish (masalan "20 ming taksi") — ovozli
+        # kiritish bilan bir xil GPT tahlilchisi ishlatiladi.
+        status_msg = await update.message.reply_text("🤖 Tahlil qilinmoqda...")
+        await _process_parsed_text(user_id, context, text, status_msg,
+                                    label="Kiritildi", emoji_prefix="✍️")
         return
 
     if context.user_data.get("awaiting_broadcast"):
@@ -3719,7 +3890,7 @@ async def _save_transaction(user_id, context, note="",
     elif reply_fn:
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
 
-    await maybe_send_onboarding_tip(context.bot, user_id)
+    await maybe_send_onboarding_tip(context.bot, user_id, context=context)
 
 async def _show_recent(telegram_id, reply_fn=None, query=None):
     """Oxirgi amaliyotlar ro'yxati — har biriga tahrirlash tugmasi."""
