@@ -475,6 +475,25 @@ async def init_db():
                 freeze_month     TEXT
             )
         """)
+        try:
+            await conn.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS
+                    reminder_hour INTEGER DEFAULT 20
+            """)
+            await conn.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS
+                    reminder_miss_streak INTEGER NOT NULL DEFAULT 0
+            """)
+        except Exception as e:
+            logger.warning(f"ALTER TABLE users (reminder_*): {e}")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS smart_alerts_log (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                category    TEXT NOT NULL,
+                sent_at     TIMESTAMP DEFAULT NOW()
+            )
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -572,6 +591,11 @@ async def close_streak_day(telegram_id: int) -> dict:
                     freezes_left = $4, freeze_month = $5
                 WHERE telegram_id = $6
             """, new_streak, longest, today, freezes_left, freeze_month, telegram_id)
+
+            # Kun yopildi — eslatma javobsizlik hisoblagichini nolga tushiramiz
+            await conn.execute(
+                "UPDATE users SET reminder_miss_streak = 0 WHERE telegram_id = $1",
+                telegram_id)
 
             return {
                 "changed": True, "streak": new_streak, "freeze_used": freeze_used,
@@ -1861,12 +1885,28 @@ def ai_keyboard():
 def sozlamalar_keyboard(user_id=None):
     buttons = [
         [InlineKeyboardButton("💳 Balanslar", callback_data="balances")],
+        [InlineKeyboardButton("⏰ Eslatma vaqti", callback_data="reminder_settings")],
         [InlineKeyboardButton("📖 Qo'llanma", callback_data="guide")],
         [InlineKeyboardButton("🗑️ Ma'lumotlarni tozalash", callback_data="clear_month")],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
     buttons.append([InlineKeyboardButton("◀️ Orqaga", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+def reminder_settings_keyboard(current_hour=None):
+    def _label(hour, text):
+        return f"✅ {text}" if current_hour == hour else text
+
+    buttons = [
+        [InlineKeyboardButton(_label(18, "18:00"), callback_data="set_reminder_18")],
+        [InlineKeyboardButton(_label(20, "20:00"), callback_data="set_reminder_20")],
+        [InlineKeyboardButton(_label(22, "22:00"), callback_data="set_reminder_22")],
+        [InlineKeyboardButton(
+            "✅ O'chirilgan" if current_hour is None else "🔕 O'chirish",
+            callback_data="set_reminder_off")],
+        [InlineKeyboardButton("◀️ Orqaga", callback_data="back_main")],
+    ]
     return InlineKeyboardMarkup(buttons)
 
 def category_keyboard(categories, txn_type):
@@ -2430,7 +2470,7 @@ async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="HTML"
     )
 
-    await send_daily_reminders(context.bot)
+    await send_daily_reminders(context.bot, force=True)
 
     await update.message.reply_text(
         "✅ <b>Test tugadi!</b>\n\n"
@@ -3813,7 +3853,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Bugun tranzaksiya kiritmagan foydalanuvchilarga eslatma boradi.",
             parse_mode="HTML"
         )
-        await send_daily_reminders(context.bot)
+        await send_daily_reminders(context.bot, force=True)
         await context.bot.send_message(
             chat_id=user_id,
             text="✅ <b>Eslatmalar yuborildi!</b>\n\nNatijani Render logs'dan ko'ring.",
@@ -4029,6 +4069,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result["milestone"]:
             await notify_streak_result(context.bot, user_id, result)
+
+    elif data == "reminder_settings":
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT reminder_hour FROM users WHERE telegram_id = $1", user_id)
+        current_hour = row["reminder_hour"] if row else 20
+        text = (
+            "⏰ <b>Eslatma vaqti</b>\n\n"
+            "Kunlik eslatma (agar bugun yozuv kiritmagan bo'lsangiz) "
+            "qaysi vaqtda kelishini tanlang:"
+        )
+        await query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=reminder_settings_keyboard(current_hour))
+
+    elif data.startswith("set_reminder_"):
+        choice = data.replace("set_reminder_", "")
+        new_hour = None if choice == "off" else int(choice)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET reminder_hour = $1, reminder_miss_streak = 0 "
+                "WHERE telegram_id = $2", new_hour, user_id)
+        if new_hour is None:
+            text = "🔕 <b>Eslatmalar o'chirildi.</b>"
+        else:
+            text = f"✅ <b>Eslatma vaqti {new_hour}:00 ga o'rnatildi!</b>"
+        await query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=reminder_settings_keyboard(new_hour))
 
     elif data == "back_main":
         txns  = await get_month_transactions(user_id)
@@ -5066,23 +5135,43 @@ async def send_debt_reminders(bot):
         logger.error(f"❌ Qarz eslatmasi funksiyasida xato: {e}")
 
 
-async def send_daily_reminders(bot):
-    """Har kuni 20:00 (Toshkent) da bugun xarajat kiritmaganlarga eslatma yuboradi."""
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT u.telegram_id, u.name
-                FROM users u
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM transactions t
-                    WHERE t.telegram_id = u.telegram_id
-                      AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
-                )
-            """)
+REMINDER_MISS_LIMIT = 5
 
-        logger.info(f"📬 Eslatma yuboriladi: {len(rows)} foydalanuvchi")
+async def send_daily_reminders(bot, force=False):
+    """Har soat boshida ishga tushadi (scheduler), lekin har bir foydalanuvchiga
+    faqat O'ZI TANLAGAN soatda (users.reminder_hour) yuboradi. Bugun kuni
+    allaqachon yopilgan (tranzaksiya YOKI "Bugun xarajat bo'lmadi") bo'lsa —
+    yuborilmaydi. Ketma-ket 5 marta javobsiz qolsa — avtomatik o'chiriladi.
+
+    force=True — admin test uchun (/testreminder, admin_send_reminder):
+    soat mosligini tekshirmasdan, bugun yopilmagan barcha foydalanuvchilarga
+    darhol yuboradi (o'chirilgan reminder_hour'ga qaramasdan)."""
+    try:
+        tz = pytz.timezone("Asia/Tashkent")
+        current_hour = datetime.now(tz).hour
+
+        hour_filter = "" if force else "AND u.reminder_hour = $1"
+        query_sql = f"""
+            SELECT u.telegram_id, u.name, u.reminder_miss_streak
+            FROM users u
+            LEFT JOIN user_streaks s ON s.telegram_id = u.telegram_id
+            WHERE (s.last_closed_date IS NULL OR s.last_closed_date != CURRENT_DATE)
+              AND NOT EXISTS (
+                  SELECT 1 FROM transactions t
+                  WHERE t.telegram_id = u.telegram_id
+                    AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
+              )
+              {hour_filter}
+        """
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(query_sql) if force else await conn.fetch(query_sql, current_hour)
+
+        if not rows:
+            return
+        logger.info(f"📬 Eslatma soati {current_hour}:00 (force={force}) — {len(rows)} foydalanuvchi")
 
         sent = 0
+        paused = 0
         failed = 0
         for row in rows:
             user_id = row["telegram_id"]
@@ -5090,6 +5179,29 @@ async def send_daily_reminders(bot):
 
             premium = await is_user_premium(user_id)
             if not premium:
+                continue
+
+            # Ketma-ket 5 marta javobsiz qolgan bo'lsa — eslatmani o'chirib,
+            # bitta xabar yuboramiz (spam qilib, keyin ham yubormaymiz)
+            if row["reminder_miss_streak"] >= REMINDER_MISS_LIMIT:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE users SET reminder_hour = NULL, reminder_miss_streak = 0 "
+                        "WHERE telegram_id = $1", user_id)
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            "🔕 <b>Eslatmalar to'xtatildi.</b>\n\n"
+                            f"{REMINDER_MISS_LIMIT} kun ketma-ket javobsiz qoldi. "
+                            "Qayta yoqish: ⚙️ Sozlamalar → ⏰ Eslatma vaqti"
+                        ),
+                        parse_mode="HTML"
+                    )
+                    paused += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Pauza xabari yuborilmadi {user_id}: {e}")
+                await asyncio.sleep(0.1)
                 continue
 
             async with db_pool.acquire() as conn:
@@ -5130,6 +5242,10 @@ async def send_daily_reminders(bot):
                     chat_id=user_id, text=msg,
                     parse_mode="HTML", reply_markup=markup
                 )
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE users SET reminder_miss_streak = reminder_miss_streak + 1 "
+                        "WHERE telegram_id = $1", user_id)
                 sent += 1
             except Exception as e:
                 failed += 1
@@ -5137,10 +5253,120 @@ async def send_daily_reminders(bot):
 
             await asyncio.sleep(0.1)
 
-        logger.info(f"✅ Eslatmalar yuborildi: {sent} ta | ❌ Xato: {failed} ta")
+        logger.info(f"✅ Eslatmalar: {sent} ta | 🔕 Pauza: {paused} ta | ❌ Xato: {failed} ta")
 
     except Exception as e:
         logger.error(f"❌ Eslatma funksiyasida xato: {e}")
+
+# ===================== SMART OGOHLANTIRISHLAR (BOSQICH 6) =====================
+
+SMART_ALERT_PCT_THRESHOLD = 40.0
+SMART_ALERT_ABS_THRESHOLD = 50000.0
+SMART_ALERT_MAX_PER_WEEK = 2
+SMART_ALERT_MAX_PER_CATEGORY_PER_MONTH = 1
+
+async def send_smart_alerts(bot):
+    """Kuniga bir marta (12:00-20:00 oralig'idagi belgilangan soatda) ishga
+    tushadi — kategoriya xarajati keskin oshgan premium foydalanuvchilarga
+    ogohlantirish yuboradi. Faqat >=3 oylik tarixi bo'lganlar uchun,
+    chastota chegaralari bilan (haftasiga <=2, kategoriya boyicha oyiga <=1)."""
+    try:
+        async with db_pool.acquire() as conn:
+            users = await conn.fetch("SELECT telegram_id FROM users")
+
+        tz = pytz.timezone("Asia/Tashkent")
+        today = datetime.now(tz).date()
+        days_in_month = cal_module.monthrange(today.year, today.month)[1]
+        days_left_in_month = days_in_month - today.day
+
+        sent_total = 0
+        for u in users:
+            user_id = u["telegram_id"]
+
+            premium = await is_user_premium(user_id)
+            if not premium:
+                continue
+
+            available_months = await get_available_months(user_id)
+            if len(available_months) < 3:
+                continue
+
+            async with db_pool.acquire() as conn:
+                week_count = await conn.fetchval("""
+                    SELECT COUNT(*) FROM smart_alerts_log
+                    WHERE telegram_id = $1 AND sent_at >= NOW() - INTERVAL '7 days'
+                """, user_id)
+            remaining_this_week = SMART_ALERT_MAX_PER_WEEK - week_count
+            if remaining_this_week <= 0:
+                continue
+
+            cur_txns = await get_month_transactions(user_id)
+            cur_totals = _health_category_totals(cur_txns)
+            if not cur_totals:
+                continue
+
+            prev_expenses_by_cat = {}
+            y, m = today.year, today.month
+            for _ in range(3):
+                m -= 1
+                if m == 0:
+                    m = 12
+                    y -= 1
+                ptxns = await get_transactions_by_month(user_id, y, m)
+                for cat, amt in _health_category_totals(ptxns).items():
+                    prev_expenses_by_cat.setdefault(cat, []).append(amt)
+
+            candidates = []
+            for cat, cur_amt in cur_totals.items():
+                valid_hist = [h for h in prev_expenses_by_cat.get(cat, []) if h > 0]
+                if not valid_hist:
+                    continue
+                median_hist = statistics.median(valid_hist)
+                if median_hist <= 0:
+                    continue
+                pct_change = (cur_amt - median_hist) / median_hist * 100
+                abs_diff = cur_amt - median_hist
+                if pct_change >= SMART_ALERT_PCT_THRESHOLD and abs_diff >= SMART_ALERT_ABS_THRESHOLD:
+                    candidates.append((cat, cur_amt, median_hist, pct_change))
+
+            if not candidates:
+                continue
+            candidates.sort(key=lambda c: -c[3])
+
+            for cat, cur_amt, median_hist, pct_change in candidates:
+                if remaining_this_week <= 0:
+                    break
+                async with db_pool.acquire() as conn:
+                    month_count = await conn.fetchval("""
+                        SELECT COUNT(*) FROM smart_alerts_log
+                        WHERE telegram_id = $1 AND category = $2
+                          AND sent_at >= DATE_TRUNC('month', NOW())
+                    """, user_id, cat)
+                if month_count >= SMART_ALERT_MAX_PER_CATEGORY_PER_MONTH:
+                    continue
+
+                msg = (
+                    f"⚠️ <b>Diqqat</b>\n\n"
+                    f"{cat} xarajatlari bu oyda {format_money(cur_amt)}.\n"
+                    f"Odatdagi darajangiz: ~{format_money(median_hist)} ({pct_change:+.0f}%)\n\n"
+                    f"Oy tugashiga {days_left_in_month} kun qoldi."
+                )
+                try:
+                    await bot.send_message(chat_id=user_id, text=msg, parse_mode="HTML")
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "INSERT INTO smart_alerts_log (telegram_id, category) VALUES ($1, $2)",
+                            user_id, cat)
+                    remaining_this_week -= 1
+                    sent_total += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Smart alert yuborilmadi {user_id}: {e}")
+                await asyncio.sleep(0.1)
+
+        logger.info(f"⚠️ Smart ogohlantirishlar yuborildi: {sent_total} ta")
+
+    except Exception as e:
+        logger.error(f"❌ Smart alerts funksiyasida xato: {e}")
 
 # ===================== MCP SERVER =====================
 
@@ -5531,7 +5757,9 @@ async def main():
         print(f"⚠️ Webhook xatolik (bot ishlaydi): {e}", flush=True)
 
     scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Tashkent"))
-    scheduler.add_job(send_daily_reminders, trigger="cron", hour=20, minute=0,
+    # Har soat boshida ishga tushadi — ichida har bir foydalanuvchining
+    # o'zi tanlagan reminder_hour'i bilan solishtiriladi (18:00/20:00/22:00)
+    scheduler.add_job(send_daily_reminders, trigger="cron", minute=0,
                       args=[app.bot], id="daily_reminder", replace_existing=True)
     scheduler.add_job(send_debt_reminders, trigger="cron", hour=9, minute=0,
                       args=[app.bot], id="debt_reminder", replace_existing=True)
@@ -5541,6 +5769,8 @@ async def main():
     scheduler.add_job(send_monthly_ai_summaries, trigger="cron", day=1, hour=9,
                       minute=2, args=[app.bot], id="monthly_ai_summary",
                       replace_existing=True)
+    scheduler.add_job(send_smart_alerts, trigger="cron", hour=13, minute=0,
+                      args=[app.bot], id="smart_alerts", replace_existing=True)
     scheduler.start()
     print("🎉 Bot to'liq ishga tushdi!", flush=True)
 
