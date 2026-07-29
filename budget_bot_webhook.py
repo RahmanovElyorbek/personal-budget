@@ -15,6 +15,7 @@
 import logging
 import os
 import sys
+import time
 import asyncio
 import asyncpg
 import tempfile
@@ -555,14 +556,31 @@ async def add_transaction(telegram_id: int, txn_type: str,
                     await conn.execute(
                         "UPDATE balances SET amount = amount - $1 WHERE id = $2",
                         amount, balance_id)
+            invalidate_start_cache(telegram_id)
             return tx_id
 
 async def get_transaction(telegram_id: int, tx_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT id, type, amount, category, note, balance_id "
+            "SELECT id, type, amount, category, note, balance_id, date "
             "FROM transactions WHERE id = $1 AND telegram_id = $2",
             tx_id, telegram_id)
+
+async def count_transactions(telegram_id: int) -> int:
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM transactions WHERE telegram_id = $1", telegram_id)
+
+async def get_today_transactions(telegram_id: int) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT type, amount, category, note, date
+            FROM transactions
+            WHERE telegram_id = $1
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') = DATE(NOW() AT TIME ZONE 'Asia/Tashkent')
+            ORDER BY date DESC
+        """, telegram_id)
+        return [dict(r) for r in rows]
 
 async def delete_transaction(telegram_id: int, tx_id: int) -> bool:
     async with db_pool.acquire() as conn:
@@ -582,6 +600,7 @@ async def delete_transaction(telegram_id: int, tx_id: int) -> bool:
                                        tx["amount"], tx["balance_id"])
             await conn.execute("DELETE FROM transactions WHERE id = $1 AND telegram_id = $2",
                                tx_id, telegram_id)
+            invalidate_start_cache(telegram_id)
             return True
 
 async def update_transaction(telegram_id: int, tx_id: int,
@@ -615,6 +634,7 @@ async def update_transaction(telegram_id: int, tx_id: int,
                 "UPDATE transactions SET type = $1, amount = $2, category = $3 "
                 "WHERE id = $4 AND telegram_id = $5",
                 f_type, f_amt, f_cat, tx_id, telegram_id)
+            invalidate_start_cache(telegram_id)
             return True
 
 async def create_login_code(telegram_id: int) -> str:
@@ -1155,6 +1175,123 @@ def calc_stats(transactions: list) -> dict:
 def format_money(amount: float) -> str:
     return f"{amount:,.0f} so'm"
 
+# ===================== /START KESHI =====================
+# In-memory TTL kesh — Render'da bitta worker (WEB_CONCURRENCY=1) ishlagani
+# uchun jarayonlar orasida kesh nomuvofiqligi bo'lmaydi, Redis shart emas.
+
+_start_cache = {}
+_START_CACHE_TTL = 60  # soniya
+
+def invalidate_start_cache(telegram_id: int):
+    _start_cache.pop(telegram_id, None)
+
+async def get_start_screen_data(telegram_id: int) -> dict:
+    """/start ekrani uchun oylik+bugungi statistika va balanslarni
+    60 soniyalik keshdan qaytaradi (yoki bazadan hisoblab keshlaydi)."""
+    now = time.monotonic()
+    cached = _start_cache.get(telegram_id)
+    if cached and (now - cached[1]) < _START_CACHE_TTL:
+        return cached[0]
+
+    txns = await get_month_transactions(telegram_id)
+    stats = calc_stats(txns)
+    today_txns = await get_today_transactions(telegram_id)
+    today_stats = calc_stats(today_txns)
+    bals = await get_balances(telegram_id)
+    total_balance = sum(float(b["amount"]) for b in bals)
+
+    data = {
+        "stats": stats,
+        "today_stats": today_stats,
+        "balances": bals,
+        "total_balance": total_balance,
+    }
+    _start_cache[telegram_id] = (data, now)
+    return data
+
+# ===================== ONBOARDING =====================
+
+ONBOARDING_TIP = (
+    "🎉 Zo'r! Endi sirni aytamiz:\n\n"
+    "Menyu bosishingiz shart emas. Shunchaki yozing:\n"
+    "   \"20 ming taksi\"\n"
+    "   \"150000 oziq-ovqat\"\n\n"
+    "Yoki ovozli xabar yuboring — bot o'zi tushunadi 🎙\n\n"
+    "Sinab ko'ring 👇"
+)
+
+async def maybe_send_onboarding_tip(bot, telegram_id: int, batch_count: int = 1):
+    """Foydalanuvchining ENG BIRINCHI tranzaksiyasidan keyin bir martalik
+    maslahat xabarini yuboradi (matnli/ovozli tez kiritish haqida)."""
+    total = await count_transactions(telegram_id)
+    if total <= batch_count:
+        try:
+            await bot.send_message(chat_id=telegram_id, text=ONBOARDING_TIP)
+        except Exception as e:
+            logger.warning(f"Onboarding maslahati yuborilmadi ({telegram_id}): {e}")
+
+# ===================== TRANZAKSIYANI O'CHIRISH + QAYTARISH =====================
+# 15 soniyalik "Qaytarish" oynasi — alohida DB ustuni talab qilmaydi,
+# o'chirilgan tranzaksiya ma'lumotlari xotirada vaqtinchalik saqlanadi.
+
+_undo_cache = {}  # tx_id -> {"telegram_id", "type", "amount", "category", "note", "balance_id", "deleted_at"}
+UNDO_WINDOW_SECONDS = 15
+
+async def delete_transaction_with_undo(telegram_id: int, tx_id: int) -> bool:
+    """Tranzaksiyani o'chiradi va 15 soniya ichida tiklash uchun keshda saqlaydi."""
+    tx = await get_transaction(telegram_id, tx_id)
+    if not tx:
+        return False
+    ok = await delete_transaction(telegram_id, tx_id)
+    if ok:
+        _undo_cache[tx_id] = {
+            "telegram_id": telegram_id,
+            "type": tx["type"],
+            "amount": float(tx["amount"]),
+            "category": tx["category"],
+            "note": tx["note"] or "",
+            "balance_id": tx["balance_id"],
+            "deleted_at": time.monotonic(),
+        }
+    return ok
+
+async def restore_transaction(telegram_id: int, tx_id: int):
+    """Kesh ichidagi o'chirilgan tranzaksiyani tiklaydi. (yangi_id, xato_matni) qaytaradi."""
+    entry = _undo_cache.get(tx_id)
+    if not entry or entry["telegram_id"] != telegram_id:
+        return None, "❌ Qaytarish muddati tugagan yoki topilmadi."
+    if time.monotonic() - entry["deleted_at"] > UNDO_WINDOW_SECONDS:
+        _undo_cache.pop(tx_id, None)
+        return None, "⏱ Qaytarish muddati (15 soniya) tugadi."
+    new_id = await add_transaction(
+        telegram_id, entry["type"], entry["amount"],
+        entry["category"], entry["note"], entry["balance_id"]
+    )
+    _undo_cache.pop(tx_id, None)
+    return new_id, None
+
+async def expire_undo_button(bot, chat_id, message_id, tx_id, fallback_markup):
+    """15 soniyadan keyin 'Qaytarish' tugmasini xabardan olib tashlaydi (agar ishlatilmagan bo'lsa)."""
+    await asyncio.sleep(UNDO_WINDOW_SECONDS)
+    if tx_id in _undo_cache:
+        _undo_cache.pop(tx_id, None)
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=message_id, reply_markup=fallback_markup)
+        except Exception:
+            pass
+
+_background_tasks = set()
+
+def fire_and_forget(coro):
+    """asyncio.create_task natijasini kuchli havola bilan saqlaydi — aks holda
+    Python vazifani muddatidan oldin GC qilib yuborishi mumkin (fon vazifalar
+    uchun rasmiy asyncio tavsiyasi)."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 # ===================== KLAVIATURALAR =====================
 
 def main_keyboard(user_id=None):
@@ -1306,11 +1443,16 @@ def balance_type_keyboard():
 
 # ----- Tranzaksiya tahrirlash klaviaturalari (YANGI) -----
 
-def tx_confirm_keyboard(tx_id):
-    """Tranzaksiya saqlangach chiqadigan tugmalar (tahrir/o'chir)."""
+def tx_confirm_keyboard(tx_id, fresh=False):
+    """Tranzaksiya saqlangach chiqadigan tugmalar (tahrir/o'chir).
+    fresh=True — bu yangi saqlangan tranzaksiyaning tasdiq xabari, shuning
+    uchun tahrir/o'chirish tugmalari faqat 15 daqiqa ichida ishlaydi.
+    fresh=False (standart) — navigatsiya orqali ochilgan karta (masalan
+    "Oxirgi amaliyotlar" ro'yxatidan), cheklovsiz ishlaydi."""
+    suffix = ":fresh" if fresh else ""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"txedit:{tx_id}"),
-         InlineKeyboardButton("🗑 O'chirish", callback_data=f"txdel:{tx_id}")],
+        [InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"txedit:{tx_id}{suffix}"),
+         InlineKeyboardButton("🗑 O'chirish", callback_data=f"txdel:{tx_id}{suffix}")],
         [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
          InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
         [InlineKeyboardButton("📊 Statistika", callback_data="stats"),
@@ -1433,29 +1575,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if is_new:
-        welcome_text = (
-            f"👋 Salom, <b>{user.first_name}</b>! Xush kelibsiz!\n\n"
-            f"💰 <b>Oson Byudjet</b> — shaxsiy moliya yordamchingiz!\n\n"
-            f"Bu bot bilan:\n"
-            f"✅ Daromad va xarajatlarni yozing\n"
-            f"✅ Ovoz orqali kiritish 🎤\n"
-            f"✅ Chek rasmini yuboring — avtomatik tahlil 📸\n"
-            f"✅ Oylik statistika va PDF hisobot\n"
-            f"✅ Byudjet belgilang va nazorat qiling\n"
-            f"✅ Qarzlarni kuzating\n"
-            f"✅ Balanslar (Naqd, Karta) bilan bog'langan!\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎁 <b>7 kun to'liq BEPUL!</b>\n"
-            f"💡 Sizga avtomatik <b>Naqd</b> va <b>Karta</b> balanslari yaratildi.\n"
-            f"💳 Balanslar bo'limidan miqdorni kiriting va boshlang!\n\n"
-            f"📖 <b>Birinchi marta ishlatayapsizmi?</b>\n"
-            f"Quyidagi tugma orqali videoqo'llanmani ko'ring! 👇"
+        onboarding_text = (
+            f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+            f"💰 <b>Oson Byudjet</b> — shaxsiy moliya yordamchingiz.\n"
+            f"🎁 Sizga <b>7 kunlik bepul sinov</b> va avtomatik <b>Naqd</b> +\n"
+            f"<b>Karta</b> balanslari faollashtirildi.\n\n"
+            f"Boshlaymizmi? Birinchi xarajatingizni yozing 👇"
         )
         await update.message.reply_text(
-            welcome_text, parse_mode="HTML",
+            onboarding_text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📖 Qo'llanmani ko'rish", callback_data="guide")],
-                [InlineKeyboardButton("🚀 Boshlash!", callback_data="back_main")]
+                [InlineKeyboardButton("💸 Xarajat qo'shish", callback_data="add_expense")],
+                [InlineKeyboardButton("⏭ Keyinroq", callback_data="back_main")]
             ])
         )
         return
@@ -1466,28 +1597,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     days_left = await get_trial_days_left(user.id)
-    txns   = await get_month_transactions(user.id)
-    stats  = calc_stats(txns)
+    data   = await get_start_screen_data(user.id)
+    stats  = data["stats"]
+    today_stats = data["today_stats"]
     budget = await get_budget(user.id)
-    bals   = await get_balances(user.id)
+    bals   = data["balances"]
 
     trial_msg = ""
     if days_left > 0:
         trial_msg = f"🎁 Bepul sinov: <b>{days_left} kun qoldi</b>\n"
 
+    if today_stats["expenses"] > 0 or today_stats["income"] > 0:
+        today_line = (
+            f"📅 Bugun: {format_money(today_stats['expenses'])} xarajat, "
+            f"{format_money(today_stats['income'])} daromad\n"
+        )
+    else:
+        today_line = "📅 Bugun hali yozuv kiritilmadi.\n"
+
     text = (
-        f"👋 Xush kelibsiz, <b>{user.first_name}</b>!\n\n"
-        f"💰 <b>Oson Byudjet</b>\n"
-        f"📅 <b>{datetime.now().strftime('%B %Y')}</b>\n"
+        f"👋 Assalomu alaykum, <b>{user.first_name}</b>!\n\n"
+        f"💰 Joriy balans: <b>{format_money(data['total_balance'])}</b>\n"
+        f"{today_line}"
         f"{trial_msg}"
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 <b>{datetime.now().strftime('%B %Y')}</b>\n"
         f"📥 Daromad : <b>{format_money(stats['income'])}</b>\n"
         f"📤 Xarajat : <b>{format_money(stats['expenses'])}</b>\n"
-        f"💵 Balans  : <b>{format_money(stats['balance'])}</b>\n"
+        f"💵 Sof natija: <b>{format_money(stats['balance'])}</b>\n"
     )
-    if bals:
-        total = sum(float(b["amount"]) for b in bals)
-        text += f"💳 Jami balans: <b>{format_money(total)}</b>\n"
     if budget > 0:
         pct = min(int(stats["expenses"] / budget * 10), 10)
         bar = "🟥" * pct + "⬜" * (10 - pct)
@@ -1498,7 +1636,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 {bar} {int(stats['expenses']/budget*100)}%\n"
             f"✅ Qolgan : <b>{format_money(max(remaining, 0))}</b>\n"
         )
-    text += "\n🎤 Ovoz yuboring, 📸 chek rasmini yuboring yoki tugma bosing:"
+    text += "\nKerakli amalni tanlang 👇"
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_keyboard(user.id))
 
@@ -1886,11 +2024,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- TRANZAKSIYANI TAHRIRLASH ----------
     if data.startswith("txedit:"):
-        tx_id = int(data.split(":")[1])
+        parts   = data.split(":")
+        tx_id   = int(parts[1])
+        is_fresh = len(parts) > 2 and parts[2] == "fresh"
         tx = await get_transaction(user_id, tx_id)
         if not tx:
             await query.edit_message_text("❌ Amaliyot topilmadi (o'chirilgan).")
             return
+        if is_fresh:
+            age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["date"].astimezone(pytz.timezone("Asia/Tashkent"))
+            if age > timedelta(minutes=15):
+                await query.answer("Bu yozuv eskirdi. Tarix bo'limidan tahrirlang.", show_alert=True)
+                return
         emoji  = "📥" if tx["type"] == "income" else "📤"
         type_t = "Daromad" if tx["type"] == "income" else "Xarajat"
         await query.edit_message_text(
@@ -1907,15 +2052,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("❌ Amaliyot topilmadi.")
 
-    elif data.startswith("txdel:"):
+    elif data.startswith("txundo:"):
         tx_id = int(data.split(":")[1])
-        ok = await delete_transaction(user_id, tx_id)
+        new_id, err = await restore_transaction(user_id, tx_id)
+        if err:
+            await query.answer(err, show_alert=True)
+            return
         await query.edit_message_text(
-            "🗑 <b>Amaliyot o'chirildi, balans tiklandi.</b>" if ok else "❌ Amaliyot topilmadi.",
+            "↩️ <b>Amaliyot tiklandi!</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
                 [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]]))
+
+    elif data.startswith("txdel:"):
+        parts    = data.split(":")
+        tx_id    = int(parts[1])
+        is_fresh = len(parts) > 2 and parts[2] == "fresh"
+        if is_fresh:
+            tx = await get_transaction(user_id, tx_id)
+            if not tx:
+                await query.edit_message_text("❌ Amaliyot topilmadi.")
+                return
+            age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["date"].astimezone(pytz.timezone("Asia/Tashkent"))
+            if age > timedelta(minutes=15):
+                await query.answer("Bu yozuv eskirdi. Tarix bo'limidan tahrirlang.", show_alert=True)
+                return
+
+        fallback_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
+            [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+
+        ok = await delete_transaction_with_undo(user_id, tx_id)
+        if ok:
+            undo_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Qaytarish", callback_data=f"txundo:{tx_id}")],
+                [InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
+                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+            ])
+            await query.edit_message_text(
+                "🗑 <b>Amaliyot o'chirildi, balans tiklandi.</b>\n\n"
+                "<i>15 soniya ichida qaytarishingiz mumkin.</i>",
+                parse_mode="HTML", reply_markup=undo_markup)
+            fire_and_forget(expire_undo_button(
+                context.bot, query.message.chat_id, query.message.message_id,
+                tx_id, fallback_markup))
+        else:
+            await query.edit_message_text(
+                "❌ Amaliyot topilmadi.", parse_mode="HTML", reply_markup=fallback_markup)
 
     elif data.startswith("txamt:"):
         tx_id = int(data.split(":")[1])
@@ -2045,6 +2229,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
                 ])
             )
+            await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending))
             return
 
         # 2) Bitta amaliyot (voice_parsed — chek tasdiqi ham shu yerga keladi)
@@ -2070,8 +2255,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📤 {format_money(stats['expenses'])}  "
                 f"💵 {format_money(stats['balance'])}",
                 parse_mode="HTML",
-                reply_markup=tx_confirm_keyboard(tx_id)
+                reply_markup=tx_confirm_keyboard(tx_id, fresh=True)
             )
+            await maybe_send_onboarding_tip(context.bot, user_id)
             return
 
         # 3) Qo'lda kiritish (cat_ tugmasidan keyin — miqdor so'raladi)
@@ -3526,12 +3712,14 @@ async def _save_transaction(user_id, context, note="",
             msg += f"\n⚠️ Budget tugayapti! Qolgan: {format_money(rem)}"
 
     # Tahrir/o'chirish tugmalari bilan
-    markup = tx_confirm_keyboard(tx_id)
+    markup = tx_confirm_keyboard(tx_id, fresh=True)
 
     if via_query:
         await via_query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
     elif reply_fn:
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
+
+    await maybe_send_onboarding_tip(context.bot, user_id)
 
 async def _show_recent(telegram_id, reply_fn=None, query=None):
     """Oxirgi amaliyotlar ro'yxati — har biriga tahrirlash tugmasi."""
