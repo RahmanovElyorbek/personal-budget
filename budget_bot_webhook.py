@@ -465,6 +465,16 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_streaks (
+                telegram_id      BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                current_streak   INTEGER NOT NULL DEFAULT 0,
+                longest_streak   INTEGER NOT NULL DEFAULT 0,
+                last_closed_date DATE,
+                freezes_left     INTEGER NOT NULL DEFAULT 2,
+                freeze_month     TEXT
+            )
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -490,6 +500,137 @@ async def ensure_user(telegram_id: int, name: str = ""):
                 INSERT INTO balances (telegram_id, name, type, amount)
                 VALUES ($1, $2, $3, 0), ($1, $4, $5, 0)
             """, telegram_id, "Naqd", "cash", "Karta", "card")
+
+# ===================== STREAK (BOSQICH 4) =====================
+# "Kun yopish" — tranzaksiya kiritish EMAS, kunni sanaydi. Kun yopilgan
+# hisoblanadi: kamida 1 ta tranzaksiya kiritilsa YOKI "Bugun xarajat
+# bo'lmadi" tugmasi bosilsa. Har oyga 2 ta muzlatish kuni beriladi.
+
+STREAK_MILESTONES = (7, 30, 100)
+
+async def _get_or_create_streak_row(conn, telegram_id: int):
+    row = await conn.fetchrow(
+        "SELECT * FROM user_streaks WHERE telegram_id = $1", telegram_id)
+    if row is None:
+        row = await conn.fetchrow("""
+            INSERT INTO user_streaks (telegram_id, current_streak, longest_streak, freezes_left)
+            VALUES ($1, 0, 0, 2)
+            RETURNING *
+        """, telegram_id)
+    return row
+
+async def close_streak_day(telegram_id: int) -> dict:
+    """Bugungi kunni 'yopilgan' deb belgilaydi (idempotent — kuniga bir marta
+    real o'zgarish qiladi). Qaytaradi:
+    {"changed": bool, "streak": int, "freeze_used": int, "milestone": int|None,
+     "broken": bool, "freezes_left": int}
+    """
+    tz = pytz.timezone("Asia/Tashkent")
+    today = datetime.now(tz).date()
+    this_month = today.strftime("%Y-%m")
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await _get_or_create_streak_row(conn, telegram_id)
+
+            if row["last_closed_date"] == today:
+                return {
+                    "changed": False, "streak": row["current_streak"],
+                    "freeze_used": 0, "milestone": None, "broken": False,
+                    "freezes_left": row["freezes_left"],
+                }
+
+            freezes_left = row["freezes_left"]
+            freeze_month = row["freeze_month"]
+            if freeze_month != this_month:
+                freezes_left = 2
+                freeze_month = this_month
+
+            freeze_used = 0
+            broken = False
+
+            if row["last_closed_date"] is None:
+                new_streak = 1
+            else:
+                gap_days = (today - row["last_closed_date"]).days - 1  # o'tkazib yuborilgan kunlar
+                if gap_days <= 0:
+                    new_streak = row["current_streak"] + 1
+                elif gap_days <= freezes_left:
+                    freeze_used = gap_days
+                    freezes_left -= gap_days
+                    new_streak = row["current_streak"] + 1
+                else:
+                    broken = True
+                    new_streak = 1
+
+            longest = max(row["longest_streak"], new_streak)
+            milestone = new_streak if new_streak in STREAK_MILESTONES else None
+
+            await conn.execute("""
+                UPDATE user_streaks
+                SET current_streak = $1, longest_streak = $2, last_closed_date = $3,
+                    freezes_left = $4, freeze_month = $5
+                WHERE telegram_id = $6
+            """, new_streak, longest, today, freezes_left, freeze_month, telegram_id)
+
+            return {
+                "changed": True, "streak": new_streak, "freeze_used": freeze_used,
+                "milestone": milestone, "broken": broken, "freezes_left": freezes_left,
+            }
+
+async def get_current_streak(telegram_id: int) -> int:
+    """/start ekrani uchun — hech narsani YOZMASDAN joriy streakni hisoblaydi.
+    close_streak_day() bilan bir xil bo'shliq+muzlatish mantig'ini qo'llaydi,
+    lekin faqat o'qiydi (DB'ga yozmaydi — haqiqiy yopilish faqat foydalanuvchi
+    biror amal qilganda close_streak_day() orqali qayd etiladi)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT current_streak, last_closed_date, freezes_left, freeze_month "
+            "FROM user_streaks WHERE telegram_id = $1", telegram_id)
+        if not row or row["last_closed_date"] is None:
+            return 0
+
+        tz = pytz.timezone("Asia/Tashkent")
+        today = datetime.now(tz).date()
+        this_month = today.strftime("%Y-%m")
+
+        if row["last_closed_date"] == today:
+            return row["current_streak"]
+
+        gap_days = (today - row["last_closed_date"]).days - 1
+        if gap_days <= 0:
+            return row["current_streak"]
+
+        freezes_left = row["freezes_left"] if row["freeze_month"] == this_month else 2
+        return row["current_streak"] if gap_days <= freezes_left else 0
+
+async def notify_streak_result(bot, telegram_id: int, result: dict):
+    """Faqat e'tiborga molik holatlarda (muzlatish ishlatildi yoki yubileyga
+    yetdi) alohida xabar yuboradi — har kuni spam qilmaslik uchun."""
+    if not result["changed"]:
+        return
+    try:
+        if result["freeze_used"] > 0:
+            kun = "kun" if result["freeze_used"] == 1 else "kun"
+            await bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    f"🧊 {result['freeze_used']} {kun} yozuv kiritmadingiz, "
+                    f"lekin muzlatish ishlatildi.\n"
+                    f"🔥 Seriya davom etmoqda: {result['streak']} kun\n"
+                    f"Qolgan muzlatish: {result['freezes_left']}"
+                )
+            )
+        elif result["milestone"]:
+            await bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    f"🎉 Tabriklaymiz! Siz {result['milestone']} kun ketma-ket "
+                    f"moliyangizni kuzatib bordingiz! 🔥"
+                )
+            )
+    except Exception as e:
+        logger.warning(f"Streak xabari yuborilmadi ({telegram_id}): {e}")
 
 async def is_user_premium(telegram_id: int) -> bool:
     async with db_pool.acquire() as conn:
@@ -1830,10 +1971,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         today_line = "📅 Bugun hali yozuv kiritilmadi.\n"
 
+    streak = await get_current_streak(user.id)
+    streak_line = f"🔥 {streak} kun ketma-ket\n" if streak > 0 else ""
+
     text = (
         f"👋 Assalomu alaykum, <b>{user.first_name}</b>!\n\n"
         f"💰 Joriy balans: <b>{format_money(data['total_balance'])}</b>\n"
         f"{today_line}"
+        f"{streak_line}"
         f"{trial_msg}"
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 <b>{datetime.now().strftime('%B %Y')}</b>\n"
@@ -2453,6 +2598,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending), context=context)
+            streak_result = await close_streak_day(user_id)
+            await notify_streak_result(context.bot, user_id, streak_result)
             return
 
         # 2) Bitta amaliyot (voice_parsed — chek tasdiqi ham shu yerga keladi)
@@ -2481,6 +2628,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=tx_confirm_keyboard(tx_id, fresh=True)
             )
             await maybe_send_onboarding_tip(context.bot, user_id, context=context)
+            streak_result = await close_streak_day(user_id)
+            await notify_streak_result(context.bot, user_id, streak_result)
             return
 
         # 3) Qo'lda kiritish (cat_ tugmasidan keyin — miqdor so'raladi)
@@ -3627,6 +3776,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
 
+    elif data == "no_expense_today":
+        result = await close_streak_day(user_id)
+        if not result["changed"]:
+            await query.answer("Bugun allaqachon qayd etilgan ✅", show_alert=True)
+            return
+        text = f"✅ <b>Qabul qilindi!</b> Bugun uchun xarajat yo'q deb belgilandi.\n\n"
+        if result["freeze_used"] > 0:
+            text += (
+                f"🧊 {result['freeze_used']} kun yozuv kiritmagansiz, "
+                f"lekin muzlatish ishlatildi.\n"
+                f"🔥 Seriya davom etmoqda: <b>{result['streak']} kun</b>\n"
+                f"Qolgan muzlatish: {result['freezes_left']}"
+            )
+        else:
+            text += f"🔥 Seriya: <b>{result['streak']} kun</b>"
+        await query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+        )
+        if result["milestone"]:
+            await notify_streak_result(context.bot, user_id, result)
+
     elif data == "back_main":
         txns  = await get_month_transactions(user_id)
         stats = calc_stats(txns)
@@ -4059,6 +4231,8 @@ async def _save_transaction(user_id, context, note="",
         await reply_fn(msg, parse_mode="HTML", reply_markup=markup)
 
     await maybe_send_onboarding_tip(context.bot, user_id, context=context)
+    streak_result = await close_streak_day(user_id)
+    await notify_streak_result(context.bot, user_id, streak_result)
 
 async def _show_recent(telegram_id, reply_fn=None, query=None):
     """Oxirgi amaliyotlar ro'yxati — har biriga tahrirlash tugmasi."""
@@ -4716,6 +4890,7 @@ async def send_daily_reminders(bot):
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
                  InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
+                [InlineKeyboardButton("✅ Bugun xarajat bo'lmadi", callback_data="no_expense_today")],
                 [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
             ])
 
