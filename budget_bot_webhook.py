@@ -1089,6 +1089,203 @@ async def calculate_monthly_forecast(telegram_id: int) -> dict:
         "remaining_days": remaining_days,
     }
 
+# ===================== AI HEALTH SCORE (BOSQICH 5) =====================
+# MUHIM: ball to'liq Python'da deterministik formula bilan hisoblanadi.
+# AI FAQAT tayyor raqamlarga asoslanib tushuntirish matnini yozadi —
+# ball hech qachon LLM'dan kelmaydi (barqarorlik va ishonchlilik uchun).
+#
+# ESLATMA: spec "Budjet limitiga rioya" mezonini kategoriya-bo'yicha
+# limitlar asosida so'ragan edi, lekin botda faqat BITTA umumiy oylik
+# budjet bor (users.budget). Shu sababli bu mezon "umumiy budjetga
+# rioya qilish"ga moslashtirildi — foydalanuvchi bilan kelishilgan.
+
+def _clamp(x, lo, hi):
+    return max(lo, min(x, hi))
+
+def _health_saving_score(income: float, expense: float) -> float:
+    if income <= 0:
+        return 0.0
+    rate = (income - expense) / income
+    return _clamp(rate / 0.30, 0, 1) * 100
+
+def _health_budget_score(expense: float, budget: float):
+    """None qaytaradi — budjet o'rnatilmagan bo'lsa (25 ball qolganlarga
+    proporsional taqsimlanadi)."""
+    if budget <= 0:
+        return None
+    if expense <= budget:
+        return 100.0
+    over_pct = (expense - budget) / budget
+    return _clamp(100 - over_pct * 100, 0, 100)
+
+def _health_regularity_score(days_with_txn: int, days_elapsed: int) -> float:
+    if days_elapsed <= 0:
+        return 0.0
+    return _clamp(days_with_txn / days_elapsed, 0, 1) * 100
+
+def _health_stability_score(current_expense: float, prev_expenses: list) -> float:
+    valid_prev = [e for e in prev_expenses if e > 0]
+    if not valid_prev:
+        return 100.0  # solishtirish uchun tarix yo'q — neytral yuqori ball
+    median_prev = statistics.median(valid_prev)
+    if median_prev == 0:
+        return 100.0
+    deviation = abs(current_expense - median_prev) / median_prev
+    return _clamp(100 - (deviation / 0.50) * 100, 0, 100)
+
+def _health_weighted_total(saving: float, budget, regularity: float, stability: float) -> int:
+    W_SAVING, W_BUDGET, W_REGULARITY, W_STABILITY = 35, 25, 20, 20
+    if budget is None:
+        total_other = W_SAVING + W_REGULARITY + W_STABILITY
+        w_saving     = W_SAVING     + W_SAVING     / total_other * W_BUDGET
+        w_regularity = W_REGULARITY + W_REGULARITY / total_other * W_BUDGET
+        w_stability  = W_STABILITY  + W_STABILITY  / total_other * W_BUDGET
+        score = (saving * w_saving + regularity * w_regularity + stability * w_stability) / 100
+    else:
+        score = (
+            saving * W_SAVING + budget * W_BUDGET +
+            regularity * W_REGULARITY + stability * W_STABILITY
+        ) / 100
+    return round(_clamp(score, 0, 100))
+
+def _health_distinct_txn_days(txns: list) -> int:
+    tz = pytz.timezone("Asia/Tashkent")
+    return len({t["date"].astimezone(tz).day for t in txns})
+
+async def _health_trailing_3month_expenses(telegram_id: int, year: int, month: int) -> list:
+    """Berilgan oydan OLDINGI 3 oyning jami xarajatlari (median uchun)."""
+    results = []
+    y, m = year, month
+    for _ in range(3):
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+        txns = await get_transactions_by_month(telegram_id, y, m)
+        results.append(sum(float(t["amount"]) for t in txns if t["type"] == "expense"))
+    return results
+
+async def calculate_health_score_for_month(telegram_id: int, year: int, month: int,
+                                            days_elapsed: int = None) -> dict:
+    """Berilgan oy uchun Health Score'ni hisoblaydi. days_elapsed berilmasa
+    oyning to'liq kunlar soni ishlatiladi (o'tgan oylar uchun)."""
+    txns = await get_transactions_by_month(telegram_id, year, month)
+    income  = sum(float(t["amount"]) for t in txns if t["type"] == "income")
+    expense = sum(float(t["amount"]) for t in txns if t["type"] == "expense")
+
+    if days_elapsed is None:
+        days_elapsed = cal_module.monthrange(year, month)[1]
+
+    budget = await get_budget(telegram_id)
+    prev_expenses = await _health_trailing_3month_expenses(telegram_id, year, month)
+
+    saving     = _health_saving_score(income, expense)
+    budget_sc  = _health_budget_score(expense, budget)
+    regularity = _health_regularity_score(_health_distinct_txn_days(txns), days_elapsed)
+    stability  = _health_stability_score(expense, prev_expenses)
+
+    total = _health_weighted_total(saving, budget_sc, regularity, stability)
+
+    return {
+        "total": total,
+        "saving": round(saving),
+        "budget": round(budget_sc) if budget_sc is not None else None,
+        "regularity": round(regularity),
+        "stability": round(stability),
+        "income": income,
+        "expense": expense,
+        "txns": txns,
+    }
+
+def _health_category_totals(txns: list) -> dict:
+    totals = {}
+    for t in txns:
+        if t["type"] != "expense":
+            continue
+        cat = t.get("category") or "📦 Boshqa"
+        totals[cat] = totals.get(cat, 0) + float(t["amount"])
+    return totals
+
+def _health_top_growth_category(cur_txns: list, prev_txns: list):
+    """Eng ko'p (% da) oshgan xarajat kategoriyasini topadi.
+    (category, growth_pct, growth_amount) yoki (None, 0, 0) qaytaradi."""
+    cur_totals  = _health_category_totals(cur_txns)
+    prev_totals = _health_category_totals(prev_txns)
+    best_cat, best_pct, best_diff = None, 0.0, 0.0
+    for cat, cur_amt in cur_totals.items():
+        prev_amt = prev_totals.get(cat, 0.0)
+        if prev_amt > 0:
+            pct = (cur_amt - prev_amt) / prev_amt * 100
+        elif cur_amt > 0:
+            pct = 100.0
+        else:
+            continue
+        if pct > best_pct:
+            best_cat, best_pct, best_diff = cat, pct, cur_amt - prev_amt
+    return best_cat, best_pct, best_diff
+
+async def get_health_score_explanation(scores_now: dict, scores_prev: dict,
+                                       top_growth_cat, top_growth_pct: float) -> str:
+    """Faqat tayyor raqamlarga asoslanib 3 jumlali tushuntirish yozadi.
+    Ballni GPT hisoblamaydi — faqat matn yozadi."""
+
+    def _delta(now_val, prev_val):
+        if now_val is None or prev_val is None:
+            return 0
+        return now_val - prev_val
+
+    saving_delta     = _delta(scores_now["saving"], scores_prev["saving"] if scores_prev else scores_now["saving"])
+    budget_delta     = _delta(scores_now["budget"], scores_prev["budget"] if scores_prev else scores_now["budget"])
+    regularity_delta = _delta(scores_now["regularity"], scores_prev["regularity"] if scores_prev else scores_now["regularity"])
+    stability_delta  = _delta(scores_now["stability"], scores_prev["stability"] if scores_prev else scores_now["stability"])
+
+    budget_line = (
+        f"- Budjet rioyasi: {scores_now['budget']}/100 ({budget_delta:+d})"
+        if scores_now["budget"] is not None
+        else "- Budjet rioyasi: budjet o'rnatilmagan (bu mezon boshqalarga taqsimlangan)"
+    )
+    growth_line = (
+        f"Eng ko'p oshgan kategoriya: {top_growth_cat} ({top_growth_pct:.0f}%)"
+        if top_growth_cat else "Eng ko'p oshgan kategoriya: aniqlanmadi"
+    )
+
+    prompt = (
+        f"Foydalanuvchining moliyaviy ballari (o'zgarish o'tgan oyga nisbatan):\n"
+        f"- Jamg'arma: {scores_now['saving']}/100 ({saving_delta:+d})\n"
+        f"{budget_line}\n"
+        f"- Muntazamlik: {scores_now['regularity']}/100 ({regularity_delta:+d})\n"
+        f"- Barqarorlik: {scores_now['stability']}/100 ({stability_delta:+d})\n\n"
+        f"{growth_line}\n\n"
+        f"3 ta qisqa jumla yoz o'zbek tilida:\n"
+        f"1) Nima yaxshi\n"
+        f"2) Nima yomonlashdi va aniq raqam bilan sabab\n"
+        f"3) Kelasi oy uchun 1 ta aniq amaliy tavsiya (summa bilan)\n"
+        f"Raqamlarni o'zing o'ylab topma, faqat berilganlarini ishlat.\n"
+        f"FAQAT shu 3 jumlani yoz (har biri alohida qatorda), boshqa hech narsa qo'shma."
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.5,
+                    "max_tokens": 300,
+                },
+            )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        logger.warning(f"Health Score AI xato: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Health Score AI exception: {e}")
+    return None
+
 async def add_balance(telegram_id: int, name: str, bal_type: str, amount: float):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -1657,6 +1854,7 @@ def ai_keyboard():
         [InlineKeyboardButton("📅 Haftalik AI hisobot", callback_data="ai_weekly")],
         [InlineKeyboardButton("📈 Oylik AI xulosa", callback_data="ai_monthly")],
         [InlineKeyboardButton("📊 Oy oxiri prognozi", callback_data="monthly_forecast")],
+        [InlineKeyboardButton("🏆 Moliyaviy Salomatlik", callback_data="health_score")],
         [InlineKeyboardButton("◀️ Orqaga", callback_data="back_main")],
     ])
 
@@ -3041,6 +3239,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+        )
+
+    elif data == "health_score":
+        await query.edit_message_text(
+            "🏆 <b>Moliyaviy salomatlik hisoblanmoqda...</b>\n\n<i>Bir daqiqa sabr qiling...</i>",
+            parse_mode="HTML"
+        )
+        today = datetime.now(pytz.timezone("Asia/Tashkent")).date()
+        prev_month = today.month - 1 if today.month > 1 else 12
+        prev_year  = today.year if today.month > 1 else today.year - 1
+
+        scores_now  = await calculate_health_score_for_month(
+            user_id, today.year, today.month, days_elapsed=today.day)
+        scores_prev = await calculate_health_score_for_month(user_id, prev_year, prev_month)
+
+        top_cat, top_pct, top_diff = _health_top_growth_category(
+            scores_now["txns"], scores_prev["txns"])
+
+        explanation = await get_health_score_explanation(scores_now, scores_prev, top_cat, top_pct)
+
+        delta_total = scores_now["total"] - scores_prev["total"]
+        delta_str = f" ({delta_total:+d})" if scores_prev["income"] or scores_prev["expense"] else ""
+
+        text = (
+            f"🏆 <b>Moliyaviy salomatlik: {scores_now['total']}/100</b>{delta_str}\n\n"
+            f"{explanation or 'AI tushuntirish vaqtincha ishlamayapti. Keyinroq urinib ko`ring.'}"
+        )
+        await query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Yangilash", callback_data="health_score")],
+                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
+            ])
         )
 
     # ---------- TARIX ----------
