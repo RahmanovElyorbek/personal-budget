@@ -5703,19 +5703,28 @@ async def main():
     await site.start()
     print(f"🚀 Port {PORT} ochildi — bot ishga tushmoqda...", flush=True)
 
-    # 2. DB — 45 soniya timeout
-    try:
-        print("🔄 [1/5] DB ulanmoqda...", flush=True)
-        await asyncio.wait_for(init_db(), timeout=45)
-        print("✅ [2/5] DB tayyor!", flush=True)
-    except asyncio.TimeoutError:
-        print("❌ [1/5] DB ulanishi 45 soniyada timeout!", flush=True)
-        await asyncio.Event().wait()
-        return
-    except Exception as e:
-        print(f"❌ [1/5] DB xatolik: {e}", flush=True)
-        await asyncio.Event().wait()
-        return
+    # 2. DB — avtomatik qayta urinish bilan (45s timeout, ortib boruvchi kutish).
+    # Supabase ba'zan sovuq holatdan sekin "uyg'onadi" — health-check "Healthy"
+    # ko'rsatsa ham birinchi ulanish 45s dan oshishi mumkin. Bitta muvaffaqiyatsiz
+    # urinishda butunlay to'xtab qolish o'rniga (avval shunday edi — faqat qo'lda
+    # qayta deploy qilish orqali tuzalardi), endi cheksiz qayta urinadi.
+    # Port allaqachon ochiq bo'lgani uchun Render health-check bunga xalaqit bermaydi.
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            print(f"🔄 [1/5] DB ulanmoqda... (urinish {attempt})", flush=True)
+            await asyncio.wait_for(init_db(), timeout=45)
+            print("✅ [2/5] DB tayyor!", flush=True)
+            break
+        except asyncio.TimeoutError:
+            wait_s = min(10 * attempt, 60)
+            print(f"❌ [1/5] DB ulanishi 45 soniyada timeout! {wait_s}s dan keyin qayta urinaman...", flush=True)
+            await asyncio.sleep(wait_s)
+        except Exception as e:
+            wait_s = min(10 * attempt, 60)
+            print(f"❌ [1/5] DB xatolik: {e}. {wait_s}s dan keyin qayta urinaman...", flush=True)
+            await asyncio.sleep(wait_s)
 
     # 3. Bot handlers
     print("🔄 [3/5] Telegram bot qurilmoqda...", flush=True)
