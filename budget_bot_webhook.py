@@ -28,6 +28,7 @@ import secrets
 import calendar as cal_module
 from datetime import datetime, timedelta, date
 from aiohttp import web
+from services.classifier import classify_transactions
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -151,128 +152,17 @@ async def transcribe_voice(file_path: str) -> str:
     return ""
 
 async def parse_voice_transactions(text: str) -> list:
-    """GPT-4o-mini orqali matndan BIR YOKI BIR NECHTA amaliyotni ajratadi.
-    Har biri: income / expense / debt_gave / debt_took"""
+    """Matndan tranzaksiya ajratadi. Ovoz VA yozma xabar — ikkalasi ham shu
+    yerga keladi (voice_handler ovozni transkripsiya qilgandan keyin ham,
+    message_handler foydalanuvchi terib yozgan matn uchun ham shu funksiyani
+    chaqiradi — 2242-qatordagi _process_parsed_text() orqali).
 
-    expense_cats = ", ".join(EXPENSE_CATEGORIES)
-    income_cats = ", ".join(INCOME_CATEGORIES)
+    Haqiqiy klassifikatsiya (3 qatlamli: kalit so'z lug'ati + AI + validatsiya)
+    services/classifier.py modulida — bu yerda faqat chaqiruv bor, chunki
+    boshqa kod (message_handler, voice_handler) shu funksiya nomiga bog'liq.
 
-    system_prompt = (
-        "Sen o'zbek tilidagi moliyaviy ovoz xabarlarini tahlil qiluvchi yordamchisan.\n"
-        "Foydalanuvchi BITTA gapda BIR, IKKI YOKI UCHTA moliyaviy amaliyotni ketma-ket "
-        "aytishi mumkin (odatda vergul, 'va', 'hamda', 'keyin', 'so'ngra' bilan ajratiladi). "
-        "Har bir alohida amaliyotni topib, alohida obyekt sifatida chiqar — hech birini "
-        "tushirib qoldirma.\n\n"
-        "MUHIM: Har doim shu formatda JSON qaytar:\n"
-        '{\"transactions\": [ {...}, {...} ]}\n\n'
-        "Har bir amaliyot uchun:\n"
-        "1. type: 'income' | 'expense' | 'debt_gave' | 'debt_took'\n"
-        "   - 'sarfladim/(mahsulot uchun) berdim/to'ladim/xarjladim/oldim (sotib)' = expense\n"
-        "   - 'maosh/tushdi/kirdi/daromad/ishlab topdim/sotdim' = income\n"
-        "   - 'qarz berdim/qarzga berdim/qarz qildim (biror kishiga)' = debt_gave\n"
-        "   - 'qarz oldim/qarzga oldim/qarzimni qaytardim' = debt_took\n"
-        "   MUHIM: 'qarz' so'zi ANIQ aytilmagan bo'lsa, buni debt deb hisoblama — "
-        "   oddiy 'berdim' (masalan qizimga/o'g'limga pul berish) odatda EXPENSE bo'ladi, "
-        "   debt EMAS.\n"
-        "2. amount: butun son (so'mda). O'zbekcha sonlarni QISMLARDAN QO'SHIB hisobla:\n"
-        "   - 'ming'=1 000, 'o'n ming'=10 000, 'yigirma ming'=20 000, 'ellik ming'=50 000\n"
-        "   - 'yuz ming'=100 000, 'ikki yuz ming'=200 000, 'uch yuz ming'=300 000\n"
-        "   - 'yuz ellik ming'=150 000 ('yuz'+'ellik ming' qo'shiladi)\n"
-        "   - 'million'=1 000 000, 'bir yarim million'=1 500 000\n"
-        "   QOIDA: har bir son so'zini alohida qiymatga aylantirib, ULARNI QO'SH "
-        "   (masalan 'ikki yuz o'n besh ming' = 200000+10000+5000 = 215000).\n"
-        "   Agar audio matni buzilgan yoki tanish bo'lmagan tovushga o'xshasa (masalan "
-        "   'üçüz', 'dörüz', 'beşüz' kabi turkcha aralashgan so'zlar chiqsa), buni mos "
-        "   o'zbekcha songa mosla: üçüz≈uch yuz, dörüz≈to'rt yuz, beşüz≈besh yuz — "
-        "   FAQAT boshqa aniqroq talqin topilmaganda ishlat.\n"
-        "3. category: faqat expense/income uchun. Quyidagidan ANIQ BIRI:\n"
-        f"   Xarajat: {expense_cats}\n"
-        f"   Daromad: {income_cats}\n"
-        "4. note: qisqa izoh (3-8 so'z)\n"
-        "5. person: faqat debt uchun — kim (masalan 'Sardor'). Aks holda null\n\n"
-        "MISOL 1 kirish: 'bozordan olti yuz ming bozorlik qildim, mashinaga ikki yuz ming "
-        "yoqilg'i quydirdim, Sardorga uch yuz ming qarz berdim'\n"
-        "MISOL 1 chiqish:\n"
-        '{\"transactions\": ['
-        '{\"type\":\"expense\",\"amount\":600000,\"category\":\"🍔 Oziq-ovqat\",\"note\":\"Bozorlik\",\"person\":null},'
-        '{\"type\":\"expense\",\"amount\":200000,\"category\":\"🚌 Transport\",\"note\":\"Yoqilg\'i\",\"person\":null},'
-        '{\"type\":\"debt_gave\",\"amount\":300000,\"category\":null,\"note\":\"Qarz berildi\",\"person\":\"Sardor\"}'
-        ']}\n\n'
-        "MISOL 2 kirish: 'qizimga o'n ming so'm berdim, mashinaga ellik ming so'mlik benzin "
-        "quydim, oyligimni oldim uch million so'm'\n"
-        "MISOL 2 chiqish (bu yerda 3 ta amaliyot bor, 'qarz' so'zi yo'q — hammasi expense/income):\n"
-        '{\"transactions\": ['
-        '{\"type\":\"expense\",\"amount\":10000,\"category\":\"📦 Boshqa\",\"note\":\"Qizimga berildi\",\"person\":null},'
-        '{\"type\":\"expense\",\"amount\":50000,\"category\":\"🚌 Transport\",\"note\":\"Benzin\",\"person\":null},'
-        '{\"type\":\"income\",\"amount\":3000000,\"category\":\"💼 Maosh\",\"note\":\"Oylik maosh\",\"person\":null}'
-        ']}\n\n'
-        "Tushunarsiz bo'lsa: {\"transactions\": []}\n"
-        "FAQAT JSON qaytar, boshqa hech narsa yozma!"
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": text},
-                    ],
-                    "temperature": 0.1,
-                    "response_format": {"type": "json_object"},
-                }
-            )
-
-            if response.status_code != 200:
-                logger.error(f"GPT error: {response.text}")
-                return []
-
-            content = response.json()["choices"][0]["message"]["content"]
-            logger.info(f"🤖 GPT multi response: {content}")
-
-            parsed = json.loads(content)
-            raw_list = parsed.get("transactions", [])
-
-            results = []
-            for item in raw_list:
-                ttype = item.get("type", "expense")
-                if ttype not in ("income", "expense", "debt_gave", "debt_took"):
-                    ttype = "expense"
-
-                amount = float(item.get("amount", 0))
-                if amount <= 0:
-                    continue
-
-                # Kategoriya validatsiyasi faqat income/expense uchun
-                category = item.get("category") or ""
-                if ttype == "expense":
-                    if category not in EXPENSE_CATEGORIES:
-                        category = "📦 Boshqa"
-                elif ttype == "income":
-                    if category not in INCOME_CATEGORIES:
-                        category = "📦 Boshqa daromad"
-                else:
-                    category = None  # debt
-
-                results.append({
-                    "type": ttype,
-                    "amount": amount,
-                    "category": category,
-                    "note": (item.get("note") or "")[:200],
-                    "person": item.get("person"),
-                })
-
-            return results
-
-    except Exception as e:
-        logger.error(f"GPT multi parse error: {e}")
-        return []
+    Har biri: income / expense / debt_gave / debt_took."""
+    return await classify_transactions(text, OPENAI_API_KEY)
 
 
 async def analyze_receipt_image(image_bytes: bytes) -> dict:
