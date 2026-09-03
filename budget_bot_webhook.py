@@ -1364,6 +1364,26 @@ async def validate_mcp_token(token: str) -> "int | None":
 
 # ===================== DONUT CHART =====================
 
+def _apportion_percentages(amounts: list) -> list:
+    """VAZIFA 5: har bir summaning foizini yig'indisi ANIQ 100% bo'ladigan
+    qilib hisoblaydi ("eng katta qoldiq" — largest remainder — usuli).
+    Oddiy int(amt/total*100) bilan har birini alohida pastga yaxlitlash
+    umumiy yig'indini 100%dan kamroq qilib qo'yishi mumkin edi (masalan
+    71%+28%=99%) — bu funksiya buni tuzatadi: avval har biri pastga
+    yaxlitlanadi, so'ng yetishmayotgan ballar eng katta kasr qoldiqqa ega
+    ulushlarga birma-bir qo'shiladi."""
+    total = sum(amounts)
+    if total <= 0 or not amounts:
+        return [0] * len(amounts)
+    raw       = [a / total * 100 for a in amounts]
+    floors    = [int(r) for r in raw]
+    remainder = 100 - sum(floors)
+    order     = sorted(range(len(raw)), key=lambda i: raw[i] - floors[i], reverse=True)
+    for i in range(max(remainder, 0)):
+        floors[order[i % len(order)]] += 1
+    return floors
+
+
 def generate_donut_chart(
     cat_stats: dict,
     total_expenses: float,
@@ -1381,9 +1401,28 @@ def generate_donut_chart(
     BG, FG, SUB = '#111827', '#FFFFFF', '#9CA3AF'
 
     sorted_cats = sorted(cat_stats.items(), key=lambda x: -x[1])
-    sizes  = [c[1] for c in sorted_cats]
-    n      = len(sorted_cats)
-    colors = PALETTE[:n]
+
+    # VAZIFA 5: 2% dan kichik ulushlarni "Boshqalar" guruhiga birlashtiramiz
+    # — legenda va diagramma toza bo'lishi uchun (qarz bu yerga umuman
+    # kelmaydi — cat_stats faqat "expense" tranzaksiyalardan tuziladi).
+    MERGE_THRESHOLD_PCT = 2.0
+    big_cats, small_total = [], 0.0
+    for cat, amt in sorted_cats:
+        pct_raw = (amt / total_expenses * 100) if total_expenses else 0
+        if pct_raw < MERGE_THRESHOLD_PCT:
+            small_total += amt
+        else:
+            big_cats.append((cat, amt))
+    if small_total > 0:
+        big_cats.append(("🔹 Boshqalar", small_total))
+    sorted_cats = big_cats
+
+    sizes       = [c[1] for c in sorted_cats]
+    n           = len(sorted_cats)
+    colors      = PALETTE[:n]
+    grand_total = sum(sizes)
+    # Foizlar yig'indisi aniq 100% bo'lishi kafolatlanadi (VAZIFA 5)
+    percentages = _apportion_percentages(sizes)
 
     donut_h  = 4.0
     legend_h = 0.42 * n
@@ -1403,9 +1442,11 @@ def generate_donut_chart(
         wedgeprops=dict(width=0.50, edgecolor=BG, linewidth=3),
         counterclock=False,
     )
-    ax.text(0,  0.10, f"-{total_expenses:,.0f}",
+    # VAZIFA 5: markazda MUSBAT raqam + izoh (avval "-845,000 / UZS" kabi
+    # manfiy va tushunarsiz chiqardi — chiqim manfiy bo'lishi mantiqsiz edi)
+    ax.text(0,  0.10, f"{grand_total:,.0f}",
             ha='center', va='center', fontsize=14, fontweight='bold', color=FG)
-    ax.text(0, -0.20, "UZS",
+    ax.text(0, -0.20, "so'm · chiqim",
             ha='center', va='center', fontsize=9, color=SUB)
     if period_label:
         ax.text(0.5, 1.0, period_label,
@@ -1421,7 +1462,7 @@ def generate_donut_chart(
     ax_l.axis('off')
 
     for i, (cat, amt) in enumerate(sorted_cats):
-        pct = int(amt / total_expenses * 100) if total_expenses else 0
+        pct = percentages[i]
         yc  = 1.0 - (i + 0.5) / n
         ax_l.plot([0.04], [yc], 'o',
                   color=colors[i], markersize=9,
