@@ -732,6 +732,22 @@ async def update_transaction(telegram_id: int, tx_id: int,
             invalidate_start_cache(telegram_id)
             return True
 
+async def log_category_correction(telegram_id: int, original_text: str,
+                                    ai_category: str, corrected_category: str):
+    """VAZIFA 3: foydalanuvchi tranzaksiya kategoriyasini qo'lda tuzatganda
+    shu yerga yoziladi — kelajakda lug'atni/promptni kengaytirish uchun
+    manba bo'ladi. Xatolik bo'lsa ham asosiy oqimni to'xtatmaydi."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO category_corrections "
+                "(telegram_id, original_text, ai_category, corrected_category) "
+                "VALUES ($1, $2, $3, $4)",
+                telegram_id, original_text or "", ai_category, corrected_category
+            )
+    except Exception as e:
+        logger.warning(f"category_corrections yozib bo'lmadi: {e}")
+
 async def create_login_code(telegram_id: int) -> str:
     code = str(secrets.randbelow(900000) + 100000)
     expires_at = datetime.now() + timedelta(minutes=10)
@@ -2818,7 +2834,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Amaliyot topilmadi.")
             return
         cats = INCOME_CATEGORIES if tx["type"] == "income" else EXPENSE_CATEGORIES
-        await update_transaction(user_id, tx_id, new_category=cats[int(idx_s)])
+        new_cat = cats[int(idx_s)]
+        old_cat = tx["category"]
+        await update_transaction(user_id, tx_id, new_category=new_cat)
+        # VAZIFA 3: qo'lda tuzatilgan kategoriyani keyingi lug'at/prompt
+        # takomillashtirish uchun qayd qilib boramiz
+        if new_cat != old_cat:
+            await log_category_correction(
+                user_id, tx.get("note") or "", old_cat, new_cat
+            )
         text, kb = await render_tx_card(user_id, tx_id)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
 
@@ -2866,37 +2890,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending = context.user_data.pop("pending_txns")
             context.user_data.pop("pending_text", None)
 
+            tx_ids = []
             for t in pending:
-                await add_transaction(
+                tx_id = await add_transaction(
                     user_id, t["type"], t["amount"],
                     t["category"], t.get("note", ""), balance_id
                 )
+                tx_ids.append(tx_id)
 
             txns  = await get_month_transactions(user_id)
             stats = calc_stats(txns)
 
-            saved = ""
-            for t in pending:
-                emoji = "📥" if t["type"] == "income" else "📤"
-                saved += f"{emoji} {format_money(t['amount'])} — {t['category']}\n"
-
+            # VAZIFA 3: bitta birlashtirilgan xabar o'rniga — HAR BIR
+            # amaliyot uchun ALOHIDA tasdiqlash kartasi (mustaqil
+            # tahrirlash/o'chirish mumkin bo'lishi uchun, xuddi bitta
+            # amaliyot saqlanganidagi kabi)
             await query.edit_message_text(
                 f"✅ <b>{len(pending)} ta amaliyot saqlandi!</b>\n\n"
-                f"{saved}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"📥 {format_money(stats['income'])}  "
                 f"📤 {format_money(stats['expenses'])}  "
-                f"💵 {format_money(stats['balance'])}\n\n"
-                f"<i>Tahrirlash uchun 📝 Oxirgi amaliyotlar tugmasini bosing</i>",
+                f"💵 {format_money(stats['balance'])}",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
-                    [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
-                     InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
-                    [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
-                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
-                ])
             )
+            for t, tx_id in zip(pending, tx_ids):
+                emoji  = "📥" if t["type"] == "income" else "📤"
+                type_t = "Daromad" if t["type"] == "income" else "Xarajat"
+                note_t = f"\n📝 Izoh: {t['note']}" if t.get("note") else ""
+                card_text = (
+                    f"✅ <b>{type_t}</b>\n\n"
+                    f"{emoji} Miqdor: <b>{format_money(float(t['amount']))}</b>\n"
+                    f"📁 Kategoriya: {t['category']}{note_t}"
+                )
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=card_text,
+                    parse_mode="HTML",
+                    reply_markup=tx_confirm_keyboard(tx_id, fresh=True),
+                )
             await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending), context=context)
             streak_result = await close_streak_day(user_id)
             await notify_streak_result(context.bot, user_id, streak_result)
