@@ -869,6 +869,29 @@ async def build_debts_screen(telegram_id: int):
     ])
     return msg, markup
 
+async def build_debts_report_section(telegram_id: int) -> str:
+    """VAZIFA 4: hisobot ekranlariga qo'shiladigan '🤝 Oldi-berdilar' bo'limi.
+    Qarz — chiqim EMAS, shuning uchun statistikaga aralashtirilmaydi, lekin
+    foydalanuvchi buni ko'rishi kerak. Ochiq qarz umuman bo'lmasa — bo'sh
+    matn qaytaradi (bo'lim ko'rsatilmaydi)."""
+    debts = await get_debts(telegram_id)
+    if not debts:
+        return ""
+    gave = [d for d in debts if d["direction"] == "gave"]
+    took = [d for d in debts if d["direction"] == "took"]
+    gave_total = sum(float(d["amount"]) for d in gave)
+    took_total = sum(float(d["amount"]) for d in took)
+    gave_people = len({d["person_name"] for d in gave})
+    took_people = len({d["person_name"] for d in took})
+
+    lines = ["\n🤝 <b>Oldi-berdilar</b>"]
+    if gave:
+        lines.append(f"  Berilgan qarzlar: {format_money(gave_total)} ({gave_people} kishiga)")
+    if took:
+        lines.append(f"  Olingan qarzlar: {format_money(took_total)} ({took_people} kishidan)")
+    return "\n".join(lines) + "\n"
+
+
 async def mark_debt_paid(debt_id: int, return_balance_id: int = None):
     async with db_pool.acquire() as conn:
         async with conn.transaction():
@@ -883,6 +906,53 @@ async def mark_debt_paid(debt_id: int, return_balance_id: int = None):
                     "UPDATE balances SET amount = amount + $1 WHERE id = $2",
                     delta, return_balance_id
                 )
+
+def _match_debts_by_person(debts: list, person: "str | None") -> list:
+    """Ism berilgan bo'lsa — FAQAT o'sha odamning ochiq qarzlarini qaytaradi
+    (katta-kichik harfga sezgir emas). Mos kelmasa — bo'sh ro'yxat (chaqiruvchi
+    buni 'bu odam uchun ochiq qarz yo'q' deb talqin qiladi).
+    Ism berilmasa — barcha ochiq qarzlarni qaytaradi."""
+    if not person:
+        return debts
+    person_norm = person.strip().lower()
+    return [d for d in debts if d["person_name"].strip().lower() == person_norm]
+
+
+def debt_pick_keyboard(debts: list, back_callback: str = "debts") -> InlineKeyboardMarkup:
+    """Bir nechta qarzdan birini tanlash klaviaturasi (VAZIFA 4: debt_repay
+    bir nechta nomzodga mos kelganda ham, qo'lda 'Qarz to'landi' ro'yxatida
+    ham ishlatiladi)."""
+    buttons = []
+    for d in debts:
+        direction = "🔴" if d["direction"] == "gave" else "🟢"
+        label = f"{direction} {d['person_name']} — {format_money(float(d['amount']))}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"mark_paid_{d['id']}")])
+    buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data=back_callback)])
+    return InlineKeyboardMarkup(buttons)
+
+
+def debt_balance_prompt(debt: dict, balances: list) -> "tuple[str, InlineKeyboardMarkup]":
+    """Bitta qarzni yopishdan oldin 'qaysi balansga' so'rovi (matn+tugmalar)."""
+    direction = debt["direction"]
+    amount    = float(debt["amount"])
+    person    = debt["person_name"]
+    debt_id   = debt["id"]
+    emoji     = "🔴" if direction == "gave" else "🟢"
+    action    = "qaytaradi → qo'shamiz" if direction == "gave" else "qaytaramiz → yechilamiz"
+
+    msg = (
+        f"{emoji} <b>{person}</b> — <b>{format_money(amount)}</b>\n\n"
+        f"💳 Qaysi balansga <b>{action}</b>?"
+    )
+    buttons = []
+    for b in balances:
+        type_emoji = BALANCE_TYPES.get(b["type"], "📦").split()[0]
+        label = f"{type_emoji} {b['name']} — {format_money(float(b['amount']))}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"debt_ret_bal_{debt_id}_{b['id']}")])
+    buttons.append([InlineKeyboardButton("⏭️ Balanssiz belgilash", callback_data=f"debt_ret_no_bal_{debt_id}")])
+    buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="debt_paid_list")])
+    return msg, InlineKeyboardMarkup(buttons)
+
 
 async def check_due_debts(telegram_id: int) -> list:
     """/start ekranida qarz eslatmasi ko'rsatish uchun.
@@ -2165,6 +2235,63 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_reply_keyboard())
 
+async def _handle_debt_repay(user_id, item, context, bot, chat_id):
+    """VAZIFA 4: 'eski qarz to'lovi' / 'qarzimni qaytardim' kabi — bu YANGI
+    qarz EMAS, MAVJUD ochiq qarzni yopish so'rovi. Yangi debts yozuvi
+    yaratmaydi, aksincha:
+      - ism bo'yicha ANIQ bitta ochiq qarz topilsa -> darhol balans so'raydi
+        (mark_paid_ bilan bir xil oqim)
+      - bir nechta mos qarz topilsa -> tanlash tugmalari beradi
+      - hech qanday mos ochiq qarz topilmasa -> buni yangi qarz sifatida
+        qo'shishni taklif qiladi (agar summa aytilgan bo'lsa)."""
+    person = item.get("person")
+    open_debts = await get_debts(user_id)
+    matches = _match_debts_by_person(open_debts, person)
+
+    if len(matches) == 1:
+        debt = matches[0]
+        balances = await get_balances(user_id)
+        msg, markup = debt_balance_prompt(debt, balances)
+        header = f"🤝 <b>{person or debt['person_name']}</b> bilan hisob-kitob topildi:\n\n"
+        await bot.send_message(chat_id=chat_id, text=header + msg,
+                                parse_mode="HTML", reply_markup=markup)
+        return
+
+    if len(matches) > 1:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"🤝 <b>{person}</b> nomida bir nechta ochiq qarz topildi. "
+                 f"Qaysi biri yopilsin?",
+            parse_mode="HTML",
+            reply_markup=debt_pick_keyboard(matches),
+        )
+        return
+
+    # Hech qanday mos ochiq qarz topilmadi
+    display_person = person or "Noma'lum"
+    amount = item.get("amount") or 0
+    text_msg = f"🤝 <b>{display_person}</b> uchun ochiq qarz topilmadi.\n"
+    buttons = []
+    if amount and amount > 0:
+        context.user_data["debt_person"] = display_person
+        context.user_data["debt_amount"] = amount
+        context.user_data["debt_direction"] = "gave"
+        text_msg += (
+            f"\n💰 Aytilgan summa: <b>{format_money(amount)}</b>\n\n"
+            f"Buni yangi qarz sifatida (men bergan) qo'shaymi?"
+        )
+        buttons.append([InlineKeyboardButton(
+            "➕ Ha, yangi qarz sifatida qo'sh", callback_data="debt_skip_date")])
+        buttons.append([InlineKeyboardButton(
+            "❌ Bekor qilish", callback_data="debtrepay_cancel")])
+    else:
+        text_msg += "\n<i>Agar bu yangi qarz bo'lsa, 💸 Qarzlar bo'limidan qo'lda qo'shing.</i>"
+        buttons.append([InlineKeyboardButton("💸 Qarzlar bo'limi", callback_data="debts")])
+
+    await bot.send_message(chat_id=chat_id, text=text_msg, parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup(buttons))
+
+
 async def _process_parsed_text(user_id, context, text, status_msg, label="Tanildi", emoji_prefix="🎤"):
     """Ovozdan yoki erkin matndan (masalan '20 ming taksi') ajratilgan
     amaliyotlarni qayta ishlaydi: qarzlarni darhol saqlaydi, pul
@@ -2181,12 +2308,15 @@ async def _process_parsed_text(user_id, context, text, status_msg, label="Tanild
         )
         return
 
-    # Qarzlarni darhol saqlaymiz (balans talab qilmaydi)
-    debts = [t for t in transactions if t["type"] in ("debt_gave", "debt_took")]
-    money_txns = [t for t in transactions if t["type"] in ("income", "expense")]
+    # YANGI qarzlarni darhol saqlaymiz (balans talab qilmaydi)
+    debts_new   = [t for t in transactions if t["type"] in ("debt_gave", "debt_took")]
+    # MAVJUD qarzni yopish so'rovlari — alohida xabar(lar)da, chunki foydalanuvchi
+    # tasdiqi/tanlovi kerak bo'lishi mumkin (VAZIFA 4)
+    debt_repays = [t for t in transactions if t["type"] == "debt_repay"]
+    money_txns  = [t for t in transactions if t["type"] in ("income", "expense")]
 
     debt_summary = ""
-    for d in debts:
+    for d in debts_new:
         direction = "gave" if d["type"] == "debt_gave" else "took"
         await add_debt(
             user_id,
@@ -2200,12 +2330,18 @@ async def _process_parsed_text(user_id, context, text, status_msg, label="Tanild
         action = "berdim" if direction == "gave" else "oldim"
         debt_summary += f"{emoji} Qarz {action}: {d.get('person') or '—'} — {format_money(d['amount'])}\n"
 
-    # Agar faqat qarz bo'lsa
+    for r in debt_repays:
+        await _handle_debt_repay(user_id, r, context, context.bot, status_msg.chat_id)
+    if debt_repays:
+        debt_summary += f"🤝 {len(debt_repays)} ta qarz-hisob so'rovi yuqoridagi xabar(lar)da — tasdiqlang\n"
+
+    # Agar faqat qarz(lar) bo'lsa (pul amaliyoti yo'q)
     if not money_txns:
+        header = "✅ <b>Qarz(lar) saqlandi!</b>\n\n" if debts_new else ""
         await status_msg.edit_text(
             f"{emoji_prefix} <b>{label}:</b> {text}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ <b>Qarz(lar) saqlandi!</b>\n\n{debt_summary}",
+            f"{header}{debt_summary}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
@@ -2941,6 +3077,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📄 PDF yuklab olish", callback_data="stats_pdf")],
             [InlineKeyboardButton("🔙 Bosh menyu", callback_data="back_main")]
         ])
+        # VAZIFA 4: qarz — chiqim emas, statistikaga aralashtirilmaydi,
+        # lekin alohida bo'lim sifatida ko'rsatiladi
+        debts_section = await build_debts_report_section(user_id)
 
         chart_buf = generate_donut_chart(
             cat_stats, stats['expenses'], stats['income'], month_str
@@ -2960,6 +3099,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 if rem < 0:
                     caption += f"\n⚠️ {format_money(abs(rem))} oshib ketdi!"
+            if debts_section:
+                caption += f"\n{debts_section}"
             try:
                 await query.message.delete()
             except Exception:
@@ -2997,6 +3138,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pct = int(amt / stats['expenses'] * 100) if stats['expenses'] else 0
                     bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
                     msg += f"{cat}\n  {bar} {pct}%  {format_money(amt)}\n"
+            if debts_section:
+                msg += f"\n{debts_section}"
             await safe_edit(msg, parse_mode="HTML", reply_markup=stats_kb)
 
     elif data == "stats_pdf":
@@ -3503,16 +3646,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔙 Orqaga", callback_data="debts")]]))
             return
-        buttons = []
-        for d in debts:
-            direction = "🔴" if d["direction"] == "gave" else "🟢"
-            label = f"{direction} {d['person_name']} — {format_money(float(d['amount']))}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"mark_paid_{d['id']}")])
-        buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="debts")])
         await query.edit_message_text(
             "✅ <b>Qaysi qarz to'landi?</b>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(buttons)
+            reply_markup=debt_pick_keyboard(debts)
         )
 
     elif data.startswith("mark_paid_"):
@@ -3523,24 +3660,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Qarz topilmadi")
             return
         balances = await get_balances(user_id)
-        direction = debt["direction"]
-        amount    = float(debt["amount"])
-        person    = debt["person_name"]
-        emoji     = "🔴" if direction == "gave" else "🟢"
-        action    = "qaytaradi → qo'shamiz" if direction == "gave" else "qaytaramiz → yechilamiz"
-
-        msg = (
-            f"{emoji} <b>{person}</b> — <b>{format_money(amount)}</b>\n\n"
-            f"💳 Qaysi balansga <b>{action}</b>?"
-        )
-        buttons = []
-        for b in balances:
-            type_emoji = BALANCE_TYPES.get(b["type"], "📦").split()[0]
-            label = f"{type_emoji} {b['name']} — {format_money(float(b['amount']))}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"debt_ret_bal_{debt_id}_{b['id']}")])
-        buttons.append([InlineKeyboardButton("⏭️ Balanssiz belgilash", callback_data=f"debt_ret_no_bal_{debt_id}")])
-        buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="debt_paid_list")])
-        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+        msg, markup = debt_balance_prompt(debt, balances)
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
 
     elif data.startswith("debt_ret_bal_"):
         parts     = data.split("_")
@@ -3730,6 +3851,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("debt_sel_bal_"):
         balance_id = int(data.split("_")[3])
         await _save_debt(user_id, context, balance_id=balance_id, via_query=query)
+
+    elif data == "debtrepay_cancel":
+        # VAZIFA 4: debt_repay ochiq qarz topolmaganda taklif qilingan
+        # "yangi qarz sifatida qo'sh" so'rovini bekor qilish
+        for k in ("debt_person", "debt_amount", "debt_direction"):
+            context.user_data.pop(k, None)
+        await query.edit_message_text("❌ Bekor qilindi.", parse_mode="HTML")
 
     # ---------- ADMIN PANEL ----------
     elif data == "admin_panel":

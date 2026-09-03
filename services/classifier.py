@@ -421,14 +421,23 @@ def build_system_prompt() -> str:
         "MUHIM: Har doim shu formatda JSON qaytar:\n"
         '{"transactions": [ {...}, {...} ]}\n\n'
         "Har bir amaliyot uchun quyidagi maydonlar:\n\n"
-        "1. type: 'income' | 'expense' | 'debt_gave' | 'debt_took'\n"
+        "1. type: 'income' | 'expense' | 'debt_gave' | 'debt_took' | 'debt_repay'\n"
         "   - 'sarfladim/(mahsulot uchun) berdim/to'ladim/xarjladim/oldim (sotib)' = expense\n"
         "   - 'maosh/tushdi/kirdi/daromad/ishlab topdim/sotdim' = income\n"
-        "   - 'qarz berdim/qarzga berdim/qarz qildim (biror kishiga)' = debt_gave\n"
-        "   - 'qarz oldim/qarzga oldim/qarzimni qaytardim' = debt_took\n"
-        "   MUHIM: 'qarz' so'zi ANIQ aytilmagan bo'lsa, buni debt deb hisoblama — "
-        "oddiy 'berdim' (masalan qizimga/o'g'limga pul berish) odatda EXPENSE "
-        "bo'ladi, debt EMAS.\n\n"
+        "   - YANGI qarz: 'qarz berdim/qarzga berdim/qarz qildim (biror kishiga)' = debt_gave\n"
+        "   - YANGI qarz: 'qarz oldim/qarzga oldim/nasiya oldim' = debt_took\n"
+        "   - MAVJUD qarzni YOPISH (yangi qarz EMAS, eskisini yopish): "
+        "'qarz to'lovi', 'eski qarz', 'qarzimni qaytardim', 'qarzini qaytardi', "
+        "'nasiyani uzdim', 'qarzdan tushdi', 'hisoblashdik' = debt_repay\n"
+        "   ENG MUHIM FARQ: 'qarz oldim' (YANGI qarz olyapman) bilan "
+        "'qarzimni qaytardim' (ESKI qarzni yopyapman, o'zim to'layapman) "
+        "ikkisi BUTUNLAY BOSHQA — birinchisi debt_took, ikkinchisi debt_repay. "
+        "'qaytardim/qaytardi/to'ladim/to'lovi/uzdim' so'zlari MAVJUD qarz "
+        "haqida ekanini bildiradi → debt_repay.\n"
+        "   MUHIM: 'qarz' yoki 'nasiya' so'zi ANIQ aytilmagan bo'lsa, buni debt "
+        "deb hisoblama — oddiy 'berdim' (masalan qizimga/o'g'limga pul berish) "
+        "odatda EXPENSE bo'ladi, debt EMAS. Istisno: 'hisoblashdik' so'zi ham "
+        "debt_repay signali (odatda ikki kishi orasidagi qarz-hisobni yopish).\n\n"
         "2. YO'NALISH (income/expense uchun) — BU ENG MUHIM QOIDA:\n"
         "   - Pul KETGAN bo'lsa → \"expense\".\n"
         "     Fe'llar: oldim, sotib oldim, berdim, to'ladim, ketdi, bordim, sarfladim\n"
@@ -468,7 +477,9 @@ def build_system_prompt() -> str:
         "5. note: qisqa izoh (3-8 so'z), ASL matndagi so'zlarni ishlat (masalan "
         "\"bollar bilan choyxonaga\", \"bog'chaga to'lov\") — o'zingdan sarlavha "
         "o'ylab topma.\n\n"
-        "6. person: faqat debt uchun — kim (masalan 'Sardor'). Aks holda null\n\n"
+        "6. person: faqat debt_gave/debt_took/debt_repay uchun — kim (masalan "
+        "'Sardor'). Matnda ism aytilmasa (masalan \"eski qarz to'lovi\") — null "
+        "qoldir, o'zingdan ism o'ylab topma.\n\n"
         "MISOL 1 kirish: 'bozordan olti yuz ming bozorlik qildim, mashinaga ikki "
         "yuz ming yoqilg'i quydirdim, Sardorga uch yuz ming qarz berdim'\n"
         "MISOL 1 chiqish:\n"
@@ -510,6 +521,15 @@ def build_system_prompt() -> str:
         "MISOL 7 chiqish:\n"
         '{"transactions": [{"type":"income","amount":500000,"category":"🛒 Sotish",'
         '"note":"Mijoz to\'lovi","person":null}]}\n\n'
+        "MISOL 8 kirish: '600000 eski qarz to'lovi'\n"
+        "MISOL 8 chiqish (bu YANGI xarajat EMAS, MAVJUD qarzni yopish — "
+        "ism aytilmagan, person null qoladi):\n"
+        '{"transactions": [{"type":"debt_repay","amount":600000,"category":null,'
+        '"note":"Eski qarz to\'lovi","person":null}]}\n\n'
+        "MISOL 9 kirish: 'Sardorga bergan qarzimni qaytardi'\n"
+        "MISOL 9 chiqish (Sardor MENGA qarzini qaytardi — MAVJUD qarzni yopish):\n"
+        '{"transactions": [{"type":"debt_repay","amount":0,"category":null,'
+        '"note":"Sardor qarzini qaytardi","person":"Sardor"}]}\n\n'
         "Tushunarsiz bo'lsa: {\"transactions\": []}\n"
         "FAQAT JSON qaytar, boshqa hech narsa yozma!"
     )
@@ -663,14 +683,18 @@ async def classify_transactions(text: str, api_key: str) -> "list[dict]":
     results = []
     for i, item in enumerate(raw_list):
         ttype = item.get("type", "expense")
-        if ttype not in ("income", "expense", "debt_gave", "debt_took"):
+        if ttype not in ("income", "expense", "debt_gave", "debt_took", "debt_repay"):
             ttype = "expense"
 
         try:
             amount = float(item.get("amount", 0))
         except (TypeError, ValueError):
             amount = 0
-        if amount <= 0:
+        # debt_repay uchun summa MAJBURIY EMAS — haqiqiy summa mavjud qarz
+        # yozuvidan olinadi (matnda "eski qarzimni qaytardim" kabi summasiz
+        # gap bo'lishi mumkin). Boshqa turlarda summasiz yozuv tashlab
+        # yuboriladi.
+        if amount <= 0 and ttype != "debt_repay":
             continue
 
         note = (item.get("note") or "")[:200]
