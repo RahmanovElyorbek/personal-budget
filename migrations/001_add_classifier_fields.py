@@ -29,12 +29,16 @@ PowerShell'da oldindan o'rnatish:
     $env:DATABASE_URL = "postgresql://..."
     python migrations/001_add_classifier_fields.py up
 
-Bu skript budget_bot_webhook.py ichidagi init_db() ga ULANMAGAN — avtomatik
-ishga tushmaydi. Ko'rib chiqib tasdiqlagandan keyin, xohlasangiz men buni
-init_db()ga ham (boshqa migratsiyalar kabi, idempotent ALTER TABLE
-IF NOT EXISTS shaklida) qo'shib qo'yaman, shunda u Render'da har deployda
-avtomatik ishlaydi — yoki har safar shu skriptni qo'lda ishga tushirasiz.
-Buni o'zingiz tanlaysiz.
+YANGILANISH: bu o'zgarishlar endi budget_bot_webhook.py ichidagi init_db()
+ga HAM qo'shildi (xuddi shu idempotent ALTER TABLE/CREATE TABLE IF NOT
+EXISTS shaklida) — shuning uchun Render'da keyingi deploy'da avtomatik
+ishlaydi, qo'lda ishga tushirish shart emas.
+
+Bu fayl baribir saqlanadi, chunki:
+  - Rollback (`down --yes`) faqat shu yerda bor — init_db() faqat qo'shadi,
+    hech qachon o'chirmaydi.
+  - Production DB'ga Render deploy'dan OLDIN qo'lda tekshirib/ishga
+    tushirmoqchi bo'lsangiz ham ishlatishingiz mumkin — natija bir xil.
 """
 
 import asyncio

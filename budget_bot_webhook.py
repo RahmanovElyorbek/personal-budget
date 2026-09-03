@@ -384,6 +384,42 @@ async def init_db():
                 sent_at     TIMESTAMP DEFAULT NOW()
             )
         """)
+        # ---- 001_add_classifier_fields migratsiyasi (klassifikator: source,
+        # is_deleted, currency, category_corrections) — batafsili va rollback
+        # migrations/001_add_classifier_fields.py faylida ----
+        try:
+            await conn.execute("""
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS
+                    currency TEXT NOT NULL DEFAULT 'UZS'
+            """)
+            await conn.execute("""
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS
+                    source TEXT DEFAULT 'ai'
+            """)
+            await conn.execute("""
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS
+                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+            """)
+        except Exception as e:
+            logger.warning(f"ALTER TABLE transactions (currency/source/is_deleted): {e}")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS category_corrections (
+                id                  SERIAL PRIMARY KEY,
+                telegram_id         BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                original_text       TEXT NOT NULL,
+                ai_category         TEXT,
+                corrected_category  TEXT NOT NULL,
+                created_at          TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_category_corrections_telegram_id
+                ON category_corrections(telegram_id)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transactions_is_deleted
+                ON transactions(is_deleted) WHERE is_deleted = FALSE
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
