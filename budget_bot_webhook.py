@@ -420,6 +420,16 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_transactions_is_deleted
                 ON transactions(is_deleted) WHERE is_deleted = FALSE
         """)
+        # ---- 002_add_reply_kb_shown migratsiyasi (VAZIFA 6: doimiy pastki
+        # menyu ko'rsatilganini DB'da saqlash — batafsili va rollback
+        # migrations/002_add_reply_kb_shown.py faylida) ----
+        try:
+            await conn.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS
+                    reply_kb_shown BOOLEAN NOT NULL DEFAULT FALSE
+            """)
+        except Exception as e:
+            logger.warning(f"ALTER TABLE users (reply_kb_shown): {e}")
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -445,6 +455,30 @@ async def ensure_user(telegram_id: int, name: str = ""):
                 INSERT INTO balances (telegram_id, name, type, amount)
                 VALUES ($1, $2, $3, 0), ($1, $4, $5, 0)
             """, telegram_id, "Naqd", "cash", "Karta", "card")
+
+async def is_reply_kb_shown(telegram_id: int) -> bool:
+    """VAZIFA 6: doimiy pastki menyu (ReplyKeyboard) bu foydalanuvchiga
+    allaqachon ko'rsatilganmi — DB'da saqlanadi.
+    MUHIM: avval bu bayroq faqat context.user_data'da (RAM'da) saqlanardi.
+    Bot Render'da qayta ishga tushganda (deploy, uyquga ketib uyg'onish,
+    xotira yetishmasligi) barcha context.user_data tozalanadi — bayroq
+    "ko'rsatilmagan" holatga qaytadi va foydalanuvchi keyingi safar
+    "🏠 Bosh menyu" tugmasini bossa (yoki boshqa gate'lardan o'tsa) menyu
+    yana qayta yuboriladi. Aynan shu SABABDAN foydalanuvchi "Bosh menyu
+    bir necha marta ketma-ket takrorlandi" muammosini ko'rgan. DB'ga
+    ko'chirish bu muammoni butunlay bartaraf etadi, chunki jarayon qayta
+    ishga tushishidan qat'iy nazar ma'lumot saqlanib qoladi."""
+    async with db_pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT reply_kb_shown FROM users WHERE telegram_id = $1", telegram_id)
+    return bool(val)
+
+async def mark_reply_kb_shown(telegram_id: int):
+    """is_reply_kb_shown() bilan bir juftlikda ishlaydi — DB'ga yozadi."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET reply_kb_shown = TRUE WHERE telegram_id = $1",
+            telegram_id)
 
 # ===================== STREAK (BOSQICH 4) =====================
 # "Kun yopish" — tranzaksiya kiritish EMAS, kunni sanaydi. Kun yopilgan
@@ -1802,15 +1836,17 @@ ONBOARDING_TIP = (
 async def maybe_send_onboarding_tip(bot, telegram_id: int, batch_count: int = 1, context=None):
     """Foydalanuvchining ENG BIRINCHI tranzaksiyasidan keyin bir martalik
     maslahat xabarini yuboradi (matnli/ovozli tez kiritish haqida) va
-    to'liq (ReplyKeyboard) menyuni ochadi."""
+    to'liq (ReplyKeyboard) menyuni ochadi.
+    `context` argumenti endi ishlatilmaydi (VAZIFA 6: doimiy menyu
+    ko'rsatilgani DB'da saqlanadi, context.user_data'da emas) — chaqiruv
+    joylarini o'zgartirmaslik uchun parametr saqlab qolindi."""
     total = await count_transactions(telegram_id)
     if total <= batch_count:
         try:
             await bot.send_message(
                 chat_id=telegram_id, text=ONBOARDING_TIP,
                 reply_markup=main_reply_keyboard())
-            if context is not None:
-                context.user_data["_reply_kb_shown"] = True
+            await mark_reply_kb_shown(telegram_id)
         except Exception as e:
             logger.warning(f"Onboarding maslahati yuborilmadi ({telegram_id}): {e}")
 
@@ -2288,9 +2324,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Qolgan : <b>{format_money(max(remaining, 0))}</b>\n"
         )
     text += "\nKerakli amalni tanlang 👇"
-    context.user_data["_reply_kb_shown"] = True
+    # VAZIFA 6: /start — menyu ko'rsatilishi RUXSAT ETILGAN joylardan biri,
+    # shuning uchun shart-sharoitsiz yuboriladi; bayroq DB'ga yoziladi
+    # (keyingi "🏠 Bosh menyu" bosilganda qayta yuborilmasligi uchun).
+    await mark_reply_kb_shown(user.id)
     await update.message.reply_text(
         text, parse_mode="HTML", reply_markup=main_reply_keyboard())
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VAZIFA 6: /menu — Bosh menyuni ko'rsatadigan RUXSAT ETILGAN joylardan
+    biri (/start va "🏠 Bosh menyu" tugmasi bilan bir qatorda). Avval bu
+    buyruq umuman mavjud emas edi."""
+    user_id = update.effective_user.id
+    txns  = await get_month_transactions(user_id)
+    stats = calc_stats(txns)
+    kb_already_shown = await is_reply_kb_shown(user_id)
+    await update.message.reply_text(
+        f"🏠 <b>Bosh menyu</b>\n\n"
+        f"📅 {datetime.now().strftime('%B %Y')}\n"
+        f"📥 {format_money(stats['income'])}\n"
+        f"📤 {format_money(stats['expenses'])}\n"
+        f"💵 {format_money(stats['balance'])}\n\n"
+        f"Kerakli amalni tanlang 👇",
+        parse_mode="HTML",
+        reply_markup=None if kb_already_shown else main_reply_keyboard(),
+    )
+    if not kb_already_shown:
+        await mark_reply_kb_shown(user_id)
 
 async def _handle_debt_repay(user_id, item, context, bot, chat_id):
     """VAZIFA 4: 'eski qarz to'lovi' / 'qarzimni qaytardim' kabi — bu YANGI
@@ -2538,7 +2598,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Yordam — Oson Byudjet</b>\n\n"
-        "/start — Bosh menyu\n/help — Yordam\n/oxirgi — Oxirgi amaliyotlar (tahrirlash)\n\n"
+        "/start — Bosh menyu\n/menu — Bosh menyu\n/help — Yordam\n/oxirgi — Oxirgi amaliyotlar (tahrirlash)\n\n"
         "➕ Daromad/Xarajat kiritish\n"
         "🎤 Ovoz orqali kiritish (bir nechta amaliyot ham)\n"
         "📸 Chek rasm orqali kiritish\n"
@@ -4235,10 +4295,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📤 {format_money(stats['expenses'])}\n"
             f"💵 {format_money(stats['balance'])}",
             parse_mode="HTML", reply_markup=None)
-        # Doimiy pastki menyu (ReplyKeyboard) faqat bir marta yuboriladi —
-        # Telegram uni suhbatda saqlab qoladi, qayta-qayta xabar shart emas.
-        if not context.user_data.get("_reply_kb_shown"):
-            context.user_data["_reply_kb_shown"] = True
+        # VAZIFA 6: doimiy pastki menyu (ReplyKeyboard) faqat bir marta
+        # yuboriladi — Telegram uni suhbatda saqlab qoladi, qayta-qayta
+        # xabar shart emas. Bayroq DB'da saqlanadi (context.user_data'da
+        # EMAS) — aks holda Render qayta ishga tushganda RAM tozalanib,
+        # menyu har safar "🏠 Bosh menyu" bosilganda qayta yuborilardi
+        # (foydalanuvchi ko'rgan asosiy bug shu edi).
+        if not await is_reply_kb_shown(user_id):
+            await mark_reply_kb_shown(user_id)
             await context.bot.send_message(
                 chat_id=user_id, text="Kerakli amalni tanlang 👇",
                 reply_markup=main_reply_keyboard())
@@ -5856,6 +5920,7 @@ async def main():
     print("🔄 [3/5] Telegram bot qurilmoqda...", flush=True)
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("oxirgi", recent_command))
     app.add_handler(CommandHandler("mcp_token", mcp_token_command))
