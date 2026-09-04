@@ -403,8 +403,16 @@ async def init_db():
                 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS
                     is_deleted BOOLEAN NOT NULL DEFAULT FALSE
             """)
+            # VAZIFA 2 (sana): 'date' endi tranzaksiya SODIR BO'LGAN kunni
+            # ('kecha' va h.k.) bildiradi, yozuv haqiqatda QACHON
+            # YARATILGANini emas. "Yangi saqlangan" 15 daqiqalik tekshiruv
+            # esa yaratilish vaqtiga muhtoj — shuning uchun alohida ustun.
+            await conn.execute("""
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS
+                    created_at TIMESTAMP DEFAULT NOW()
+            """)
         except Exception as e:
-            logger.warning(f"ALTER TABLE transactions (currency/source/is_deleted): {e}")
+            logger.warning(f"ALTER TABLE transactions (currency/source/is_deleted/created_at): {e}")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS category_corrections (
                 id                  SERIAL PRIMARY KEY,
@@ -703,7 +711,7 @@ async def add_transaction(telegram_id: int, txn_type: str,
 async def get_transaction(telegram_id: int, tx_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT id, type, amount, category, note, balance_id, date "
+            "SELECT id, type, amount, category, note, balance_id, date, created_at "
             "FROM transactions WHERE id = $1 AND telegram_id = $2",
             tx_id, telegram_id)
 
@@ -1940,6 +1948,7 @@ async def delete_transaction_with_undo(telegram_id: int, tx_id: int) -> bool:
             "category": tx["category"],
             "note": tx["note"] or "",
             "balance_id": tx["balance_id"],
+            "date": tx["date"],
             "deleted_at": time.monotonic(),
         }
     return ok
@@ -1954,7 +1963,8 @@ async def restore_transaction(telegram_id: int, tx_id: int):
         return None, "⏱ Qaytarish muddati (15 soniya) tugadi."
     new_id = await add_transaction(
         telegram_id, entry["type"], entry["amount"],
-        entry["category"], entry["note"], entry["balance_id"]
+        entry["category"], entry["note"], entry["balance_id"],
+        date=entry.get("date"),
     )
     _undo_cache.pop(tx_id, None)
     return new_id, None
@@ -2882,7 +2892,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Amaliyot topilmadi (o'chirilgan).")
             return
         if is_fresh:
-            age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["date"].astimezone(pytz.timezone("Asia/Tashkent"))
+            age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["created_at"].astimezone(pytz.timezone("Asia/Tashkent"))
             if age > timedelta(minutes=15):
                 await safe_edit(
                     "⏱ <b>Bu yozuv eskirdi.</b>\n\n"
@@ -2932,7 +2942,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not tx:
                 await query.edit_message_text("❌ Amaliyot topilmadi.")
                 return
-            age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["date"].astimezone(pytz.timezone("Asia/Tashkent"))
+            age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["created_at"].astimezone(pytz.timezone("Asia/Tashkent"))
             if age > timedelta(minutes=15):
                 await safe_edit(
                     "⏱ <b>Bu yozuv eskirdi.</b>\n\n"
