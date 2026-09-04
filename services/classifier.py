@@ -31,6 +31,7 @@ yoziladi — migratsiya alohida bosqichda).
 import json
 import logging
 import re
+from datetime import date, timedelta
 
 import httpx
 
@@ -395,6 +396,12 @@ def _segment_for(segments: "list[str]", idx: int, fallback: str) -> str:
 
 # ===================== 2-QATLAM: AI PROMPT =====================
 
+UZBEK_WEEKDAYS = [
+    "dushanba", "seshanba", "chorshanba", "payshanba",
+    "juma", "shanba", "yakshanba",
+]
+
+
 def _category_lines(defs: dict) -> str:
     lines = []
     for cat, info in defs.items():
@@ -405,11 +412,14 @@ def _category_lines(defs: dict) -> str:
     return "\n".join(lines)
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(today: date) -> str:
     expense_lines = _category_lines(EXPENSE_CATEGORY_DEFS)
     income_lines = _category_lines(INCOME_CATEGORY_DEFS)
     expense_cats = ", ".join(EXPENSE_CATEGORIES)
     income_cats = ", ".join(INCOME_CATEGORIES)
+    today_iso = today.isoformat()
+    today_weekday = UZBEK_WEEKDAYS[today.weekday()]
+    yesterday_iso = (today - timedelta(days=1)).isoformat()
 
     return (
         "Sen o'zbek tilidagi moliyaviy xabarlarni (yozma YOKI ovozdan tanilgan "
@@ -480,56 +490,75 @@ def build_system_prompt() -> str:
         "6. person: faqat debt_gave/debt_took/debt_repay uchun — kim (masalan "
         "'Sardor'). Matnda ism aytilmasa (masalan \"eski qarz to'lovi\") — null "
         "qoldir, o'zingdan ism o'ylab topma.\n\n"
+        f"7. date: amaliyot SODIR BO'LGAN sana, 'YYYY-MM-DD' formatida.\n"
+        f"   Bugungi sana: {today_iso} ({today_weekday}).\n"
+        "   Matnda vaqt signali bo'lsa hisobla:\n"
+        "   - 'bugun' yoki hech qanday vaqt signali yo'q -> bugungi sana\n"
+        "   - 'kecha' -> bugungi sanadan 1 kun ayir\n"
+        "   - 'ertaga' -> bugungi sanaga 1 kun qo'sh\n"
+        "   - 'o'tgan juma', 'o'tgan payshanba' kabi -> shu haftaning ko'rsatilgan "
+        "kuni (agar bugun ham shu kun bo'lsa, o'tgan haftaga hisobla)\n"
+        "   - '1-sentabrda', '15-avgustda' kabi aniq kun-oy -> joriy yilning shu "
+        "sanasi (agar bu sana bugundan KEYIN chiqib qolsa, o'tgan yilga hisobla)\n"
+        "   Signal topilmasa har doim bugungi sana — hech qachon bo'sh qoldirma.\n\n"
         "MISOL 1 kirish: 'bozordan olti yuz ming bozorlik qildim, mashinaga ikki "
         "yuz ming yoqilg'i quydirdim, Sardorga uch yuz ming qarz berdim'\n"
         "MISOL 1 chiqish:\n"
         '{"transactions": ['
-        '{"type":"expense","amount":600000,"category":"🍔 Oziq-ovqat","note":"Bozorlik","person":null},'
-        '{"type":"expense","amount":200000,"category":"🚌 Transport","note":"Yoqilg\'i","person":null},'
-        '{"type":"debt_gave","amount":300000,"category":null,"note":"Qarz berildi","person":"Sardor"}'
+        f'{{"type":"expense","amount":600000,"category":"🍔 Oziq-ovqat","note":"Bozorlik","person":null,"date":"{today_iso}"}},'
+        f'{{"type":"expense","amount":200000,"category":"🚌 Transport","note":"Yoqilg\'i","person":null,"date":"{today_iso}"}},'
+        f'{{"type":"debt_gave","amount":300000,"category":null,"note":"Qarz berildi","person":"Sardor","date":"{today_iso}"}}'
         ']}\n\n'
         "MISOL 2 kirish: 'qizimga o'n ming so'm berdim, mashinaga ellik ming "
         "so'mlik benzin quydim, oyligimni oldim uch million so'm'\n"
         "MISOL 2 chiqish (3 ta amaliyot, 'qarz' so'zi yo'q — hammasi expense/income):\n"
         '{"transactions": ['
-        '{"type":"expense","amount":10000,"category":"📦 Boshqa","note":"Qizimga berildi","person":null},'
-        '{"type":"expense","amount":50000,"category":"🚌 Transport","note":"Benzin","person":null},'
-        '{"type":"income","amount":3000000,"category":"💼 Maosh","note":"Oylik maosh","person":null}'
+        f'{{"type":"expense","amount":10000,"category":"📦 Boshqa","note":"Qizimga berildi","person":null,"date":"{today_iso}"}},'
+        f'{{"type":"expense","amount":50000,"category":"🚌 Transport","note":"Benzin","person":null,"date":"{today_iso}"}},'
+        f'{{"type":"income","amount":3000000,"category":"💼 Maosh","note":"Oylik maosh","person":null,"date":"{today_iso}"}}'
         ']}\n\n'
         "MISOL 3 kirish: '100000 so'm bollar bilan choyxonaga bordik'\n"
         "MISOL 3 chiqish:\n"
         '{"transactions": [{"type":"expense","amount":100000,"category":"🍔 Oziq-ovqat",'
-        '"note":"Bollar bilan choyxonaga","person":null}]}\n\n'
+        f'"note":"Bollar bilan choyxonaga","person":null,"date":"{today_iso}"}}]}}\n\n'
         "MISOL 4 kirish: '40000 so'm bog'chaga to'lov qilindi'\n"
         "MISOL 4 chiqish:\n"
         '{"transactions": [{"type":"expense","amount":40000,"category":"📚 Ta\'lim",'
-        '"note":"Bog\'chaga to\'lov","person":null}]}\n\n'
+        f'"note":"Bog\'chaga to\'lov","person":null,"date":"{today_iso}"}}]}}\n\n'
         "MISOL 5 kirish: '20000 so'm olmaga, 30000 so'm Mohinurga yo'lkira, "
         "40000 so'm bog'chaga to'lov qilindi'\n"
         "MISOL 5 chiqish (3 ta amaliyot, hammasi EXPENSE — 'olmaga' meva nomi, "
         "kirim EMAS):\n"
         '{"transactions": ['
-        '{"type":"expense","amount":20000,"category":"🍔 Oziq-ovqat","note":"Olmaga","person":null},'
-        '{"type":"expense","amount":30000,"category":"🚌 Transport","note":"Mohinurga yo\'lkira","person":null},'
-        '{"type":"expense","amount":40000,"category":"📚 Ta\'lim","note":"Bog\'chaga to\'lov","person":null}'
+        f'{{"type":"expense","amount":20000,"category":"🍔 Oziq-ovqat","note":"Olmaga","person":null,"date":"{today_iso}"}},'
+        f'{{"type":"expense","amount":30000,"category":"🚌 Transport","note":"Mohinurga yo\'lkira","person":null,"date":"{today_iso}"}},'
+        f'{{"type":"expense","amount":40000,"category":"📚 Ta\'lim","note":"Bog\'chaga to\'lov","person":null,"date":"{today_iso}"}}'
         ']}\n\n'
         "MISOL 6 kirish: '2050000 so'm oylik maosh tushdi'\n"
         "MISOL 6 chiqish:\n"
         '{"transactions": [{"type":"income","amount":2050000,"category":"💼 Maosh",'
-        '"note":"Oylik maosh tushdi","person":null}]}\n\n'
+        f'"note":"Oylik maosh tushdi","person":null,"date":"{today_iso}"}}]}}\n\n'
         "MISOL 7 kirish: 'mijoz 500000 to'ladi'\n"
         "MISOL 7 chiqish:\n"
         '{"transactions": [{"type":"income","amount":500000,"category":"🛒 Sotish",'
-        '"note":"Mijoz to\'lovi","person":null}]}\n\n'
+        f'"note":"Mijoz to\'lovi","person":null,"date":"{today_iso}"}}]}}\n\n'
         "MISOL 8 kirish: '600000 eski qarz to'lovi'\n"
         "MISOL 8 chiqish (bu YANGI xarajat EMAS, MAVJUD qarzni yopish — "
         "ism aytilmagan, person null qoladi):\n"
         '{"transactions": [{"type":"debt_repay","amount":600000,"category":null,'
-        '"note":"Eski qarz to\'lovi","person":null}]}\n\n'
+        f'"note":"Eski qarz to\'lovi","person":null,"date":"{today_iso}"}}]}}\n\n'
         "MISOL 9 kirish: 'Sardorga bergan qarzimni qaytardi'\n"
         "MISOL 9 chiqish (Sardor MENGA qarzini qaytardi — MAVJUD qarzni yopish):\n"
         '{"transactions": [{"type":"debt_repay","amount":0,"category":null,'
-        '"note":"Sardor qarzini qaytardi","person":"Sardor"}]}\n\n'
+        f'"note":"Sardor qarzini qaytardi","person":"Sardor","date":"{today_iso}"}}]}}\n\n'
+        "MISOL 10 kirish: 'Kecha 100000 so'm bollar bilan choyxonaga bordik, "
+        "27000 so'mga uyga bozorlik qildim'\n"
+        f"MISOL 10 chiqish (2 ta amaliyot, 'kecha' -> {yesterday_iso}, ikkalasiga "
+        "ham tegishli — butun gapga bitta vaqt signali qo'llanadi):\n"
+        '{"transactions": ['
+        f'{{"type":"expense","amount":100000,"category":"🍔 Oziq-ovqat","note":"Bollar bilan choyxonaga","person":null,"date":"{yesterday_iso}"}},'
+        f'{{"type":"expense","amount":27000,"category":"🍔 Oziq-ovqat","note":"Uyga bozorlik","person":null,"date":"{yesterday_iso}"}}'
+        ']}\n\n'
         "Tushunarsiz bo'lsa: {\"transactions\": []}\n"
         "FAQAT JSON qaytar, boshqa hech narsa yozma!"
     )
@@ -659,12 +688,19 @@ async def _resolve_category(ai_category: "str | None", segment_text: str,
     return ai_category, "ai"
 
 
-async def classify_transactions(text: str, api_key: str) -> "list[dict]":
+async def classify_transactions(text: str, api_key: str, today: "date | None" = None) -> "list[dict]":
     """Asosiy kirish nuqtasi: matndan (yozma yoki ovozdan tanilgan) bir yoki
-    bir nechta tranzaksiyani ajratadi, kategoriya va yo'nalishni 3 qatlamli
-    tekshiruvdan o'tkazadi.
+    bir nechta tranzaksiyani ajratadi, kategoriya, yo'nalish va sanani 3
+    qatlamli tekshiruvdan o'tkazadi.
 
-    Qaytadigan har bir dict: type, amount, category, note, person, source."""
+    today: chaqiruvchi tomonidan mahalliy (Asia/Tashkent) bugungi sana
+    sifatida beriladi — 'kecha'/'ertaga' kabi nisbiy sanalarni hisoblash
+    shundan boshlanadi. Berilmasa server sanasi ishlatiladi (zaxira holat).
+
+    Qaytadigan har bir dict: type, amount, category, note, person, source, date."""
+    if today is None:
+        today = date.today()
+
     if not text or not text.strip():
         return []
 
@@ -672,7 +708,7 @@ async def classify_transactions(text: str, api_key: str) -> "list[dict]":
         logger.warning("OPENAI_API_KEY yo'q — klassifikator ishlay olmaydi.")
         return []
 
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(today)
     parsed = await _call_openai_json(system_prompt, text, api_key, temperature=0.0)
     if not parsed:
         return []
@@ -714,6 +750,19 @@ async def classify_transactions(text: str, api_key: str) -> "list[dict]":
             category = None
             source = "ai"
 
+        raw_date = item.get("date")
+        tx_date = today
+        if isinstance(raw_date, str) and raw_date.strip():
+            try:
+                tx_date = date.fromisoformat(raw_date.strip())
+            except ValueError:
+                logger.warning(f"Sana tanib bo'lmadi ('{raw_date}'), bugungi sana ishlatiladi: {segment_text!r}")
+                tx_date = today
+        # "ertaga" (today+1) qonuniy signal — shuni ruxsat beramiz, lekin
+        # undan uzoqroq kelajak sanalari odatda AI xatosi, bugungi sanaga tushiramiz
+        if tx_date > today + timedelta(days=1):
+            tx_date = today
+
         results.append({
             "type": ttype,
             "amount": amount,
@@ -721,6 +770,7 @@ async def classify_transactions(text: str, api_key: str) -> "list[dict]":
             "note": note,
             "person": item.get("person"),
             "source": source,
+            "date": tx_date,
         })
 
     return results

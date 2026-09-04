@@ -161,8 +161,11 @@ async def parse_voice_transactions(text: str) -> list:
     services/classifier.py modulida — bu yerda faqat chaqiruv bor, chunki
     boshqa kod (message_handler, voice_handler) shu funksiya nomiga bog'liq.
 
-    Har biri: income / expense / debt_gave / debt_took."""
-    return await classify_transactions(text, OPENAI_API_KEY)
+    Har biri: income / expense / debt_gave / debt_took. Har birida endi
+    'date' maydoni ham bor (kecha/bugun/ertaga kabi signallar hisobga
+    olinadi, mahalliy Asia/Tashkent sanasidan hisoblanadi)."""
+    today = datetime.now(pytz.timezone("Asia/Tashkent")).date()
+    return await classify_transactions(text, OPENAI_API_KEY, today=today)
 
 
 async def analyze_receipt_image(image_bytes: bytes) -> dict:
@@ -666,15 +669,24 @@ async def set_budget(telegram_id: int, amount: float):
 
 async def add_transaction(telegram_id: int, txn_type: str,
                           amount: float, category: str, note: str,
-                          balance_id: int = None) -> int:
-    """Tranzaksiya qo'shish + balansni yangilash. id qaytaradi."""
+                          balance_id: int = None, date: "datetime | None" = None) -> int:
+    """Tranzaksiya qo'shish + balansni yangilash. id qaytaradi.
+    date berilsa (masalan 'kecha' kabi nisbiy sana aniqlangan bo'lsa) —
+    tranzaksiya shu sana bilan yoziladi, aks holda hozirgi vaqt (NOW())."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            tx_id = await conn.fetchval("""
-                INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id
-            """, telegram_id, txn_type, amount, category, note, balance_id)
+            if date is not None:
+                tx_id = await conn.fetchval("""
+                    INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id, date)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING id
+                """, telegram_id, txn_type, amount, category, note, balance_id, date)
+            else:
+                tx_id = await conn.fetchval("""
+                    INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id
+                """, telegram_id, txn_type, amount, category, note, balance_id)
 
             if balance_id:
                 if txn_type == "income":
@@ -1788,6 +1800,59 @@ def calc_stats(transactions: list) -> dict:
 def format_money(amount: float) -> str:
     return f"{amount:,.0f} so'm"
 
+# ===================== TRANZAKSIYA KARTASI (VAZIFA 2) =====================
+
+def _card_money(amount: float, force_minus: bool = False) -> str:
+    """Karta uchun probel bilan ajratilgan pul formati (masalan '127 000
+    so'm'). force_minus=True yoki summa manfiy bo'lsa oldida '−' turadi."""
+    sign = "−" if (force_minus or amount < 0) else ""
+    s = f"{abs(amount):,.0f}".replace(",", " ")
+    return f"{sign}{s} so'm"
+
+def _tashkent_datetime_for_date(target_date: date) -> datetime:
+    """Berilgan taqvim kuni (Toshkent) uchun DB yozuvi bilan mos naive
+    datetime hisoblaydi. Hozirgi soat:daqiqa saqlanadi, faqat kalendar kuni
+    almashtiriladi, so'ng mavjud DB konvensiyasiga mos ravishda UTC-naive'ga
+    o'giriladi (ustunlar TIMESTAMP, saqlangan qiymat UTC devor vaqti sifatida
+    o'qiladi — mavjud kod bazasida hamma joyda shunday)."""
+    tz = pytz.timezone("Asia/Tashkent")
+    now_local = datetime.now(tz)
+    target_local = tz.localize(datetime.combine(target_date, now_local.time()))
+    return target_local.astimezone(pytz.utc).replace(tzinfo=None)
+
+async def build_saved_card(telegram_id: int, txn_type: str, amount: float,
+                            category: str, note: str, tx_date: date) -> str:
+    """VAZIFA 2: boyitilgan tranzaksiya kartasi matni — sana, oylik
+    kategoriya jami va oylik balans bilan. tx_date TRANZAKSIYA sodir bo'lgan
+    oyning statistikasini ko'rsatadi (joriy oy emas) — shunda orqaga
+    sanalgan ('kecha' va h.k.) yozuvlar ham to'g'ri oyda hisoblanadi."""
+    direction_label = "Kirim" if txn_type == "income" else "Chiqim"
+    date_str = tx_date.strftime("%d.%m.%Y")
+    note_line = f"\n📝 {note}" if note else ""
+
+    month_txns = await get_transactions_by_month(telegram_id, tx_date.year, tx_date.month)
+    stats = calc_stats(month_txns)
+    cat_total = sum(
+        float(t["amount"]) for t in month_txns
+        if t["category"] == category and t["type"] == txn_type
+    )
+
+    amount_line = _card_money(amount, force_minus=(txn_type == "expense"))
+
+    text = (
+        f"✅ <b>Saqlandi</b>\n\n"
+        f"{category} · {direction_label}\n"
+        f"<b>{amount_line}</b>\n"
+        f"📅 {date_str}{note_line}\n\n"
+        f"💡 {category}: bu oy {_card_money(cat_total)}\n"
+    )
+    if txn_type == "expense":
+        text += f"Bu oygi chiqimlar: {_card_money(stats['expenses'])}\n"
+    else:
+        text += f"Bu oygi daromad: {_card_money(stats['income'])}\n"
+    text += f"Balans: {_card_money(stats['balance'])}"
+    return text
+
 # ===================== /START KESHI =====================
 # In-memory TTL kesh — Render'da bitta worker (WEB_CONCURRENCY=1) ishlagani
 # uchun jarayonlar orasida kesh nomuvofiqligi bo'lmaydi, Redis shart emas.
@@ -2127,7 +2192,9 @@ def balance_type_keyboard():
 # ----- Tranzaksiya tahrirlash klaviaturalari (YANGI) -----
 
 def tx_confirm_keyboard(tx_id, fresh=False):
-    """Tranzaksiya saqlangach chiqadigan tugmalar (tahrir/o'chir).
+    """Tranzaksiya saqlangach chiqadigan tugmalar — FAQAT tahrir/o'chir
+    (VAZIFA 2: navigatsiya tugmalari olib tashlandi, ular doimiy pastki
+    ReplyKeyboard'da allaqachon bor — Daromad/Xarajat/Statistika/Bosh menyu).
     fresh=True — bu yangi saqlangan tranzaksiyaning tasdiq xabari, shuning
     uchun tahrir/o'chirish tugmalari faqat 15 daqiqa ichida ishlaydi.
     fresh=False (standart) — navigatsiya orqali ochilgan karta (masalan
@@ -2136,10 +2203,6 @@ def tx_confirm_keyboard(tx_id, fresh=False):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"txedit:{tx_id}{suffix}"),
          InlineKeyboardButton("🗑 O'chirish", callback_data=f"txdel:{tx_id}{suffix}")],
-        [InlineKeyboardButton("➕ Daromad", callback_data="add_income"),
-         InlineKeyboardButton("➖ Xarajat", callback_data="add_expense")],
-        [InlineKeyboardButton("📊 Statistika", callback_data="stats"),
-         InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
     ])
 
 def tx_edit_keyboard(tx_id):
@@ -2152,18 +2215,16 @@ def tx_edit_keyboard(tx_id):
     ])
 
 async def render_tx_card(telegram_id, tx_id):
-    """Tranzaksiya kartasini (matn + tugmalar) tayyorlaydi."""
+    """Tranzaksiya kartasini (matn + tugmalar) tayyorlaydi — VAZIFA 2
+    boyitilgan formatida (sana, oylik kategoriya jami, oylik balans)."""
     tx = await get_transaction(telegram_id, tx_id)
     if not tx:
         return None, None
-    emoji  = "📥" if tx["type"] == "income" else "📤"
-    type_t = "Daromad" if tx["type"] == "income" else "Xarajat"
-    note_t = f"\n📝 Izoh: {tx['note']}" if tx.get("note") else ""
-    text = (
-        f"✅ <b>{type_t}</b>\n\n"
-        f"{emoji} Miqdor: <b>{format_money(float(tx['amount']))}</b>\n"
-        f"📁 Kategoriya: {tx['category']}{note_t}"
-    )
+    tz = pytz.timezone("Asia/Tashkent")
+    tx_date = tx["date"].astimezone(tz).date()
+    text = await build_saved_card(
+        telegram_id, tx["type"], float(tx["amount"]),
+        tx["category"], tx.get("note") or "", tx_date)
     return text, tx_confirm_keyboard(tx_id)
 
 # ===================== TO'LOV =====================
@@ -2986,77 +3047,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("selbal_"):
         balance_id = int(data.split("_")[1])
 
-        # 1) Multi-transaction (ovozdan kelgan bir nechta amaliyot)
+        # 1) Multi-transaction (ovozdan/matndan kelgan bir yoki bir nechta
+        # amaliyot). VAZIFA 2: birlashtirilgan "N ta amaliyot saqlandi"
+        # xabari olib tashlandi — har biri o'z boyitilgan kartasini oladi
+        # (sana, oylik kategoriya jami, oylik balans bilan).
         if context.user_data.get("pending_txns"):
             pending = context.user_data.pop("pending_txns")
             context.user_data.pop("pending_text", None)
+            tz = pytz.timezone("Asia/Tashkent")
 
-            tx_ids = []
-            for t in pending:
+            for i, t in enumerate(pending):
+                tx_date = t.get("date") or datetime.now(tz).date()
                 tx_id = await add_transaction(
-                    user_id, t["type"], t["amount"],
-                    t["category"], t.get("note", ""), balance_id
+                    user_id, t["type"], t["amount"], t["category"],
+                    t.get("note", ""), balance_id,
+                    date=_tashkent_datetime_for_date(tx_date),
                 )
-                tx_ids.append(tx_id)
+                card_text = await build_saved_card(
+                    user_id, t["type"], float(t["amount"]),
+                    t["category"], t.get("note", ""), tx_date)
+                markup = tx_confirm_keyboard(tx_id, fresh=True)
+                if i == 0:
+                    await query.edit_message_text(card_text, parse_mode="HTML", reply_markup=markup)
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id, text=card_text,
+                        parse_mode="HTML", reply_markup=markup)
 
-            txns  = await get_month_transactions(user_id)
-            stats = calc_stats(txns)
-
-            # VAZIFA 3: bitta birlashtirilgan xabar o'rniga — HAR BIR
-            # amaliyot uchun ALOHIDA tasdiqlash kartasi (mustaqil
-            # tahrirlash/o'chirish mumkin bo'lishi uchun, xuddi bitta
-            # amaliyot saqlanganidagi kabi)
-            await query.edit_message_text(
-                f"✅ <b>{len(pending)} ta amaliyot saqlandi!</b>\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📥 {format_money(stats['income'])}  "
-                f"📤 {format_money(stats['expenses'])}  "
-                f"💵 {format_money(stats['balance'])}",
-                parse_mode="HTML",
-            )
-            for t, tx_id in zip(pending, tx_ids):
-                emoji  = "📥" if t["type"] == "income" else "📤"
-                type_t = "Daromad" if t["type"] == "income" else "Xarajat"
-                note_t = f"\n📝 Izoh: {t['note']}" if t.get("note") else ""
-                card_text = (
-                    f"✅ <b>{type_t}</b>\n\n"
-                    f"{emoji} Miqdor: <b>{format_money(float(t['amount']))}</b>\n"
-                    f"📁 Kategoriya: {t['category']}{note_t}"
-                )
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=card_text,
-                    parse_mode="HTML",
-                    reply_markup=tx_confirm_keyboard(tx_id, fresh=True),
-                )
             await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending), context=context)
             streak_result = await close_streak_day(user_id)
             await notify_streak_result(context.bot, user_id, streak_result)
             return
 
-        # 2) Bitta amaliyot (voice_parsed — chek tasdiqi ham shu yerga keladi)
+        # 2) Bitta amaliyot (voice_parsed — chek tasdiqi ham shu yerga
+        # keladi; chek tahlilida sana signali yo'q, shuning uchun bugungi
+        # sana ishlatiladi).
         if context.user_data.get("voice_parsed"):
             parsed = context.user_data["voice_parsed"]
+            tz = pytz.timezone("Asia/Tashkent")
+            tx_date = parsed.get("date") or datetime.now(tz).date()
             tx_id = await add_transaction(
                 user_id, parsed["type"], parsed["amount"],
-                parsed["category"], parsed.get("note", parsed.get("text", "")), balance_id
+                parsed["category"], parsed.get("note", parsed.get("text", "")), balance_id,
+                date=_tashkent_datetime_for_date(tx_date),
             )
             context.user_data.pop("voice_parsed", None)
 
-            txns   = await get_month_transactions(user_id)
-            stats  = calc_stats(txns)
-            emoji  = "📥" if parsed["type"] == "income" else "📤"
-            type_t = "Daromad" if parsed["type"] == "income" else "Xarajat"
+            card_text = await build_saved_card(
+                user_id, parsed["type"], float(parsed["amount"]),
+                parsed["category"], parsed.get("note", parsed.get("text", "")), tx_date)
 
             await query.edit_message_text(
-                f"✅ <b>{type_t} saqlandi!</b>\n\n"
-                f"{emoji} {format_money(parsed['amount'])}\n"
-                f"📁 {parsed['category']}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📥 {format_money(stats['income'])}  "
-                f"📤 {format_money(stats['expenses'])}  "
-                f"💵 {format_money(stats['balance'])}",
-                parse_mode="HTML",
+                card_text, parse_mode="HTML",
                 reply_markup=tx_confirm_keyboard(tx_id, fresh=True)
             )
             await maybe_send_onboarding_tip(context.bot, user_id, context=context)
@@ -4679,38 +4721,22 @@ async def _save_transaction(user_id, context, note="",
     if not amount:
         return
 
-    tx_id = await add_transaction(user_id, txn_type, amount, category, note, balance_id)
-    txns   = await get_month_transactions(user_id)
-    stats  = calc_stats(txns)
+    tz      = pytz.timezone("Asia/Tashkent")
+    tx_date = datetime.now(tz).date()
+
+    tx_id  = await add_transaction(user_id, txn_type, amount, category, note, balance_id)
     budget = await get_budget(user_id)
 
-    emoji  = "📥" if txn_type == "income" else "📤"
-    note_t = f"\n📝 Izoh: {note}" if note else ""
+    msg = await build_saved_card(user_id, txn_type, amount, category, note, tx_date)
 
-    bal_text = ""
-    if balance_id:
-        async with db_pool.acquire() as conn:
-            bal = await conn.fetchrow(
-                "SELECT name, amount FROM balances WHERE id = $1", balance_id
-            )
-            if bal:
-                bal_text = f"\n💳 Balans: <b>{bal['name']}</b> — {format_money(float(bal['amount']))}"
-
-    msg = (
-        f"✅ <b>{'Daromad' if txn_type=='income' else 'Xarajat'} saqlandi!</b>\n\n"
-        f"{emoji} Miqdor    : <b>{format_money(amount)}</b>\n"
-        f"📁 Kategoriya: {category}{note_t}{bal_text}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 {format_money(stats['income'])}  "
-        f"📤 {format_money(stats['expenses'])}  "
-        f"💵 {format_money(stats['balance'])}\n"
-    )
     if budget > 0 and txn_type == "expense":
+        month_txns = await get_transactions_by_month(user_id, tx_date.year, tx_date.month)
+        stats = calc_stats(month_txns)
         rem = budget - stats["expenses"]
         if rem < 0:
-            msg += f"\n⚠️ <b>Budget {format_money(abs(rem))} oshib ketdi!</b>"
+            msg += f"\n\n⚠️ <b>Budget {format_money(abs(rem))} oshib ketdi!</b>"
         elif rem < budget * 0.2:
-            msg += f"\n⚠️ Budget tugayapti! Qolgan: {format_money(rem)}"
+            msg += f"\n\n⚠️ Budget tugayapti! Qolgan: {format_money(rem)}"
 
     # Tahrir/o'chirish tugmalari bilan
     markup = tx_confirm_keyboard(tx_id, fresh=True)
