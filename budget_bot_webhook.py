@@ -2884,7 +2884,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_fresh:
             age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["date"].astimezone(pytz.timezone("Asia/Tashkent"))
             if age > timedelta(minutes=15):
-                await query.answer("Bu yozuv eskirdi. Tarix bo'limidan tahrirlang.", show_alert=True)
+                await safe_edit(
+                    "⏱ <b>Bu yozuv eskirdi.</b>\n\n"
+                    "15 daqiqadan keyin tezkor tugmalar ishlamaydi — "
+                    "\"📝 Oxirgi amaliyotlar\" bo'limidan tahrirlang.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
+                        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+                )
                 return
         emoji  = "📥" if tx["type"] == "income" else "📤"
         type_t = "Daromad" if tx["type"] == "income" else "Xarajat"
@@ -2926,7 +2934,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             age = datetime.now(pytz.timezone("Asia/Tashkent")) - tx["date"].astimezone(pytz.timezone("Asia/Tashkent"))
             if age > timedelta(minutes=15):
-                await query.answer("Bu yozuv eskirdi. Tarix bo'limidan tahrirlang.", show_alert=True)
+                await safe_edit(
+                    "⏱ <b>Bu yozuv eskirdi.</b>\n\n"
+                    "15 daqiqadan keyin tezkor tugmalar ishlamaydi — "
+                    "\"📝 Oxirgi amaliyotlar\" bo'limidan tahrirlang.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📝 Oxirgi amaliyotlar", callback_data="recent")],
+                        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")]])
+                )
                 return
 
         fallback_markup = InlineKeyboardMarkup([[
