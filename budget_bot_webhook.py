@@ -1838,13 +1838,17 @@ async def build_saved_card(telegram_id: int, txn_type: str, amount: float,
     )
 
     amount_line = _card_money(amount, force_minus=(txn_type == "expense"))
+    # "💡" qatorida kategoriya nomi o'z emojisiz ko'rsatiladi (sarlavhada
+    # allaqachon "🍔 Oziq-ovqat · Chiqim" ko'rinishida bitta marta bor —
+    # ikkinchi marta takrorlanmasin)
+    category_name = category.split(" ", 1)[1] if " " in category else category
 
     text = (
         f"✅ <b>Saqlandi</b>\n\n"
         f"{category} · {direction_label}\n"
         f"<b>{amount_line}</b>\n"
         f"📅 {date_str}{note_line}\n\n"
-        f"💡 {category}: bu oy {_card_money(cat_total)}\n"
+        f"💡 {category_name}: bu oy {_card_money(cat_total)}\n"
     )
     if txn_type == "expense":
         text += f"Bu oygi chiqimlar: {_card_money(stats['expenses'])}\n"
