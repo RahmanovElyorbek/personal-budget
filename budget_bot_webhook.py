@@ -23,8 +23,10 @@ import tempfile
 import httpx
 import io
 import base64
+import hashlib
 import json
 import secrets
+from urllib.parse import quote
 import calendar as cal_module
 from datetime import datetime, timedelta, date
 from aiohttp import web
@@ -337,6 +339,60 @@ async def init_db():
                 id         SERIAL PRIMARY KEY,
                 user_id    BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
                 token      TEXT UNIQUE NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # ── OAuth 2.1 (MCP Authorization) — Claude va boshqa MCP mijozlar
+        # uchun "bitta manzil joylashtirib ulash" tajribasi (PKCE, dynamic
+        # client registration, refresh token). mcp_tokens (yuqorida) — eski
+        # qo'lda /mcp_token orqali olinadigan statik token, orqaga
+        # moslik uchun saqlanadi.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id     TEXT PRIMARY KEY,
+                client_name   TEXT,
+                redirect_uris TEXT NOT NULL,
+                created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_link_codes (
+                code       TEXT PRIMARY KEY,
+                user_id    BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                used       BOOLEAN DEFAULT FALSE,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+                code                  TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                user_id               BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                redirect_uri          TEXT NOT NULL,
+                code_challenge        TEXT NOT NULL,
+                code_challenge_method TEXT NOT NULL,
+                used                  BOOLEAN DEFAULT FALSE,
+                expires_at            TIMESTAMP NOT NULL,
+                created_at            TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+                token      TEXT PRIMARY KEY,
+                client_id  TEXT NOT NULL,
+                user_id    BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+                token      TEXT PRIMARY KEY,
+                client_id  TEXT NOT NULL,
+                user_id    BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                revoked    BOOLEAN DEFAULT FALSE,
                 expires_at TIMESTAMP NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )
@@ -1409,12 +1465,137 @@ async def create_mcp_token(telegram_id: int) -> str:
     return token
 
 async def validate_mcp_token(token: str) -> "int | None":
+    # Avval OAuth (yangi) access tokenlarni tekshiramiz, keyin eski
+    # /mcp_token statik tokenlarni — ikkalasi ham /mcp uchun amal qiladi.
+    user_id = await validate_oauth_access_token(token)
+    if user_id:
+        return user_id
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT user_id FROM mcp_tokens WHERE token = $1 AND expires_at > NOW()",
             token
         )
     return row["user_id"] if row else None
+
+# ===================== OAuth 2.1 (MCP Authorization) =====================
+# Claude/boshqa MCP mijozlar uchun "bitta manzil joylashtirib ulash"
+# tajribasi: PKCE (S256) bilan authorization-code oqimi + refresh token.
+
+OAUTH_ACCESS_TOKEN_TTL  = timedelta(hours=1)
+OAUTH_REFRESH_TOKEN_TTL = timedelta(days=180)
+OAUTH_AUTH_CODE_TTL     = timedelta(minutes=5)
+OAUTH_LINK_CODE_TTL     = timedelta(minutes=10)
+
+def _pkce_challenge_from_verifier(code_verifier: str) -> str:
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+async def oauth_register_client(client_name: str, redirect_uris: list) -> dict:
+    """Dynamic Client Registration (RFC 7591) — Claude ulanishda o'zi
+    chaqiradi, client_secret shart emas (PKCE'li public client)."""
+    client_id = "mcp_" + secrets.token_urlsafe(16)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES ($1, $2, $3)",
+            client_id, client_name or "MCP Client", json.dumps(redirect_uris),
+        )
+    return {"client_id": client_id, "client_name": client_name or "MCP Client",
+            "redirect_uris": redirect_uris}
+
+async def oauth_get_client(client_id: str) -> "dict | None":
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM oauth_clients WHERE client_id = $1", client_id)
+    if not row:
+        return None
+    d = dict(row)
+    d["redirect_uris"] = json.loads(d["redirect_uris"])
+    return d
+
+async def create_oauth_link_code(telegram_id: int) -> str:
+    """Foydalanuvchi Telegram'da /mcp_login orqali oladigan, ulanish
+    sahifasiga (browser) kiritiladigan bir martalik kod."""
+    code = secrets.token_urlsafe(6)
+    expires_at = datetime.now() + OAUTH_LINK_CODE_TTL
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM oauth_link_codes WHERE user_id = $1 AND used = FALSE", telegram_id
+        )
+        await conn.execute(
+            "INSERT INTO oauth_link_codes (code, user_id, expires_at) VALUES ($1, $2, $3)",
+            code, telegram_id, expires_at,
+        )
+    return code
+
+async def consume_oauth_link_code(code: str) -> "int | None":
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM oauth_link_codes "
+            "WHERE code = $1 AND used = FALSE AND expires_at > NOW()", code
+        )
+        if not row:
+            return None
+        await conn.execute("UPDATE oauth_link_codes SET used = TRUE WHERE code = $1", code)
+    return row["user_id"]
+
+async def oauth_create_auth_code(client_id, user_id, redirect_uri, code_challenge,
+                                  code_challenge_method) -> str:
+    code = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + OAUTH_AUTH_CODE_TTL
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO oauth_auth_codes
+                (code, client_id, user_id, redirect_uri, code_challenge, code_challenge_method, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """, code, client_id, user_id, redirect_uri, code_challenge, code_challenge_method, expires_at)
+    return code
+
+async def oauth_consume_auth_code(code, client_id, redirect_uri, code_verifier) -> "int | None":
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT * FROM oauth_auth_codes
+            WHERE code = $1 AND client_id = $2 AND redirect_uri = $3
+              AND used = FALSE AND expires_at > NOW()
+        """, code, client_id, redirect_uri)
+        if not row:
+            return None
+        if _pkce_challenge_from_verifier(code_verifier or "") != row["code_challenge"]:
+            return None
+        await conn.execute("UPDATE oauth_auth_codes SET used = TRUE WHERE code = $1", code)
+    return row["user_id"]
+
+async def oauth_issue_tokens(client_id: str, user_id: int):
+    access_token  = secrets.token_urlsafe(32)
+    refresh_token = secrets.token_urlsafe(32)
+    now = datetime.now()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO oauth_access_tokens (token, client_id, user_id, expires_at) VALUES ($1, $2, $3, $4)",
+            access_token, client_id, user_id, now + OAUTH_ACCESS_TOKEN_TTL,
+        )
+        await conn.execute(
+            "INSERT INTO oauth_refresh_tokens (token, client_id, user_id, expires_at) VALUES ($1, $2, $3, $4)",
+            refresh_token, client_id, user_id, now + OAUTH_REFRESH_TOKEN_TTL,
+        )
+    return access_token, refresh_token, int(OAUTH_ACCESS_TOKEN_TTL.total_seconds())
+
+async def oauth_refresh_access_token(refresh_token: str, client_id: str):
+    """Eski refresh tokenni bekor qilib (rotation), yangi access+refresh
+    tokenlar juftligini qaytaradi — foydalanuvchi qatnashuvisiz."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT * FROM oauth_refresh_tokens
+            WHERE token = $1 AND client_id = $2 AND revoked = FALSE AND expires_at > NOW()
+        """, refresh_token, client_id)
+        if not row:
+            return None
+        await conn.execute("UPDATE oauth_refresh_tokens SET revoked = TRUE WHERE token = $1", refresh_token)
+    return await oauth_issue_tokens(client_id, row["user_id"])
+
+async def validate_oauth_access_token(token: str) -> "int | None":
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT user_id FROM oauth_access_tokens WHERE token = $1 AND expires_at > NOW()", token
+        )
 
 # ===================== DONUT CHART =====================
 
@@ -2804,6 +2985,25 @@ async def mcp_token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Ishlatish:</b>\n"
         "<code>Authorization: Bearer &lt;token&gt;</code>\n\n"
         f"📋 Manifest: <code>{WEBHOOK_URL}/.well-known/mcp.json</code>",
+        parse_mode="HTML",
+    )
+
+async def mcp_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mcp_login — Claude (yoki boshqa MCP mijoz)ni "bitta manzil
+    joylashtirib ulash" (OAuth) oqimida ulash uchun bir martalik kod."""
+    user_id = update.effective_user.id
+    if not await is_user_premium(user_id):
+        await update.message.reply_text(
+            "❌ Bu funksiya faqat premium foydalanuvchilar uchun.",
+            parse_mode="HTML",
+        )
+        return
+    code = await create_oauth_link_code(user_id)
+    await update.message.reply_text(
+        "🤖 <b>AI ulash kodi</b>\n\n"
+        f"<code>{code}</code>\n\n"
+        "⏰ <b>10 daqiqa</b> davomida amal qiladi.\n"
+        "Claude'da ulanish sahifasiga shu kodni kiriting.",
         parse_mode="HTML",
     )
 
@@ -5788,7 +5988,10 @@ async def mcp_manifest_handler(request: web.Request) -> web.Response:
 async def mcp_tool_handler(request: web.Request) -> web.Response:
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
-        return web.json_response({"error": "Unauthorized"}, status=401)
+        return web.json_response(
+            {"error": "Unauthorized"}, status=401,
+            headers={"WWW-Authenticate": _mcp_www_authenticate()},
+        )
 
     user_id = await validate_mcp_token(auth[7:])
     if not user_id:
@@ -5871,6 +6074,12 @@ def _jsonrpc_err(req_id, code, message):
     )
 
 
+def _mcp_www_authenticate() -> str:
+    """Claude (va boshqa MCP mijozlar) shu header orqali OAuth serverini
+    avtomatik topadi — foydalanuvchi manzilni joylashtirganda qo'lda
+    hech narsa sozlashi shart bo'lmaydi (RFC 9728)."""
+    return f'Bearer resource_metadata="{WEBHOOK_URL}/.well-known/oauth-protected-resource"'
+
 async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -5878,7 +6087,7 @@ async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
             text='{"error":"Unauthorized"}',
             content_type="application/json",
             status=401,
-            headers={"WWW-Authenticate": "Bearer"},
+            headers={"WWW-Authenticate": _mcp_www_authenticate()},
         )
 
     user_id = await validate_mcp_token(auth[7:])
@@ -5929,6 +6138,168 @@ async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
     return _jsonrpc_err(req_id, -32601, f"Method not found: {method}")
 
 
+# ===================== OAuth 2.1 HTTP ENDPOINTLARI =====================
+# Claude Desktop/Claude Code/claude.ai connector sozlamalarida faqat
+# WEBHOOK_URL + "/mcp" manzilini joylashtirish kifoya — qolganini Claude
+# shu metadata orqali o'zi topadi (RFC 8414 / RFC 9728 / RFC 7591).
+
+def _oauth_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+async def oauth_metadata_handler(request: web.Request) -> web.Response:
+    base = WEBHOOK_URL
+    return web.json_response({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+async def oauth_protected_resource_handler(request: web.Request) -> web.Response:
+    base = WEBHOOK_URL
+    return web.json_response({
+        "resource": f"{base}/mcp",
+        "authorization_servers": [base],
+    })
+
+async def oauth_register_handler(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    redirect_uris = body.get("redirect_uris") or []
+    if not redirect_uris:
+        return web.json_response(
+            {"error": "invalid_client_metadata", "error_description": "redirect_uris required"},
+            status=400)
+    client = await oauth_register_client(body.get("client_name", "MCP Client"), redirect_uris)
+    return web.json_response({
+        "client_id": client["client_id"],
+        "client_name": client["client_name"],
+        "redirect_uris": client["redirect_uris"],
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    })
+
+def _oauth_authorize_page(client_name: str, client_id: str, redirect_uri: str,
+                           state: str, code_challenge: str, error: str = "") -> str:
+    error_html = f'<p class="err">❌ {_oauth_escape(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="uz"><head><meta charset="utf-8">
+<title>Oson Byudjet — AI ulash</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;
+       align-items:center;justify-content:center;min-height:100vh;margin:0}}
+  .card{{background:#1e293b;padding:32px;border-radius:16px;max-width:380px;width:90%;
+        box-shadow:0 10px 30px rgba(0,0,0,.3)}}
+  h1{{font-size:20px;margin:0 0 8px}}
+  p{{color:#94a3b8;font-size:14px;line-height:1.6}}
+  input{{width:100%;box-sizing:border-box;padding:12px;margin-top:16px;border-radius:8px;
+        border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:16px}}
+  button{{width:100%;padding:12px;margin-top:16px;border-radius:8px;border:none;
+         background:#6366f1;color:#fff;font-size:16px;font-weight:600;cursor:pointer}}
+  .err{{color:#f87171;font-size:14px;margin-top:8px}}
+</style></head>
+<body>
+  <div class="card">
+    <h1>🤖 {_oauth_escape(client_name)} ni ulash</h1>
+    <p>1️⃣ Telegram botga <b>/mcp_login</b> buyrug'ini yuboring<br>
+       2️⃣ Bot bergan kodni pastga kiriting</p>
+    {error_html}
+    <form method="post">
+      <input type="hidden" name="client_id" value="{_oauth_escape(client_id)}">
+      <input type="hidden" name="redirect_uri" value="{_oauth_escape(redirect_uri)}">
+      <input type="hidden" name="state" value="{_oauth_escape(state)}">
+      <input type="hidden" name="code_challenge" value="{_oauth_escape(code_challenge)}">
+      <input type="text" name="link_code" placeholder="Bot bergan kod" required autofocus autocomplete="off">
+      <button type="submit">Ulash</button>
+    </form>
+  </div>
+</body></html>"""
+
+async def oauth_authorize_get_handler(request: web.Request) -> web.Response:
+    q = request.query
+    client_id             = q.get("client_id", "")
+    redirect_uri          = q.get("redirect_uri", "")
+    state                 = q.get("state", "")
+    code_challenge        = q.get("code_challenge", "")
+    code_challenge_method = q.get("code_challenge_method", "")
+    response_type         = q.get("response_type", "")
+
+    client = await oauth_get_client(client_id)
+    if not client or redirect_uri not in client["redirect_uris"]:
+        return web.Response(text="❌ Noto'g'ri client_id yoki redirect_uri", status=400)
+    if response_type != "code" or code_challenge_method != "S256" or not code_challenge:
+        return web.Response(text="❌ PKCE (S256) talab qilinadi", status=400)
+
+    html = _oauth_authorize_page(client["client_name"], client_id, redirect_uri, state, code_challenge)
+    return web.Response(text=html, content_type="text/html")
+
+async def oauth_authorize_post_handler(request: web.Request) -> web.Response:
+    data           = await request.post()
+    client_id      = data.get("client_id", "")
+    redirect_uri   = data.get("redirect_uri", "")
+    state          = data.get("state", "")
+    code_challenge = data.get("code_challenge", "")
+    link_code      = (data.get("link_code") or "").strip()
+
+    client = await oauth_get_client(client_id)
+    if not client or redirect_uri not in client["redirect_uris"]:
+        return web.Response(text="❌ Noto'g'ri client_id yoki redirect_uri", status=400)
+
+    user_id = await consume_oauth_link_code(link_code)
+    if not user_id:
+        html = _oauth_authorize_page(
+            client["client_name"], client_id, redirect_uri, state, code_challenge,
+            error="Kod noto'g'ri yoki muddati tugagan. Botga qayta /mcp_login yuboring.")
+        return web.Response(text=html, content_type="text/html", status=400)
+
+    auth_code = await oauth_create_auth_code(client_id, user_id, redirect_uri, code_challenge, "S256")
+    sep = "&" if "?" in redirect_uri else "?"
+    raise web.HTTPFound(f"{redirect_uri}{sep}code={auth_code}&state={quote(state)}")
+
+async def oauth_token_handler(request: web.Request) -> web.Response:
+    if request.content_type == "application/json":
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+    else:
+        data = await request.post()
+
+    grant_type = data.get("grant_type", "")
+
+    if grant_type == "authorization_code":
+        user_id = await oauth_consume_auth_code(
+            data.get("code", ""), data.get("client_id", ""),
+            data.get("redirect_uri", ""), data.get("code_verifier", ""))
+        if not user_id:
+            return web.json_response({"error": "invalid_grant"}, status=400)
+        access_token, refresh_token, expires_in = await oauth_issue_tokens(data.get("client_id", ""), user_id)
+        return web.json_response({
+            "access_token": access_token, "token_type": "Bearer",
+            "expires_in": expires_in, "refresh_token": refresh_token,
+        })
+
+    if grant_type == "refresh_token":
+        result = await oauth_refresh_access_token(data.get("refresh_token", ""), data.get("client_id", ""))
+        if not result:
+            return web.json_response({"error": "invalid_grant"}, status=400)
+        access_token, refresh_token, expires_in = result
+        return web.json_response({
+            "access_token": access_token, "token_type": "Bearer",
+            "expires_in": expires_in, "refresh_token": refresh_token,
+        })
+
+    return web.json_response({"error": "unsupported_grant_type"}, status=400)
+
+
 # ===================== WEBHOOK =====================
 
 async def health(request):
@@ -5956,6 +6327,12 @@ async def main():
     web_app.router.add_get("/.well-known/mcp.json", mcp_manifest_handler)
     web_app.router.add_post("/mcp/tools/{tool_name}", mcp_tool_handler)
     web_app.router.add_post("/mcp", mcp_jsonrpc_handler)
+    web_app.router.add_get("/.well-known/oauth-authorization-server", oauth_metadata_handler)
+    web_app.router.add_get("/.well-known/oauth-protected-resource", oauth_protected_resource_handler)
+    web_app.router.add_post("/register", oauth_register_handler)
+    web_app.router.add_get("/authorize", oauth_authorize_get_handler)
+    web_app.router.add_post("/authorize", oauth_authorize_post_handler)
+    web_app.router.add_post("/token", oauth_token_handler)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -5994,6 +6371,7 @@ async def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("oxirgi", recent_command))
     app.add_handler(CommandHandler("mcp_token", mcp_token_command))
+    app.add_handler(CommandHandler("mcp_login", mcp_login_command))
     app.add_handler(CommandHandler("testreminder", admin_test_reminder))
     app.add_handler(CommandHandler("adminstats", admin_stats))
     app.add_handler(CallbackQueryHandler(button_handler))
