@@ -1829,11 +1829,15 @@ def _tashkent_datetime_for_date(target_date: date) -> datetime:
     return target_local.astimezone(pytz.utc).replace(tzinfo=None)
 
 async def build_saved_card(telegram_id: int, txn_type: str, amount: float,
-                            category: str, note: str, tx_date: date) -> str:
+                            category: str, note: str, tx_date: date,
+                            balance_id: int = None) -> str:
     """VAZIFA 2: boyitilgan tranzaksiya kartasi matni — sana, oylik
     kategoriya jami va oylik balans bilan. tx_date TRANZAKSIYA sodir bo'lgan
     oyning statistikasini ko'rsatadi (joriy oy emas) — shunda orqaga
-    sanalgan ('kecha' va h.k.) yozuvlar ham to'g'ri oyda hisoblanadi."""
+    sanalgan ('kecha' va h.k.) yozuvlar ham to'g'ri oyda hisoblanadi.
+    "Balans" — barcha hisoblarning JORIY qoldig'i (balances jadvali
+    yig'indisi), oylik kirim−chiqim farqi EMAS (ular alohida "Bu oygi
+    chiqimlar/daromad" qatorida ko'rsatiladi)."""
     direction_label = "Kirim" if txn_type == "income" else "Chiqim"
     date_str = tx_date.strftime("%d.%m.%Y")
     note_line = f"\n📝 {note}" if note else ""
@@ -1844,6 +1848,10 @@ async def build_saved_card(telegram_id: int, txn_type: str, amount: float,
         float(t["amount"]) for t in month_txns
         if t["category"] == category and t["type"] == txn_type
     )
+
+    balances = await get_balances(telegram_id)
+    total_balance = sum(float(b["amount"]) for b in balances)
+    used_balance = next((b for b in balances if b["id"] == balance_id), None)
 
     amount_line = _card_money(amount, force_minus=(txn_type == "expense"))
     # "💡" qatorida kategoriya nomi o'z emojisiz ko'rsatiladi (sarlavhada
@@ -1862,7 +1870,9 @@ async def build_saved_card(telegram_id: int, txn_type: str, amount: float,
         text += f"Bu oygi chiqimlar: {_card_money(stats['expenses'])}\n"
     else:
         text += f"Bu oygi daromad: {_card_money(stats['income'])}\n"
-    text += f"Balans: {_card_money(stats['balance'])}"
+    text += f"Balans: {_card_money(total_balance)}"
+    if used_balance:
+        text += f"\n💳 {used_balance['name']}: {_card_money(float(used_balance['amount']))}"
     return text
 
 # ===================== /START KESHI =====================
@@ -2238,7 +2248,8 @@ async def render_tx_card(telegram_id, tx_id):
     tx_date = tx["date"].astimezone(tz).date()
     text = await build_saved_card(
         telegram_id, tx["type"], float(tx["amount"]),
-        tx["category"], tx.get("note") or "", tx_date)
+        tx["category"], tx.get("note") or "", tx_date,
+        balance_id=tx.get("balance_id"))
     return text, tx_confirm_keyboard(tx_id)
 
 # ===================== TO'LOV =====================
@@ -3095,7 +3106,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 card_text = await build_saved_card(
                     user_id, t["type"], float(t["amount"]),
-                    t["category"], t.get("note", ""), tx_date)
+                    t["category"], t.get("note", ""), tx_date,
+                    balance_id=balance_id)
                 markup = tx_confirm_keyboard(tx_id, fresh=True)
                 if i == 0:
                     await query.edit_message_text(card_text, parse_mode="HTML", reply_markup=markup)
@@ -3125,7 +3137,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             card_text = await build_saved_card(
                 user_id, parsed["type"], float(parsed["amount"]),
-                parsed["category"], parsed.get("note", parsed.get("text", "")), tx_date)
+                parsed["category"], parsed.get("note", parsed.get("text", "")), tx_date,
+                balance_id=balance_id)
 
             await query.edit_message_text(
                 card_text, parse_mode="HTML",
@@ -4757,7 +4770,8 @@ async def _save_transaction(user_id, context, note="",
     tx_id  = await add_transaction(user_id, txn_type, amount, category, note, balance_id)
     budget = await get_budget(user_id)
 
-    msg = await build_saved_card(user_id, txn_type, amount, category, note, tx_date)
+    msg = await build_saved_card(user_id, txn_type, amount, category, note, tx_date,
+                                  balance_id=balance_id)
 
     if budget > 0 and txn_type == "expense":
         month_txns = await get_transactions_by_month(user_id, tx_date.year, tx_date.month)
