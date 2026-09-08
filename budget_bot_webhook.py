@@ -5990,7 +5990,7 @@ async def mcp_tool_handler(request: web.Request) -> web.Response:
     if not auth.startswith("Bearer "):
         return web.json_response(
             {"error": "Unauthorized"}, status=401,
-            headers={"WWW-Authenticate": _mcp_www_authenticate()},
+            headers={"WWW-Authenticate": _mcp_www_authenticate(request)},
         )
 
     user_id = await validate_mcp_token(auth[7:])
@@ -6074,10 +6074,17 @@ def _jsonrpc_err(req_id, code, message):
     )
 
 
-def _mcp_www_authenticate() -> str:
+def _mcp_www_authenticate(request: "web.Request | None" = None) -> str:
     """Claude (va boshqa MCP mijozlar) shu header orqali OAuth serverini
     avtomatik topadi — foydalanuvchi manzilni joylashtirganda qo'lda
-    hech narsa sozlashi shart bo'lmaydi (RFC 9728)."""
+    hech narsa sozlashi shart bo'lmaydi (RFC 9728).
+    /mcp/{account} kabi qo'shimcha hisoblar uchun manzillarda (bitta
+    Claude tashkiloti ichida bir xil URL'ni ikkinchi marta connector
+    sifatida qo'shib bo'lmasligi sababli — har bir Telegram hisobi uchun
+    alohida yo'l kerak) resource_metadata ham o'sha yo'lga mos keladi."""
+    path = request.path if request is not None else "/mcp"
+    if path.startswith("/mcp/") and not path.startswith("/mcp/tools/"):
+        return f'Bearer resource_metadata="{WEBHOOK_URL}/.well-known/oauth-protected-resource{path}"'
     return f'Bearer resource_metadata="{WEBHOOK_URL}/.well-known/oauth-protected-resource"'
 
 async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
@@ -6087,7 +6094,7 @@ async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
             text='{"error":"Unauthorized"}',
             content_type="application/json",
             status=401,
-            headers={"WWW-Authenticate": _mcp_www_authenticate()},
+            headers={"WWW-Authenticate": _mcp_www_authenticate(request)},
         )
 
     user_id = await validate_mcp_token(auth[7:])
@@ -6163,6 +6170,18 @@ async def oauth_protected_resource_handler(request: web.Request) -> web.Response
     base = WEBHOOK_URL
     return web.json_response({
         "resource": f"{base}/mcp",
+        "authorization_servers": [base],
+    })
+
+async def oauth_protected_resource_account_handler(request: web.Request) -> web.Response:
+    """Bitta Claude tashkiloti bir xil connector URL'ini ikki marta qo'shishga
+    yo'l qo'ymaydi, shuning uchun ikkinchi (uchinchi, ...) Telegram hisobi
+    /mcp/{account} kabi alohida yo'ldan ulanadi — bu yerda faqat 'resource'
+    o'sha yo'lga mos qilib qaytariladi, avtorizatsiya serveri bitta va umumiy."""
+    base = WEBHOOK_URL
+    account = request.match_info["account"]
+    return web.json_response({
+        "resource": f"{base}/mcp/{account}",
         "authorization_servers": [base],
     })
 
@@ -6327,8 +6346,11 @@ async def main():
     web_app.router.add_get("/.well-known/mcp.json", mcp_manifest_handler)
     web_app.router.add_post("/mcp/tools/{tool_name}", mcp_tool_handler)
     web_app.router.add_post("/mcp", mcp_jsonrpc_handler)
+    web_app.router.add_post("/mcp/{account}", mcp_jsonrpc_handler)
     web_app.router.add_get("/.well-known/oauth-authorization-server", oauth_metadata_handler)
     web_app.router.add_get("/.well-known/oauth-protected-resource", oauth_protected_resource_handler)
+    web_app.router.add_get("/.well-known/oauth-protected-resource/mcp/{account}",
+                            oauth_protected_resource_account_handler)
     web_app.router.add_post("/register", oauth_register_handler)
     web_app.router.add_get("/authorize", oauth_authorize_get_handler)
     web_app.router.add_post("/authorize", oauth_authorize_post_handler)
