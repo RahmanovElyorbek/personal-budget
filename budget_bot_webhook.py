@@ -6649,31 +6649,347 @@ async def _mcp_get_reports(user_id: int, params: dict) -> dict:
     }
 
 
-async def _mcp_get_summary(user_id: int, params: dict) -> dict:
-    txns   = await get_month_transactions(user_id)
-    stats  = calc_stats(txns)
-    budget = await get_budget(user_id)
+# ===================== BOSQICH 3: STATISTIKA (SQL agregatsiya) =====================
+# Barcha statistika tool'lari SQL GROUP BY bilan ishlaydi, Python'da xom
+# tranzaksiya ro'yxatini tortib loop bilan emas (section 7 talabi).
 
-    cat_stats: dict = {}
-    for t in txns:
-        if t["type"] == "expense":
-            cat = t.get("category", "Boshqa")
-            cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
+# transactions.category_id bo'lsa categories jadvalidan nom/emoji olinadi,
+# bo'lmasa (eski, hali migratsiya qilinmagan yozuvlar) transactions.category
+# matn ustuni ishlatiladi — uchala statistika tool'ida bir xil SQL bo'lagi.
+_MCP_CATEGORY_JOIN    = "LEFT JOIN categories c ON c.id = t.category_id"
+_MCP_CATEGORY_SELECT  = "t.category_id, c.name AS cat_name, c.emoji AS cat_emoji, t.category AS legacy_category"
+_MCP_CATEGORY_GROUPBY = "t.category_id, c.name, c.emoji, t.category"
+
+def _mcp_category_display(row) -> str:
+    if row["cat_name"]:
+        return f"{row['cat_emoji']} {row['cat_name']}".strip()
+    return row["legacy_category"] or "📦 Boshqa"
+
+def _mcp_pct_change(cur: float, prev: float) -> "float | None":
+    if prev == 0:
+        return None if cur == 0 else 100.0
+    return round((cur - prev) / prev * 100, 1)
+
+async def _mcp_get_summary(user_id: int, params: dict) -> dict:
+    """get_summary v2: from_date/to_date berilmasa joriy oy, + o'tgan
+    (bir xil uzunlikdagi) davr bilan taqqoslash (%)."""
+    tz = pytz.timezone("Asia/Tashkent")
+    today = datetime.now(tz).date()
+
+    from_raw, to_raw = params.get("from_date"), params.get("to_date")
+    try:
+        from_d = date.fromisoformat(from_raw) if from_raw else today.replace(day=1)
+        to_d   = date.fromisoformat(to_raw) if to_raw else today
+    except ValueError:
+        return {"error": "validation_error",
+                "message": "from_date/to_date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
+    if from_d > to_d:
+        return {"error": "validation_error", "message": "from_date to_date'dan katta bo'lishi mumkin emas.", "hint": ""}
+
+    period_days = (to_d - from_d).days + 1
+    prev_to   = from_d - timedelta(days=1)
+    prev_from = prev_to - timedelta(days=period_days - 1)
+
+    async def _period_totals(conn, f, t):
+        row = await conn.fetchrow("""
+            SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)  AS income,
+                   COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS expense
+            FROM transactions
+            WHERE telegram_id = $1 AND is_deleted = FALSE
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
+        """, user_id, f, t)
+        return float(row["income"]), float(row["expense"])
+
+    async with db_pool.acquire() as conn:
+        income, expense = await _period_totals(conn, from_d, to_d)
+        prev_income, prev_expense = await _period_totals(conn, prev_from, prev_to)
+        top_rows = await conn.fetch(f"""
+            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
+            FROM transactions t {_MCP_CATEGORY_JOIN}
+            WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = 'expense'
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3
+            GROUP BY {_MCP_CATEGORY_GROUPBY}
+            ORDER BY amt DESC
+            LIMIT 5
+        """, user_id, from_d, to_d)
+        budget = await get_budget(user_id)
 
     return {
-        "month":      datetime.now().strftime("%B %Y"),
-        "income":     stats["income"],
-        "expenses":   stats["expenses"],
-        "balance":    stats["balance"],
-        "budget":     budget,
+        "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
+        "income": income, "expenses": expense, "balance": income - expense,
+        "budget": budget,
+        "vs_previous_period": {
+            "from_date": prev_from.isoformat(), "to_date": prev_to.isoformat(),
+            "income_change_pct":  _mcp_pct_change(income, prev_income),
+            "expense_change_pct": _mcp_pct_change(expense, prev_expense),
+        },
+        "top_categories": [
+            {
+                "category_id": r["category_id"],
+                "category":    _mcp_category_display(r),
+                "amount":      float(r["amt"]),
+                "pct":         round(float(r["amt"]) / expense * 100, 1) if expense else 0,
+            }
+            for r in top_rows
+        ],
+    }
+
+async def _mcp_get_spending_overview(user_id: int, params: dict) -> dict:
+    try:
+        from_d = date.fromisoformat(params["from_date"])
+        to_d   = date.fromisoformat(params["to_date"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "validation_error",
+                "message": "from_date va to_date (YYYY-MM-DD) majburiy.", "hint": ""}
+    side = params.get("side")
+    if side not in ("income", "expense"):
+        return {"error": "validation_error", "message": "side 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
+
+    where = ("WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = $2 "
+             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $3 "
+             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $4")
+    args: list = [user_id, side, from_d, to_d]
+
+    category_ids = params.get("category_ids")
+    if category_ids:
+        try:
+            category_ids = [int(c) for c in category_ids]
+        except (TypeError, ValueError):
+            return {"error": "validation_error",
+                    "message": "category_ids butun sonlar ro'yxati bo'lishi kerak.", "hint": ""}
+        where += f" AND t.category_id = ANY(${len(args) + 1}::int[])"
+        args.append(category_ids)
+
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval(f"SELECT COALESCE(SUM(t.amount), 0) FROM transactions t {where}", *args)
+        rows = await conn.fetch(f"""
+            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt, COUNT(*) AS cnt
+            FROM transactions t {_MCP_CATEGORY_JOIN}
+            {where}
+            GROUP BY {_MCP_CATEGORY_GROUPBY}
+            ORDER BY amt DESC
+        """, *args)
+
+    total = float(total)
+    return {
+        "from_date": from_d.isoformat(), "to_date": to_d.isoformat(), "side": side,
+        "total": total,
         "categories": [
             {
-                "category": cat,
-                "amount":   amt,
-                "pct":      int(amt / stats["expenses"] * 100) if stats["expenses"] else 0,
+                "category_id": r["category_id"],
+                "category":    _mcp_category_display(r),
+                "amount":      float(r["amt"]),
+                "count":       r["cnt"],
+                "pct":         round(float(r["amt"]) / total * 100, 1) if total else 0,
             }
-            for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1])
+            for r in rows
         ],
+    }
+
+async def _mcp_get_category_stats(user_id: int, params: dict) -> dict:
+    """Ona kategoriya → subkategoriya daraxti. Hozircha hech kim
+    subkategoriya yaratmagan, shuning uchun 'children' odatda bo'sh —
+    bu xato emas, faqat hali kimdir subkategoriya yaratmagan degani."""
+    try:
+        from_d = date.fromisoformat(params["from_date"])
+        to_d   = date.fromisoformat(params["to_date"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "validation_error",
+                "message": "from_date va to_date (YYYY-MM-DD) majburiy.", "hint": ""}
+    side = params.get("side")
+    if side not in ("income", "expense"):
+        return {"error": "validation_error", "message": "side 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
+
+    where = ("WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = $2 "
+             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $3 "
+             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $4")
+    args: list = [user_id, side, from_d, to_d]
+
+    category_ids = params.get("category_ids")
+    if category_ids:
+        try:
+            category_ids = [int(c) for c in category_ids]
+        except (TypeError, ValueError):
+            return {"error": "validation_error",
+                    "message": "category_ids butun sonlar ro'yxati bo'lishi kerak.", "hint": ""}
+        where += f" AND t.category_id = ANY(${len(args) + 1}::int[])"
+        args.append(category_ids)
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
+            FROM transactions t {_MCP_CATEGORY_JOIN}
+            {where}
+            GROUP BY {_MCP_CATEGORY_GROUPBY}
+        """, *args)
+        cat_rows = await conn.fetch(
+            "SELECT id, name, emoji, parent_id FROM categories WHERE telegram_id IS NULL OR telegram_id = $1",
+            user_id)
+
+    cat_lookup = {r["id"]: r for r in cat_rows}
+    total = sum(float(r["amt"]) for r in rows)
+
+    roots: dict = {}
+    for r in rows:
+        amt = float(r["amt"])
+        cid = r["category_id"]
+        if cid is None or cid not in cat_lookup:
+            key = ("legacy", r["legacy_category"] or "📦 Boshqa")
+            node = roots.setdefault(key, {"category_id": None, "category": key[1],
+                                           "amount": 0.0, "children": []})
+            node["amount"] += amt
+            continue
+        cat = cat_lookup[cid]
+        chain = [cat]
+        while chain[-1]["parent_id"] is not None and chain[-1]["parent_id"] in cat_lookup:
+            chain.append(cat_lookup[chain[-1]["parent_id"]])
+        root_cat = chain[-1]
+        key = ("cat", root_cat["id"])
+        display = f"{root_cat['emoji']} {root_cat['name']}".strip()
+        node = roots.setdefault(key, {"category_id": root_cat["id"], "category": display,
+                                       "amount": 0.0, "children": []})
+        node["amount"] += amt
+        if root_cat["id"] != cid:
+            child_display = f"{cat['emoji']} {cat['name']}".strip()
+            node["children"].append({
+                "category_id": cid, "category": child_display, "amount": amt,
+                "pct": round(amt / total * 100, 1) if total else 0,
+            })
+
+    items = [
+        {
+            "category_id": node["category_id"],
+            "category":    node["category"],
+            "amount":      node["amount"],
+            "pct":         round(node["amount"] / total * 100, 1) if total else 0,
+            "children":    sorted(node["children"], key=lambda c: -c["amount"]),
+        }
+        for node in roots.values()
+    ]
+    items.sort(key=lambda x: -x["amount"])
+
+    return {
+        "from_date": from_d.isoformat(), "to_date": to_d.isoformat(), "side": side,
+        "total": total,
+        "categories": items,
+    }
+
+async def _mcp_get_balance_timeseries(user_id: int, params: dict) -> dict:
+    """Balans hech qachon davriy 'snapshot' sifatida saqlanmaydi — faqat
+    joriy qoldiq bor. Shuning uchun tarixiy nuqtalar HOZIRGI balansdan
+    ORQAGA hisoblanadi: balans(bucket) = hozirgi_balans - net(bucket dan
+    hozirgacha bo'lgan barcha tranzaksiyalar)."""
+    try:
+        from_d = date.fromisoformat(params["from_date"])
+        to_d   = date.fromisoformat(params["to_date"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "validation_error",
+                "message": "from_date va to_date (YYYY-MM-DD) majburiy.", "hint": ""}
+    granularity = params.get("granularity") or "day"
+    if granularity not in ("day", "week", "month"):
+        return {"error": "validation_error",
+                "message": "granularity 'day', 'week' yoki 'month' bo'lishi kerak.", "hint": ""}
+    trunc_unit = {"day": "day", "week": "week", "month": "month"}[granularity]  # whitelist — SQL injection yo'q
+
+    bals = await get_balances(user_id)
+    current_balance = sum(float(b["amount"]) for b in bals)
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT DATE_TRUNC('{trunc_unit}', date AT TIME ZONE 'Asia/Tashkent')::date AS bucket,
+                   COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)
+                     - COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS net
+            FROM transactions
+            WHERE telegram_id = $1 AND is_deleted = FALSE
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
+            GROUP BY bucket
+            ORDER BY bucket ASC
+        """, user_id, from_d, to_d)
+        after_row = await conn.fetchrow("""
+            SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)
+                     - COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS net
+            FROM transactions
+            WHERE telegram_id = $1 AND is_deleted = FALSE
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') > $2
+        """, user_id, to_d)
+
+    net_by_bucket = {r["bucket"]: float(r["net"]) for r in rows}
+    ordered_buckets = sorted(net_by_bucket.keys())
+
+    running = current_balance - float(after_row["net"])
+    balance_by_bucket = {}
+    for b in reversed(ordered_buckets):
+        balance_by_bucket[b] = running
+        running -= net_by_bucket[b]
+
+    return {
+        "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
+        "granularity": granularity,
+        "current_total_balance": current_balance,
+        "points": [
+            {"date": b.isoformat(), "balance": balance_by_bucket[b], "net_change": net_by_bucket[b]}
+            for b in ordered_buckets
+        ],
+    }
+
+async def _mcp_compare_periods(user_id: int, params: dict) -> dict:
+    try:
+        a_from = date.fromisoformat(params["period_a_from"])
+        a_to   = date.fromisoformat(params["period_a_to"])
+        b_from = date.fromisoformat(params["period_b_from"])
+        b_to   = date.fromisoformat(params["period_b_to"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "validation_error",
+                "message": "period_a_from/period_a_to/period_b_from/period_b_to (YYYY-MM-DD) majburiy.",
+                "hint": ""}
+    side = params.get("side")
+    if side not in ("income", "expense"):
+        return {"error": "validation_error", "message": "side 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
+
+    async def _by_category(conn, f, t):
+        rows = await conn.fetch(f"""
+            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
+            FROM transactions t {_MCP_CATEGORY_JOIN}
+            WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = $2
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $3
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $4
+            GROUP BY {_MCP_CATEGORY_GROUPBY}
+        """, user_id, side, f, t)
+        out = {}
+        for r in rows:
+            key = r["category_id"] if r["category_id"] is not None else f"text:{r['legacy_category']}"
+            out[key] = {"category": _mcp_category_display(r), "amount": float(r["amt"])}
+        return out
+
+    async with db_pool.acquire() as conn:
+        a_data = await _by_category(conn, a_from, a_to)
+        b_data = await _by_category(conn, b_from, b_to)
+
+    comparisons = []
+    for key in set(a_data) | set(b_data):
+        a_amt = a_data.get(key, {}).get("amount", 0.0)
+        b_amt = b_data.get(key, {}).get("amount", 0.0)
+        name = (a_data.get(key) or b_data.get(key))["category"]
+        comparisons.append({
+            "category": name,
+            "period_a_amount": a_amt,
+            "period_b_amount": b_amt,
+            "change_pct": _mcp_pct_change(b_amt, a_amt),
+        })
+    comparisons.sort(key=lambda c: -abs(c["period_b_amount"] - c["period_a_amount"]))
+
+    total_a = sum(c["period_a_amount"] for c in comparisons)
+    total_b = sum(c["period_b_amount"] for c in comparisons)
+
+    return {
+        "period_a": {"from_date": a_from.isoformat(), "to_date": a_to.isoformat(), "total": total_a},
+        "period_b": {"from_date": b_from.isoformat(), "to_date": b_to.isoformat(), "total": total_b},
+        "side": side,
+        "total_change_pct": _mcp_pct_change(total_b, total_a),
+        "categories": comparisons,
     }
 
 
@@ -6885,6 +7201,10 @@ _MCP_TOOLS = {
     "replace_transaction": _mcp_replace_transaction,
     "list_transactions":   _mcp_list_transactions,
     "get_reports":         _mcp_get_reports,
+    "get_spending_overview":  _mcp_get_spending_overview,
+    "get_category_stats":     _mcp_get_category_stats,
+    "get_balance_timeseries": _mcp_get_balance_timeseries,
+    "compare_periods":        _mcp_compare_periods,
 }
 
 
@@ -6989,8 +7309,23 @@ _MCP_TOOLS_SCHEMA = [
     },
     {
         "name": "get_summary",
-        "description": "Get financial summary for the current month (income, expenses, balance, top categories)",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": (
+            "Berilgan davr (default: joriy oy) uchun kirim/chiqim/balans + "
+            "TENG uzunlikdagi o'tgan davr bilan taqqoslash (%) va top-5 "
+            "chiqim kategoriyasi.\n\n"
+            "✅ \"shu oy qancha sarfladim\", \"o'tgan oyga nisbatan qanday\" "
+            "kabi umumiy savollarga ishlating — hech qanday parametrsiz "
+            "chaqirilsa joriy oyni beradi.\n\n"
+            "❌ Kategoriya bo'yicha TO'LIQ taqsimot (faqat top-5 emas) kerak "
+            "bo'lsa get_spending_overview chaqiring."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_date": {"type": "string", "format": "date", "description": "default: joriy oyning 1-kuni"},
+                "to_date":   {"type": "string", "format": "date", "description": "default: bugun"},
+            },
+        },
     },
     {
         "name": "get_debts",
@@ -7215,6 +7550,108 @@ _MCP_TOOLS_SCHEMA = [
                 "search":       {"type": "string", "description": "Izoh (note) matnida qidirish"},
                 "page":         {"type": "integer"},
                 "limit":        {"type": "integer", "description": "default 20, maks 200"},
+            },
+        },
+    },
+    {
+        "name": "get_spending_overview",
+        "description": (
+            "Berilgan davrdagi kirim YOKI chiqim — TO'LIQ kategoriya "
+            "taqsimoti (har biriga summa, soni va foiz), server tomonda "
+            "SQL bilan hisoblangan.\n\n"
+            "✅ SHU TOOL'NI ishlating: \"bugun/shu hafta/shu oy qancha "
+            "sarfladim\", \"eng ko'p qaysi kategoriyaga ketyapti\", "
+            "\"daromadlarim qanday taqsimlangan\".\n\n"
+            "❌ get_reports NI ISHLATMANG bunday savollarga — u xom ro'yxat "
+            "qaytaradi, siz uni sahifalab o'zingiz qo'shishingiz kerak "
+            "bo'ladi: token isrof va hisob xatosi. Bu tool tayyor jamini "
+            "beradi.\n\n"
+            "⚠️ from_date, to_date va side MAJBURIY. side: \"income\" yoki "
+            "\"expense\" — ikkalasini birga bermaydi, kerak bo'lsa ikki "
+            "marta chaqiring."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["from_date", "to_date", "side"],
+            "properties": {
+                "from_date":    {"type": "string", "format": "date"},
+                "to_date":      {"type": "string", "format": "date"},
+                "side":         {"type": "string", "enum": ["income", "expense"]},
+                "category_ids": {"type": "array", "items": {"type": "integer"}, "description": "Faqat shu kategoriyalar bilan cheklash (ixtiyoriy)"},
+            },
+        },
+    },
+    {
+        "name": "get_category_stats",
+        "description": (
+            "get_spending_overview bilan bir xil, lekin ONA KATEGORIYA → "
+            "SUBKATEGORIYA daraxti ko'rinishida (har biriga summa/foiz, "
+            "\"children\" ro'yxati bilan).\n\n"
+            "✅ Foydalanuvchi aniq subkategoriya darajasidagi bo'linishni "
+            "so'raganda ishlating (\"Transport ichida taksi va benzin "
+            "qancha-qancha\").\n\n"
+            "❌ Oddiy \"kategoriyalar bo'yicha taqsimot\" savoliga "
+            "get_spending_overview yetarli va soddaroq — buni faqat "
+            "daraxt kerak bo'lganda ishlating.\n\n"
+            "⚠️ Hozircha aksariyat kategoriyalarda subkategoriya yo'q — "
+            "\"children\" bo'sh qaytsa, bu XATO EMAS."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["from_date", "to_date", "side"],
+            "properties": {
+                "from_date":    {"type": "string", "format": "date"},
+                "to_date":      {"type": "string", "format": "date"},
+                "side":         {"type": "string", "enum": ["income", "expense"]},
+                "category_ids": {"type": "array", "items": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "name": "get_balance_timeseries",
+        "description": (
+            "Kunlik/haftalik/oylik balans qatori — \"oxirgi 3 oyda pulim "
+            "qanday o'zgardi\" turidagi savollar uchun.\n\n"
+            "✅ Balansning VAQT ICHIDA o'zgarishi so'ralganda ishlating "
+            "(grafik/trend).\n\n"
+            "❌ Faqat HOZIRGI umumiy balans kerak bo'lsa (\"hozir qancha "
+            "pulim bor\") get_summary yetarli — bu tool ORTIQCHA.\n\n"
+            "⚠️ Tarixiy balans alohida saqlanmaydi — hozirgi umumiy "
+            "balansdan orqaga hisoblab chiqariladi, shuning uchun har doim "
+            "aniq (barcha tranzaksiyalar hisobga olingan)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["from_date", "to_date"],
+            "properties": {
+                "from_date":   {"type": "string", "format": "date"},
+                "to_date":     {"type": "string", "format": "date"},
+                "granularity": {"type": "string", "enum": ["day", "week", "month"], "description": "default: day"},
+            },
+        },
+    },
+    {
+        "name": "compare_periods",
+        "description": (
+            "Ikki davrni kategoriya kesimida solishtiradi, har biriga "
+            "o'sish/pasayish foizi bilan (masalan \"shu oy o'tgan oyga "
+            "nisbatan\" yoki \"bu yil shu oy o'tgan yil shu oyga nisbatan\").\n\n"
+            "✅ Foydalanuvchi ikki aniq davrni taqqoslashni so'raganda "
+            "ishlating — bu boshqa hech bir tool'da yo'q, faqat shu yerda.\n\n"
+            "❌ Faqat BITTA davr uchun ma'lumot kerak bo'lsa "
+            "get_spending_overview yoki get_summary chaqiring.\n\n"
+            "⚠️ Ikkala davr ham BIR XIL side (income YOKI expense) bo'yicha "
+            "solishtiriladi."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["period_a_from", "period_a_to", "period_b_from", "period_b_to", "side"],
+            "properties": {
+                "period_a_from": {"type": "string", "format": "date"},
+                "period_a_to":   {"type": "string", "format": "date"},
+                "period_b_from": {"type": "string", "format": "date"},
+                "period_b_to":   {"type": "string", "format": "date"},
+                "side":          {"type": "string", "enum": ["income", "expense"]},
             },
         },
     },
