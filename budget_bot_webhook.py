@@ -587,6 +587,25 @@ async def init_db():
               AND c.telegram_id IS NULL
               AND t.category = (CASE WHEN c.emoji <> '' THEN c.emoji || ' ' || c.name ELSE c.name END)
         """)
+        # ---- 004_category_management migratsiyasi (MCP Bosqich 5:
+        # create_category/update_category/delete_category) ----
+        try:
+            await conn.execute("""
+                ALTER TABLE categories ADD COLUMN IF NOT EXISTS color TEXT DEFAULT NULL
+            """)
+        except Exception as e:
+            logger.warning(f"ALTER TABLE categories (color): {e}")
+        # Tizim kategoriyasini "o'chirish" — haqiqatda o'chirilmaydi (boshqa
+        # foydalanuvchilarga ta'sir qilmasligi uchun), faqat SHU foydalanuvchi
+        # uchun shu jadvalga yozib berkitiladi.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS hidden_categories (
+                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
+                hidden_at   TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, category_id)
+            )
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -6361,6 +6380,8 @@ async def _mcp_resolve_category(user_id: int, category_id, category_text: "str |
             cat = await conn.fetchrow("""
                 SELECT name, emoji FROM categories
                 WHERE id = $1 AND (telegram_id IS NULL OR telegram_id = $2) AND is_hidden = FALSE
+                  AND NOT EXISTS (SELECT 1 FROM hidden_categories h
+                                  WHERE h.telegram_id = $2 AND h.category_id = categories.id)
             """, category_id, user_id)
         if not cat:
             return None, "", {
@@ -7321,7 +7342,9 @@ async def _mcp_list_categories(user_id: int, params: dict) -> dict:
     search = (params.get("search") or "").strip().lower()
     page, limit, offset = _mcp_pagination(params)
 
-    where = "WHERE (telegram_id IS NULL OR telegram_id = $1) AND is_hidden = FALSE"
+    where = ("WHERE (telegram_id IS NULL OR telegram_id = $1) AND is_hidden = FALSE "
+              "AND NOT EXISTS (SELECT 1 FROM hidden_categories h "
+              "WHERE h.telegram_id = $1 AND h.category_id = categories.id)")
     args: list = [user_id]
     if search:
         where += f" AND LOWER(name) LIKE ${len(args) + 1}"
@@ -7353,6 +7376,8 @@ async def _mcp_get_used_categories(user_id: int, params: dict) -> dict:
             FROM transactions t
             JOIN categories c ON c.id = t.category_id
             WHERE t.telegram_id = $1 AND t.is_deleted = FALSE
+              AND NOT EXISTS (SELECT 1 FROM hidden_categories h
+                              WHERE h.telegram_id = $1 AND h.category_id = c.id)
             GROUP BY c.id, c.name, c.emoji, c.type
             ORDER BY usage_count DESC
             LIMIT $2
@@ -7383,6 +7408,8 @@ async def _mcp_list_subcategories(user_id: int, params: dict) -> dict:
         rows = await conn.fetch("""
             SELECT id, name, emoji, type FROM categories
             WHERE parent_id = $1 AND (telegram_id IS NULL OR telegram_id = $2) AND is_hidden = FALSE
+              AND NOT EXISTS (SELECT 1 FROM hidden_categories h
+                              WHERE h.telegram_id = $2 AND h.category_id = categories.id)
             ORDER BY name
         """, category_id, user_id)
     items = [{"id": r["id"], "name": r["name"], "emoji": r["emoji"], "type": r["type"]} for r in rows]
@@ -7391,6 +7418,148 @@ async def _mcp_list_subcategories(user_id: int, params: dict) -> dict:
         "summaries": {"count": len(items)},
         "meta": {"page": 1, "limit": len(items) or 1, "hasMore": False},
     }
+
+
+# ===================== BOSQICH 5: KATEGORIYA BOSHQARUVI =====================
+
+async def _mcp_create_category(user_id: int, params: dict) -> dict:
+    name = (params.get("name") or "").strip()
+    if not name:
+        return {"error": "validation_error", "message": "name majburiy.", "hint": ""}
+
+    parent_id = params.get("parent_id")
+    cat_type = params.get("type")
+    async with db_pool.acquire() as conn:
+        if parent_id is not None:
+            try:
+                parent_id = int(parent_id)
+            except (TypeError, ValueError):
+                return {"error": "validation_error", "message": "parent_id butun son bo'lishi kerak.", "hint": ""}
+            parent = await conn.fetchrow(
+                "SELECT type FROM categories WHERE id = $1 AND (telegram_id IS NULL OR telegram_id = $2)",
+                parent_id, user_id)
+            if not parent:
+                return {"error": "not_found", "message": "parent_id topilmadi.", "hint": ""}
+            cat_type = cat_type or parent["type"]
+
+        if cat_type not in ("income", "expense"):
+            return {"error": "validation_error",
+                    "message": "type 'income' yoki 'expense' bo'lishi kerak (parent_id berilmasa majburiy).",
+                    "hint": "parent_id bersangiz, type ota-kategoriyadan avtomatik olinadi."}
+
+        emoji = (params.get("emoji") or "").strip()
+        color = (params.get("color") or "").strip() or None
+
+        row = await conn.fetchrow("""
+            INSERT INTO categories (telegram_id, name, emoji, type, parent_id, color)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+        """, user_id, name, emoji, cat_type, parent_id, color)
+
+    return {
+        "success": True, "category_id": row["id"], "name": name,
+        "emoji": emoji, "type": cat_type, "parent_id": parent_id, "color": color,
+    }
+
+async def _mcp_update_category(user_id: int, params: dict) -> dict:
+    cat_id = params.get("id")
+    if cat_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        cat_id = int(cat_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+
+    async with db_pool.acquire() as conn:
+        cat = await conn.fetchrow("SELECT telegram_id FROM categories WHERE id = $1", cat_id)
+        if not cat:
+            return {"error": "not_found", "message": "Kategoriya topilmadi.", "hint": ""}
+        if cat["telegram_id"] is None:
+            return {"error": "validation_error",
+                    "message": "Tizim kategoriyalarini tahrirlab bo'lmaydi (hamma foydalanuvchiga ta'sir qilardi).",
+                    "hint": "O'zingizga mos nom/emoji kerak bo'lsa, create_category orqali yangi shaxsiy kategoriya yarating."}
+        if cat["telegram_id"] != user_id:
+            return {"error": "not_found", "message": "Kategoriya topilmadi.", "hint": ""}
+
+        fields, args = [], []
+        for col in ("name", "emoji", "color"):
+            if params.get(col) is not None:
+                args.append(params[col])
+                fields.append(f"{col} = ${len(args)}")
+        if not fields:
+            return {"error": "validation_error",
+                    "message": "Kamida bitta maydon (name/emoji/color) berilishi kerak.", "hint": ""}
+        args.append(cat_id)
+        args.append(user_id)
+        # AND telegram_id — yuqorida egalik allaqachon tekshirilgan, lekin
+        # DB darajasida ham himoya bo'lsin (P0'dagi IDOR tuzatishlari bilan
+        # bir xil qoida: hech qanday yozuvni o'zgartiruvchi so'rov
+        # telegram_id filtrisiz qolmasin).
+        await conn.execute(
+            f"UPDATE categories SET {', '.join(fields)} WHERE id = ${len(args) - 1} AND telegram_id = ${len(args)}",
+            *args)
+        row = await conn.fetchrow(
+            "SELECT id, name, emoji, type, parent_id, color FROM categories WHERE id = $1", cat_id)
+
+    return {
+        "success": True, "category_id": row["id"], "name": row["name"], "emoji": row["emoji"],
+        "type": row["type"], "parent_id": row["parent_id"], "color": row["color"],
+    }
+
+async def _mcp_delete_category(user_id: int, params: dict) -> dict:
+    cat_id = params.get("id")
+    if cat_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        cat_id = int(cat_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+
+    async with db_pool.acquire() as conn:
+        cat = await conn.fetchrow("SELECT telegram_id FROM categories WHERE id = $1", cat_id)
+        if not cat:
+            return {"error": "not_found", "message": "Kategoriya topilmadi.", "hint": ""}
+
+        if cat["telegram_id"] is None:
+            # Tizim kategoriyasi haqiqatda o'chirilmaydi (hammaga umumiy) —
+            # faqat SHU foydalanuvchi uchun berkitiladi.
+            await conn.execute("""
+                INSERT INTO hidden_categories (telegram_id, category_id)
+                VALUES ($1, $2)
+                ON CONFLICT (telegram_id, category_id) DO NOTHING
+            """, user_id, cat_id)
+            return {
+                "success": True, "action": "hidden",
+                "message": "Bu tizim kategoriyasi — o'chirilmadi, faqat siz uchun berkitildi "
+                           "(boshqa foydalanuvchilarga ta'sir qilmaydi).",
+            }
+
+        if cat["telegram_id"] != user_id:
+            return {"error": "not_found", "message": "Kategoriya topilmadi.", "hint": ""}
+
+        move_to = params.get("move_to_category_id")
+        if move_to is not None:
+            try:
+                move_to = int(move_to)
+            except (TypeError, ValueError):
+                return {"error": "validation_error",
+                        "message": "move_to_category_id butun son bo'lishi kerak.", "hint": ""}
+            target = await conn.fetchrow(
+                "SELECT id FROM categories WHERE id = $1 AND (telegram_id IS NULL OR telegram_id = $2)",
+                move_to, user_id)
+            if not target:
+                return {"error": "not_found", "message": "move_to_category_id topilmadi.", "hint": ""}
+            await conn.execute(
+                "UPDATE transactions SET category_id = $1 WHERE category_id = $2 AND telegram_id = $3",
+                move_to, cat_id, user_id)
+
+        # move_to berilmagan bo'lsa — category_id FK (ON DELETE SET NULL)
+        # o'zi bog'liq tranzaksiyalarni "Aniqlanmagan"ga (category_id=NULL)
+        # o'tkazadi; bola kategoriyalar (parent_id) ham ON DELETE SET NULL
+        # bo'lgani uchun ildizga ko'tariladi.
+        await conn.execute("DELETE FROM categories WHERE id = $1 AND telegram_id = $2", cat_id, user_id)
+
+    return {"success": True, "action": "deleted", "moved_to_category_id": move_to}
 
 
 # ===================== P0: RATE LIMIT, AUDIT LOG, PREMIUM GATE =====================
@@ -7477,6 +7646,9 @@ _MCP_TOOLS = {
     "return_debt":            _mcp_return_debt,
     "partial_return_debt":    _mcp_partial_return_debt,
     "list_closed_debts":      _mcp_list_closed_debts,
+    "create_category":        _mcp_create_category,
+    "update_category":        _mcp_update_category,
+    "delete_category":        _mcp_delete_category,
 }
 
 
@@ -8062,6 +8234,75 @@ _MCP_TOOLS_SCHEMA = [
                 "search": {"type": "string", "description": "Ism bo'yicha qidirish (ixtiyoriy)"},
                 "page":   {"type": "integer"},
                 "limit":  {"type": "integer", "description": "default 20"},
+            },
+        },
+    },
+    {
+        "name": "create_category",
+        "description": (
+            "Yangi SHAXSIY (faqat shu foydalanuvchiga tegishli) kategoriya "
+            "yaratadi.\n\n"
+            "✅ Foydalanuvchi mavjud kategoriyalarga sig'maydigan narsa "
+            "aytsa (list_categories'da yo'q) va buni doimiy kategoriya "
+            "sifatida saqlashni xohlasa ishlating.\n\n"
+            "⚠️ type majburiy, LEKIN parent_id berilsa ixtiyoriy — bunda "
+            "ota-kategoriyaning type'i avtomatik meros olinadi (subkategoriya "
+            "har doim ota bilan bir xil turda: ikkalasi ham income yoki "
+            "ikkalasi ham expense)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name":      {"type": "string"},
+                "type":      {"type": "string", "enum": ["income", "expense"], "description": "parent_id berilmasa majburiy"},
+                "emoji":     {"type": "string"},
+                "color":     {"type": "string", "description": "masalan #FF5733 (ixtiyoriy)"},
+                "parent_id": {"type": "integer", "description": "Subkategoriya bo'lsa ota kategoriya ID (ixtiyoriy)"},
+            },
+        },
+    },
+    {
+        "name": "update_category",
+        "description": (
+            "FAQAT o'zingiz yaratgan (create_category orqali) shaxsiy "
+            "kategoriyaning nomi/emoji/rangini yangilaydi.\n\n"
+            "❌ TIZIM kategoriyalarini (list_categories'dagi ko'pchilik) "
+            "tahrirlab bo'lmaydi — chaqirilsa aniq xato qaytaradi. "
+            "Foydalanuvchi tizim kategoriyasini \"o'zgartirmoqchi\" bo'lsa, "
+            "buning o'rniga create_category bilan yangi shaxsiy kategoriya "
+            "yarating."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id":    {"type": "integer"},
+                "name":  {"type": "string"},
+                "emoji": {"type": "string"},
+                "color": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "delete_category",
+        "description": (
+            "Shaxsiy kategoriyani o'chiradi (yozuvlarni move_to_category_id "
+            "bo'lsa boshqa kategoriyaga ko'chirib, bo'lmasa \"Aniqlanmagan\" "
+            "holatiga qoldirib).\n\n"
+            "⚠️ TIZIM kategoriyasi uchun chaqirilsa — HAQIQATDA O'CHMAYDI "
+            "(boshqa foydalanuvchilarga tegishli bo'lgani uchun), balki "
+            "FAQAT shu foydalanuvchi uchun ro'yxatdan berkitiladi "
+            "(natijada action=\"hidden\" qaytadi, action=\"deleted\" emas — "
+            "javobni shunga qarab foydalanuvchiga tushuntiring, masalan "
+            "\"kategoriya sizning ro'yxatingizdan olib tashlandi\")."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id":                  {"type": "integer"},
+                "move_to_category_id": {"type": "integer", "description": "Shu kategoriyadagi yozuvlarni ko'chirish (ixtiyoriy)"},
             },
         },
     },
