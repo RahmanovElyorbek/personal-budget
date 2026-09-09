@@ -1260,6 +1260,46 @@ async def mark_debt_paid(telegram_id: int, debt_id: int, return_balance_id: int 
                 )
             return True
 
+async def partial_return_debt(telegram_id: int, debt_id: int, amount: float,
+                               return_balance_id: int = None) -> "dict | None":
+    """Qarzning bir qismini yopadi. amount qolgan summadan katta/teng bo'lsa
+    — to'liq yopiladi (is_paid=TRUE). Aks holda debts.amount kamayadi,
+    is_paid FALSE qoladi. Qaytaradi: {"applied", "remaining", "fully_paid"}
+    yoki qarz topilmasa/yopilgan bo'lsa None."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            debt = await conn.fetchrow(
+                "SELECT amount, direction FROM debts "
+                "WHERE id = $1 AND telegram_id = $2 AND is_paid = FALSE",
+                debt_id, telegram_id)
+            if not debt:
+                return None
+
+            remaining     = float(debt["amount"])
+            applied       = min(amount, remaining)
+            new_remaining = remaining - applied
+            fully_paid    = new_remaining <= 0.0000001
+
+            if fully_paid:
+                await conn.execute(
+                    "UPDATE debts SET amount = 0, is_paid = TRUE WHERE id = $1 AND telegram_id = $2",
+                    debt_id, telegram_id)
+                new_remaining = 0.0
+            else:
+                await conn.execute(
+                    "UPDATE debts SET amount = $1 WHERE id = $2 AND telegram_id = $3",
+                    new_remaining, debt_id, telegram_id)
+
+            if return_balance_id:
+                # "gave" → ular qisman qaytardi → men oldim → qo'shiladi;
+                # "took" → men qisman qaytardim → men to'ladim → yechiladi
+                delta = applied if debt["direction"] == "gave" else -applied
+                await conn.execute(
+                    "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                    delta, return_balance_id, telegram_id)
+
+            return {"applied": applied, "remaining": new_remaining, "fully_paid": fully_paid}
+
 def _match_debts_by_person(debts: list, person: "str | None") -> list:
     """Ism berilgan bo'lsa — FAQAT o'sha odamning ochiq qarzlarini qaytaradi
     (katta-kichik harfga sezgir emas). Mos kelmasa — bo'sh ro'yxat (chaqiruvchi
@@ -7011,6 +7051,232 @@ async def _mcp_get_debts(user_id: int, params: dict) -> dict:
     }
 
 
+# ===================== BOSQICH 4: QARZLAR =====================
+# ⚠️ get_debts_summary va get_debts_detail QASDDAN ajratilgan (spec talabi):
+# summary'da HECH QACHON odam ismi bo'yicha summa ko'rsatilmaydi — faqat
+# umumiy jami. Aks holda AI umumiy summani bitta odamga bog'lab noto'g'ri
+# javob berib qo'yishi mumkin (Hisobchi AI'dagi tanilgan xato).
+
+_MCP_DEBT_DIRECTIONS = {"gave", "took"}
+
+async def _mcp_get_debts_summary(user_id: int, params: dict) -> dict:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT
+                COALESCE(SUM(amount) FILTER (WHERE direction = 'gave'), 0) AS gave_total,
+                COUNT(DISTINCT person_name) FILTER (WHERE direction = 'gave') AS gave_people,
+                COALESCE(SUM(amount) FILTER (WHERE direction = 'took'), 0) AS took_total,
+                COUNT(DISTINCT person_name) FILTER (WHERE direction = 'took') AS took_people
+            FROM debts
+            WHERE telegram_id = $1 AND is_paid = FALSE
+        """, user_id)
+    return {
+        # "gave" — men bergan, ular menga qaytarishi kerak (menga qarzdor)
+        "gave": {"currency": "UZS", "total": float(row["gave_total"]), "people_count": row["gave_people"]},
+        # "took" — men olgan, men qaytarishim kerak (men qarzdorman)
+        "took": {"currency": "UZS", "total": float(row["took_total"]), "people_count": row["took_people"]},
+    }
+
+async def _mcp_get_debts_detail(user_id: int, params: dict) -> dict:
+    page, limit, offset = _mcp_pagination(params)
+    async with db_pool.acquire() as conn:
+        people_rows = await conn.fetch("""
+            SELECT person_name FROM debts
+            WHERE telegram_id = $1 AND is_paid = FALSE
+            GROUP BY person_name
+            ORDER BY MIN(due_date) ASC NULLS LAST, person_name ASC
+        """, user_id)
+        total_people = len(people_rows)
+        page_names = [r["person_name"] for r in people_rows[offset: offset + limit]]
+
+        items = []
+        if page_names:
+            rows = await conn.fetch("""
+                SELECT id, person_name, amount, direction, due_date, note, created_at
+                FROM debts
+                WHERE telegram_id = $1 AND is_paid = FALSE AND person_name = ANY($2::text[])
+                ORDER BY person_name, created_at DESC
+            """, user_id, page_names)
+            grouped: dict = {}
+            for r in rows:
+                grouped.setdefault(r["person_name"], []).append({
+                    "id": r["id"],
+                    "amount": float(r["amount"]),
+                    "direction": r["direction"],
+                    "due_date": r["due_date"].isoformat() if r["due_date"] else None,
+                    "note": r.get("note", ""),
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                })
+            for name in page_names:
+                debts = grouped.get(name, [])
+                items.append({
+                    "person_name": name,
+                    "gave_total": sum(d["amount"] for d in debts if d["direction"] == "gave"),
+                    "took_total": sum(d["amount"] for d in debts if d["direction"] == "took"),
+                    "debts": debts,
+                })
+
+    return {
+        "items": items,
+        "summaries": {"count": total_people},
+        "meta": {"page": page, "limit": limit, "hasMore": offset + len(items) < total_people},
+    }
+
+async def _mcp_add_debt(user_id: int, params: dict) -> dict:
+    person_name = (params.get("person_name") or "").strip()
+    if not person_name:
+        return {"error": "validation_error", "message": "person_name majburiy.", "hint": ""}
+
+    direction = params.get("direction")
+    if direction not in _MCP_DEBT_DIRECTIONS:
+        return {"error": "validation_error",
+                "message": "direction 'gave' (men berdim) yoki 'took' (men oldim) bo'lishi kerak.", "hint": ""}
+    try:
+        amount = float(params.get("amount"))
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "amount son bo'lishi kerak.", "hint": ""}
+    if amount <= 0:
+        return {"error": "validation_error", "message": "amount musbat bo'lishi kerak.", "hint": ""}
+
+    deadline = None
+    if params.get("deadline"):
+        try:
+            deadline = date.fromisoformat(params["deadline"])
+        except ValueError:
+            return {"error": "validation_error", "message": "deadline YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
+
+    note = params.get("comment", "") or ""
+
+    balance_id = None
+    if params.get("sync_to_balance"):
+        balance_id = params.get("balance_id")
+        bals = await get_balances(user_id)
+        if balance_id is not None:
+            try:
+                balance_id = int(balance_id)
+            except (TypeError, ValueError):
+                return {"error": "validation_error", "message": "balance_id butun son bo'lishi kerak.", "hint": ""}
+            if not any(b["id"] == balance_id for b in bals):
+                return {"error": "not_found", "message": "balance_id topilmadi.", "hint": ""}
+        else:
+            balance_id = bals[0]["id"] if bals else None
+
+    await add_debt(user_id, person_name, amount, direction, deadline, note, balance_id)
+    return {"success": True, "person_name": person_name, "amount": amount,
+            "direction": direction, "synced_to_balance": balance_id is not None}
+
+async def _mcp_return_debt(user_id: int, params: dict) -> dict:
+    debt_id = params.get("id")
+    if debt_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        debt_id = int(debt_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+
+    return_balance_id = None
+    if params.get("sync_to_balance"):
+        async with db_pool.acquire() as conn:
+            debt_row = await conn.fetchrow(
+                "SELECT balance_id FROM debts WHERE id = $1 AND telegram_id = $2 AND is_paid = FALSE",
+                debt_id, user_id)
+        if debt_row and debt_row["balance_id"]:
+            return_balance_id = debt_row["balance_id"]
+        else:
+            bals = await get_balances(user_id)
+            return_balance_id = bals[0]["id"] if bals else None
+
+    ok = await mark_debt_paid(user_id, debt_id, return_balance_id=return_balance_id)
+    if not ok:
+        return {"error": "not_found", "message": "Ochiq qarz topilmadi.", "hint": ""}
+
+    if params.get("comment"):
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE debts SET note = note || $1 WHERE id = $2 AND telegram_id = $3",
+                f" | {params['comment']}", debt_id, user_id)
+
+    return {"success": True, "debt_id": debt_id, "synced_to_balance": return_balance_id is not None}
+
+async def _mcp_partial_return_debt(user_id: int, params: dict) -> dict:
+    debt_id = params.get("id")
+    if debt_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        debt_id = int(debt_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+    try:
+        amount = float(params.get("amount"))
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "amount son bo'lishi kerak.", "hint": ""}
+    if amount <= 0:
+        return {"error": "validation_error", "message": "amount musbat bo'lishi kerak.", "hint": ""}
+
+    return_balance_id = None
+    if params.get("sync_to_balance"):
+        async with db_pool.acquire() as conn:
+            debt_row = await conn.fetchrow(
+                "SELECT balance_id FROM debts WHERE id = $1 AND telegram_id = $2 AND is_paid = FALSE",
+                debt_id, user_id)
+        if debt_row and debt_row["balance_id"]:
+            return_balance_id = debt_row["balance_id"]
+        else:
+            bals = await get_balances(user_id)
+            return_balance_id = bals[0]["id"] if bals else None
+
+    result = await partial_return_debt(user_id, debt_id, amount, return_balance_id=return_balance_id)
+    if result is None:
+        return {"error": "not_found", "message": "Ochiq qarz topilmadi.", "hint": ""}
+
+    if params.get("comment"):
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE debts SET note = note || $1 WHERE id = $2 AND telegram_id = $3",
+                f" | {params['comment']}", debt_id, user_id)
+
+    return {
+        "success": True, "debt_id": debt_id,
+        "applied": result["applied"], "remaining": result["remaining"],
+        "fully_paid": result["fully_paid"], "synced_to_balance": return_balance_id is not None,
+    }
+
+async def _mcp_list_closed_debts(user_id: int, params: dict) -> dict:
+    search = (params.get("search") or "").strip()
+    page, limit, offset = _mcp_pagination(params)
+
+    where = "WHERE telegram_id = $1 AND is_paid = TRUE"
+    args: list = [user_id]
+    if search:
+        where += f" AND LOWER(person_name) LIKE ${len(args) + 1}"
+        args.append(f"%{search.lower()}%")
+
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM debts {where}", *args)
+        rows = await conn.fetch(
+            f"SELECT id, person_name, amount, direction, due_date, note, created_at FROM debts {where} "
+            f"ORDER BY created_at DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}",
+            *args, limit, offset,
+        )
+    items = [
+        {
+            "id": r["id"], "person_name": r["person_name"], "amount": float(r["amount"]),
+            "direction": r["direction"],
+            "due_date": r["due_date"].isoformat() if r["due_date"] else None,
+            "note": r.get("note", ""),
+            # DB'da qarz qachon YOPILGANI alohida saqlanmaydi (paid_at ustuni
+            # yo'q) — faqat yaratilgan sana bor, shuni beramiz.
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+    return {
+        "items": items,
+        "summaries": {"count": total},
+        "meta": {"page": page, "limit": limit, "hasMore": offset + len(items) < total},
+    }
+
+
 # ===================== BOSQICH 1: FUNDAMENT (whoami, profil, kategoriyalar) =====
 
 async def _mcp_whoami(user_id: int, params: dict) -> dict:
@@ -7205,6 +7471,12 @@ _MCP_TOOLS = {
     "get_category_stats":     _mcp_get_category_stats,
     "get_balance_timeseries": _mcp_get_balance_timeseries,
     "compare_periods":        _mcp_compare_periods,
+    "get_debts_summary":      _mcp_get_debts_summary,
+    "get_debts_detail":       _mcp_get_debts_detail,
+    "add_debt":               _mcp_add_debt,
+    "return_debt":            _mcp_return_debt,
+    "partial_return_debt":    _mcp_partial_return_debt,
+    "list_closed_debts":      _mcp_list_closed_debts,
 }
 
 
@@ -7329,7 +7601,15 @@ _MCP_TOOLS_SCHEMA = [
     },
     {
         "name": "get_debts",
-        "description": "Get list of active (unpaid) debts",
+        "description": (
+            "Barcha ochiq (to'lanmagan) qarzlarning XOM (guruhlanmagan, "
+            "sahifalanmagan) ro'yxati.\n\n"
+            "✅ Kichik ro'yxat (bir necha o'nlab qarz) uchun tezkor umumiy "
+            "ko'rinish kerak bo'lganda ishlating.\n\n"
+            "❌ \"kimga qancha qarzim bor\" turidagi savolga "
+            "get_debts_detail (odam kesimida guruhlangan) yaxshiroq. Faqat "
+            "umumiy son/summa kerak bo'lsa get_debts_summary chaqiring."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -7652,6 +7932,136 @@ _MCP_TOOLS_SCHEMA = [
                 "period_b_from": {"type": "string", "format": "date"},
                 "period_b_to":   {"type": "string", "format": "date"},
                 "side":          {"type": "string", "enum": ["income", "expense"]},
+            },
+        },
+    },
+    {
+        "name": "get_debts_summary",
+        "description": (
+            "Qarzlarning FAQAT umumiy jami — har yo'nalish (gave/took) "
+            "uchun jami summa va nechta odam bilan bog'liqligi.\n\n"
+            "✅ \"jami qancha qarzim bor\", \"nechta odamga qarzdorman\" "
+            "kabi UMUMIY savollarga ishlating.\n\n"
+            "⚠️⚠️⚠️ BU YERDA HECH QANDAY SHAXSIY (odam bo'yicha) SUMMA "
+            "YO'Q — faqat umumiy jami. \"Kim qancha qarzdor\", \"Aliga "
+            "qancha qarzim bor\" savoliga get_debts_detail chaqiring. "
+            "Umumiy summani BITTA ODAMGA BOG'LAB javob berish — NOTO'G'RI "
+            "va XATO javob (bu ustida ayniqsa ehtiyot bo'ling — bu eng "
+            "keng tarqalgan xato)."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_debts_detail",
+        "description": (
+            "Ochiq qarzlar — ODAM KESIMIDA GURUHLANGAN (har odam uchun "
+            "o'z gave_total/took_total va shu odamning barcha alohida "
+            "qarz yozuvlari — id/summa/muddat/izoh bilan), sahifalangan.\n\n"
+            "✅ SHU TOOL'NI ishlating: \"kimlarga qarzim bor\", \"Aliga "
+            "qancha qarzim bor\", \"kim menga qarzdor\" — har qanday "
+            "SHAXSGA BOG'LIQ savolga.\n\n"
+            "❌ Faqat umumiy jami kerak bo'lsa get_debts_summary yetarli "
+            "va soddaroq.\n\n"
+            "⚠️ Sahifalash ODAM darajasida (bir sahifada N ta odam, har "
+            "birining barcha qarzlari to'liq ko'rsatiladi)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "page":  {"type": "integer", "description": "default 1"},
+                "limit": {"type": "integer", "description": "Sahifadagi ODAMLAR soni, default 20"},
+            },
+        },
+    },
+    {
+        "name": "add_debt",
+        "description": (
+            "Yangi qarz yozuvi qo'shadi.\n\n"
+            "✅ \"Aliga 500 ming berdim\", \"Vali 200 ming qarz berdi\" "
+            "kabi xabarlarga ishlating.\n\n"
+            "⚠️ direction: \"gave\" = MEN berdim (ular menga qaytarishi "
+            "kerak, menga qarzdor), \"took\" = MEN oldim (men qaytarishim "
+            "kerak, men qarzdorman). Bu get_debts/get_debts_detail "
+            "natijasidagi direction bilan bir xil qiymatlar.\n\n"
+            "sync_to_balance=true bo'lsa, summa darhol tanlangan (yoki "
+            "birinchi) balansdan yechiladi/qo'shiladi — xuddi add_transaction "
+            "kabi, naqd pul qo'lma-qo'l berilgan/olingan bo'lsa ishlating."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["amount", "person_name", "direction"],
+            "properties": {
+                "amount":          {"type": "number"},
+                "person_name":     {"type": "string"},
+                "direction":       {"type": "string", "enum": ["gave", "took"]},
+                "deadline":        {"type": "string", "format": "date", "description": "Qaytarish muddati (ixtiyoriy)"},
+                "comment":         {"type": "string"},
+                "sync_to_balance": {"type": "boolean", "description": "true bo'lsa balansga darhol ta'sir qiladi"},
+                "balance_id":      {"type": "integer", "description": "sync_to_balance=true bo'lganda qaysi balans (ixtiyoriy, berilmasa birinchisi)"},
+            },
+        },
+    },
+    {
+        "name": "return_debt",
+        "description": (
+            "Qarzni TO'LIQ yopadi (is_paid=TRUE).\n\n"
+            "✅ \"Alining qarzini to'liq qaytardi/qaytardim\" kabi aniq "
+            "to'liq yopish holatlarida ishlating.\n\n"
+            "❌ Faqat bir qismi qaytarilgan bo'lsa partial_return_debt "
+            "chaqiring — buni ishlatsangiz qolgan qism ham noto'g'ri "
+            "yopilib qoladi.\n\n"
+            "sync_to_balance=true bo'lsa, qarz o'zi bog'langan balansga "
+            "(yoki bog'lanmagan bo'lsa birinchi balansga) summa qo'shiladi/"
+            "yechiladi."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id":              {"type": "integer"},
+                "sync_to_balance": {"type": "boolean"},
+                "comment":         {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "partial_return_debt",
+        "description": (
+            "Qarzning FAQAT bir qismini yopadi — qolgan summa debts "
+            "yozuvida ochiq qoladi.\n\n"
+            "✅ \"Alining qarzidan 200 ming qaytardi\" kabi — TO'LIQ EMAS, "
+            "qisman qaytarish holatlarida ishlating.\n\n"
+            "⚠️ Agar amount qarzning to'liq (yoki undan ko'p) summasiga "
+            "teng bo'lsa, tool o'zi avtomatik to'liq yopadi (fully_paid=true "
+            "qaytaradi) — bu xato emas, xuddi shunday ishlashi kerak."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["id", "amount"],
+            "properties": {
+                "id":              {"type": "integer"},
+                "amount":          {"type": "number", "description": "Qaytarilgan qism"},
+                "sync_to_balance": {"type": "boolean"},
+                "comment":         {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "list_closed_debts",
+        "description": (
+            "Allaqachon TO'LIQ yopilgan (is_paid=TRUE) qarzlar tarixi, "
+            "sahifalangan.\n\n"
+            "✅ \"avval Aliga qarzim bo'lganmi\", \"yopilgan qarzlarim\" "
+            "kabi tarixiy savollarga ishlating.\n\n"
+            "❌ Ochiq (hali to'lanmagan) qarzlar uchun get_debts_detail "
+            "chaqiring — bu tool faqat yopilganlarni beradi."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "Ism bo'yicha qidirish (ixtiyoriy)"},
+                "page":   {"type": "integer"},
+                "limit":  {"type": "integer", "description": "default 20"},
             },
         },
     },
