@@ -24,6 +24,8 @@ import httpx
 import io
 import base64
 import hashlib
+import hmac
+import html
 import json
 import secrets
 from urllib.parse import quote
@@ -342,6 +344,42 @@ async def init_db():
                 expires_at TIMESTAMP NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )
+        """)
+        # P0: bitta /mcp manzili + har akkaunt uchun doimiy (muddatsiz,
+        # faqat qo'lda bekor qilinadigan) token — /mcp_ulash orqali olinadi.
+        # Ochiq token saqlanmaydi, faqat SHA-256 hash (mcp_api_tokens.token_hash).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS mcp_api_tokens (
+                id           SERIAL PRIMARY KEY,
+                user_id      BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                token_hash   TEXT UNIQUE NOT NULL,
+                label        TEXT NOT NULL,
+                created_at   TIMESTAMP DEFAULT NOW(),
+                last_used_at TIMESTAMP,
+                revoked_at   TIMESTAMP DEFAULT NULL
+            )
+        """)
+        # MCP orqali qilingan har bir chaqiruvning auditi (xavfsizlik va
+        # nosozlikni aniqlash uchun). user_id'ga qasddan FK qo'yilmagan —
+        # muvaffaqiyatsiz/unauthorized urinishlar ham (user aniqlanmasa
+        # NULL bilan) va foydalanuvchi o'chirilgan taqdirda ham audit
+        # tarixi saqlanib qolishi kerak.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS mcp_audit_log (
+                id          SERIAL PRIMARY KEY,
+                user_id     BIGINT,
+                token_ref   TEXT,
+                auth_method TEXT,
+                tool_name   TEXT,
+                params_hash TEXT,
+                status      TEXT NOT NULL,
+                duration_ms INTEGER,
+                ts          TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mcp_audit_log_user_id_ts
+                ON mcp_audit_log(user_id, ts DESC)
         """)
         # ── OAuth 2.1 (MCP Authorization) — Claude va boshqa MCP mijozlar
         # uchun "bitta manzil joylashtirib ulash" tajribasi (PKCE, dynamic
@@ -1464,18 +1502,80 @@ async def create_mcp_token(telegram_id: int) -> str:
         )
     return token
 
-async def validate_mcp_token(token: str) -> "int | None":
-    # Avval OAuth (yangi) access tokenlarni tekshiramiz, keyin eski
-    # /mcp_token statik tokenlarni — ikkalasi ham /mcp uchun amal qiladi.
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+async def create_mcp_api_token(telegram_id: int, label: str) -> str:
+    """P0: /mcp_ulash — muddatsiz (faqat qo'lda bekor qilinadigan) token.
+    Ochiq qiymat faqat shu funksiyadan qaytariladi va HECH QAYERDA
+    saqlanmaydi — bazada faqat SHA-256 hash turadi."""
+    token      = secrets.token_urlsafe(32)
+    token_hash = _sha256_hex(token)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO mcp_api_tokens (user_id, token_hash, label) VALUES ($1, $2, $3)",
+            telegram_id, token_hash, label,
+        )
+    return token
+
+async def list_mcp_api_tokens(telegram_id: int) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, label, created_at, last_used_at
+            FROM mcp_api_tokens
+            WHERE user_id = $1 AND revoked_at IS NULL
+            ORDER BY created_at ASC
+        """, telegram_id)
+    return [dict(r) for r in rows]
+
+async def revoke_mcp_api_token(telegram_id: int, label: str) -> bool:
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE mcp_api_tokens SET revoked_at = NOW()
+            WHERE user_id = $1 AND label = $2 AND revoked_at IS NULL
+        """, telegram_id, label.strip())
+    affected = int(result.split()[-1])
+    return affected > 0
+
+async def _validate_mcp_api_token(token: str) -> "tuple[int, str] | None":
+    """(user_id, token_ref) qaytaradi, topilmasa None. token_ref — audit
+    uchun mcp_api_tokens.id (matn ko'rinishida)."""
+    token_hash = _sha256_hex(token)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, user_id, token_hash FROM mcp_api_tokens
+            WHERE token_hash = $1 AND revoked_at IS NULL
+        """, token_hash)
+        if not row or not hmac.compare_digest(row["token_hash"], token_hash):
+            return None
+        await conn.execute(
+            "UPDATE mcp_api_tokens SET last_used_at = NOW() WHERE id = $1", row["id"]
+        )
+    return row["user_id"], f"api_token:{row['id']}"
+
+async def resolve_mcp_auth(token: str) -> "dict | None":
+    """MCP so'rovidagi Bearer token'ni uchta manba bo'yicha (OAuth access
+    token → doimiy /mcp_ulash tokeni → eski 24 soatlik /mcp_token) tekshiradi
+    va {"user_id", "auth_method", "token_ref"} qaytaradi — audit_log va
+    rate-limit shu ma'lumotdan foydalanadi. Hech biriga mos kelmasa None."""
     user_id = await validate_oauth_access_token(token)
     if user_id:
-        return user_id
+        return {"user_id": user_id, "auth_method": "oauth", "token_ref": _sha256_hex(token)[:16]}
+
+    api_result = await _validate_mcp_api_token(token)
+    if api_result:
+        user_id, token_ref = api_result
+        return {"user_id": user_id, "auth_method": "api_token", "token_ref": token_ref}
+
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT user_id FROM mcp_tokens WHERE token = $1 AND expires_at > NOW()",
             token
         )
-    return row["user_id"] if row else None
+    if row:
+        return {"user_id": row["user_id"], "auth_method": "legacy_mcp_token",
+                "token_ref": _sha256_hex(token)[:16]}
+    return None
 
 # ===================== OAuth 2.1 (MCP Authorization) =====================
 # Claude/boshqa MCP mijozlar uchun "bitta manzil joylashtirib ulash"
@@ -3006,6 +3106,94 @@ async def mcp_login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Claude'da ulanish sahifasiga shu kodni kiriting.",
         parse_mode="HTML",
     )
+
+def _mcp_config_slug(label: str) -> str:
+    slug = "".join(c if c.isalnum() else "-" for c in label.lower()).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "oson-byudjet"
+
+async def mcp_ulash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mcp_ulash [nom] — P0: bitta /mcp manzili uchun doimiy (muddatsiz,
+    faqat qo'lda /mcp_ochirish bilan bekor qilinadigan) token yaratadi.
+    Ochiq qiymat FAQAT shu xabarda ko'rsatiladi, bazada faqat hash saqlanadi
+    — qayta ko'rish imkoni yo'q, yo'qotilsa yangisini oling."""
+    user_id = update.effective_user.id
+    if not await is_user_premium(user_id):
+        await update.message.reply_text(
+            "❌ Bu funksiya faqat premium foydalanuvchilar uchun.",
+            parse_mode="HTML",
+        )
+        return
+
+    label = " ".join(context.args).strip() if context.args else ""
+    if not label:
+        existing = await list_mcp_api_tokens(user_id)
+        label = f"Hisob {len(existing) + 1}"
+
+    token = await create_mcp_api_token(user_id, label)
+    slug = _mcp_config_slug(label)
+    config_snippet = (
+        "{\n"
+        '  "mcpServers": {\n'
+        f'    "{slug}": {{\n'
+        f'      "url": "{WEBHOOK_URL}/mcp",\n'
+        '      "headers": { "Authorization": "Bearer ' + token + '" }\n'
+        "    }\n"
+        "  }\n"
+        "}"
+    )
+    await update.message.reply_text(
+        "🔑 <b>Yangi MCP token yaratildi</b>\n\n"
+        f"Nom: <b>{html.escape(label)}</b>\n\n"
+        f"<code>{token}</code>\n\n"
+        "⚠️ Bu token <b>faqat shu yerda, bir marta</b> ko'rsatiladi — saqlab qo'ying.\n"
+        "⏰ Muddatsiz amal qiladi, faqat <code>/mcp_ochirish</code> orqali bekor qilinadi.\n\n"
+        "<b>Claude Desktop config (claude_desktop_config.json):</b>\n"
+        f"<pre>{html.escape(config_snippet)}</pre>",
+        parse_mode="HTML",
+    )
+
+async def mcp_royxat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mcp_royxat — faol (bekor qilinmagan) MCP tokenlar ro'yxati."""
+    user_id = update.effective_user.id
+    tokens = await list_mcp_api_tokens(user_id)
+    if not tokens:
+        await update.message.reply_text(
+            "📋 Faol MCP tokeningiz yo'q. <code>/mcp_ulash</code> orqali yangi token oling.",
+            parse_mode="HTML",
+        )
+        return
+    lines = ["📋 <b>Faol MCP tokenlar:</b>\n"]
+    for t in tokens:
+        last_used = (t["last_used_at"].strftime("%d.%m.%Y %H:%M")
+                     if t["last_used_at"] else "hali ishlatilmagan")
+        lines.append(f"• <b>{html.escape(t['label'])}</b> — oxirgi ishlatilgan: {last_used}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def mcp_ochirish_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mcp_ochirish <nom> — berilgan nomdagi faol tokenni bekor qiladi."""
+    user_id = update.effective_user.id
+    label = " ".join(context.args).strip() if context.args else ""
+    if not label:
+        await update.message.reply_text(
+            "❗️ Nomini ko'rsating: <code>/mcp_ochirish Asosiy akkaunt</code>\n"
+            "Nomlarni <code>/mcp_royxat</code> orqali ko'rishingiz mumkin.",
+            parse_mode="HTML",
+        )
+        return
+    ok = await revoke_mcp_api_token(user_id, label)
+    if ok:
+        await update.message.reply_text(
+            f"🗑 <b>{html.escape(label)}</b> tokeni bekor qilindi.",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ <b>{html.escape(label)}</b> nomli faol token topilmadi.\n"
+            "Nomlarni <code>/mcp_royxat</code> orqali tekshiring.",
+            parse_mode="HTML",
+        )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
@@ -5973,6 +6161,60 @@ async def _mcp_get_debts(user_id: int, params: dict) -> dict:
     }
 
 
+# ===================== P0: RATE LIMIT, AUDIT LOG, PREMIUM GATE =====================
+
+_MCP_RATE_LIMIT_WINDOW = 60.0   # soniya
+_MCP_RATE_LIMIT_MAX    = 60     # bitta token uchun oynada ruxsat etilgan so'rov soni
+# Xotiradagi holat — Render'da WEB_CONCURRENCY=1 (bitta worker) bo'lgani
+# uchun jarayonlar orasida nomuvofiqlik yo'q, Redis shart emas (xuddi
+# _start_cache uslubida). Foydalanuvchilar soni kam bo'lgani uchun bu
+# dict cheksiz o'smaydi (amalda bir necha o'nlab token).
+_mcp_rate_limit_state: dict = {}
+
+def _mcp_rate_limited(token: str) -> bool:
+    now = time.monotonic()
+    hits = _mcp_rate_limit_state.setdefault(token, [])
+    cutoff = now - _MCP_RATE_LIMIT_WINDOW
+    while hits and hits[0] < cutoff:
+        hits.pop(0)
+    if len(hits) >= _MCP_RATE_LIMIT_MAX:
+        return True
+    hits.append(now)
+    return False
+
+async def _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, params, status, duration_ms):
+    """Audit yozuvi hech qachon asosiy javobni buzmasligi kerak — xato
+    bo'lsa faqat logga yoziladi, foydalanuvchiga xato qaytarilmaydi."""
+    params_hash = None
+    if params:
+        try:
+            params_hash = _sha256_hex(json.dumps(params, sort_keys=True, default=str))
+        except Exception:
+            params_hash = None
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO mcp_audit_log
+                    (user_id, token_ref, auth_method, tool_name, params_hash, status, duration_ms)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """, user_id, token_ref, auth_method, tool_name, params_hash, status, duration_ms)
+    except Exception:
+        logger.exception("mcp_audit_log yozib bo'lmadi")
+
+async def _mcp_premium_gate(user_id: int) -> "dict | None":
+    """Section 5: MCP orqali haqiqiy tool chaqirish (whoami/get_profile
+    bundan mustasno — ular Bosqich 1'da qo'shiladi) premium obuna talab
+    qiladi. Ruxsat bo'lsa None, aks holda foydalanuvchiga ko'rsatiladigan
+    (sotuv matni vazifasini ham bajaradigan) xato qaytaradi."""
+    if await is_user_premium(user_id):
+        return None
+    return {
+        "error": "premium_required",
+        "message": "MCP orqali kirish premium obuna talab qiladi. Botda /premium buyrug'i orqali faollashtiring.",
+        "upgrade_url": "https://t.me/monthbudget_bot?start=premium",
+    }
+
+
 _MCP_TOOLS = {
     "get_transactions": _mcp_get_transactions,
     "add_transaction":  _mcp_add_transaction,
@@ -5986,20 +6228,45 @@ async def mcp_manifest_handler(request: web.Request) -> web.Response:
 
 
 async def mcp_tool_handler(request: web.Request) -> web.Response:
+    t0 = time.monotonic()
+    tool_name = request.match_info.get("tool_name")
+
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
+        await _mcp_write_audit_log(None, None, None, tool_name, None,
+                                    "unauthorized", int((time.monotonic() - t0) * 1000))
         return web.json_response(
             {"error": "Unauthorized"}, status=401,
             headers={"WWW-Authenticate": _mcp_www_authenticate(request)},
         )
 
-    user_id = await validate_mcp_token(auth[7:])
-    if not user_id:
+    token = auth[7:]
+    auth_info = await resolve_mcp_auth(token)
+    if not auth_info:
+        await _mcp_write_audit_log(None, None, None, tool_name, None,
+                                    "unauthorized", int((time.monotonic() - t0) * 1000))
         return web.json_response({"error": "Invalid or expired token"}, status=401)
+    user_id, auth_method, token_ref = auth_info["user_id"], auth_info["auth_method"], auth_info["token_ref"]
 
-    tool_name = request.match_info["tool_name"]
-    handler   = _MCP_TOOLS.get(tool_name)
+    if _mcp_rate_limited(token):
+        await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
+                                    "rate_limited", int((time.monotonic() - t0) * 1000))
+        return web.json_response({
+            "error": "rate_limited",
+            "message": "Juda ko'p so'rov yuborildi. Bir daqiqadan keyin qayta urinib ko'ring.",
+            "hint": "Bitta token uchun daqiqasiga 60 tadan ko'p chaqiruvga ruxsat yo'q.",
+        }, status=429)
+
+    gate_error = await _mcp_premium_gate(user_id)
+    if gate_error:
+        await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
+                                    "premium_required", int((time.monotonic() - t0) * 1000))
+        return web.json_response(gate_error, status=402)
+
+    handler = _MCP_TOOLS.get(tool_name)
     if handler is None:
+        await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
+                                    "not_found", int((time.monotonic() - t0) * 1000))
         return web.json_response(
             {"error": f"Unknown tool: {tool_name}",
              "available": list(_MCP_TOOLS.keys())},
@@ -6015,8 +6282,12 @@ async def mcp_tool_handler(request: web.Request) -> web.Response:
         result = await handler(user_id, params)
     except Exception as e:
         logger.exception("MCP tool error: %s", tool_name)
+        await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, params,
+                                    "internal_error", int((time.monotonic() - t0) * 1000))
         return web.json_response({"error": str(e)}, status=500)
 
+    await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, params,
+                                "ok", int((time.monotonic() - t0) * 1000))
     return web.json_response(result)
 
 
@@ -6088,8 +6359,11 @@ def _mcp_www_authenticate(request: "web.Request | None" = None) -> str:
     return f'Bearer resource_metadata="{WEBHOOK_URL}/.well-known/oauth-protected-resource"'
 
 async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
+    t0 = time.monotonic()
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
+        await _mcp_write_audit_log(None, None, None, None, None,
+                                    "unauthorized", int((time.monotonic() - t0) * 1000))
         return web.Response(
             text='{"error":"Unauthorized"}',
             content_type="application/json",
@@ -6097,9 +6371,13 @@ async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
             headers={"WWW-Authenticate": _mcp_www_authenticate(request)},
         )
 
-    user_id = await validate_mcp_token(auth[7:])
-    if not user_id:
+    token = auth[7:]
+    auth_info = await resolve_mcp_auth(token)
+    if not auth_info:
+        await _mcp_write_audit_log(None, None, None, None, None,
+                                    "unauthorized", int((time.monotonic() - t0) * 1000))
         return _jsonrpc_err(None, -32000, "Invalid or expired token")
+    user_id, auth_method, token_ref = auth_info["user_id"], auth_info["auth_method"], auth_info["token_ref"]
 
     try:
         body = await request.json()
@@ -6130,16 +6408,37 @@ async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
     if method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments") or {}
-        handler   = _MCP_TOOLS.get(tool_name)
+
+        if _mcp_rate_limited(token):
+            await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
+                                        "rate_limited", int((time.monotonic() - t0) * 1000))
+            return _jsonrpc_err(req_id, -32029, "rate_limited: 1 daqiqada 60 tadan ko'p chaqiruvga ruxsat yo'q")
+
+        gate_error = await _mcp_premium_gate(user_id)
+        if gate_error:
+            await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
+                                        "premium_required", int((time.monotonic() - t0) * 1000))
+            return _jsonrpc_ok(req_id, {
+                "content": [{"type": "text", "text": json.dumps(gate_error, ensure_ascii=False, indent=2)}],
+                "isError": True,
+            })
+
+        handler = _MCP_TOOLS.get(tool_name)
         if handler is None:
+            await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
+                                        "not_found", int((time.monotonic() - t0) * 1000))
             return _jsonrpc_err(req_id, -32601, f"Unknown tool: {tool_name}")
         try:
             tool_result = await handler(user_id, arguments)
+            await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, arguments,
+                                        "ok", int((time.monotonic() - t0) * 1000))
             return _jsonrpc_ok(req_id, {
                 "content": [{"type": "text", "text": json.dumps(tool_result, ensure_ascii=False, indent=2)}]
             })
         except Exception as e:
             logger.exception("MCP tools/call error: %s", tool_name)
+            await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, arguments,
+                                        "internal_error", int((time.monotonic() - t0) * 1000))
             return _jsonrpc_err(req_id, -32000, str(e))
 
     return _jsonrpc_err(req_id, -32601, f"Method not found: {method}")
@@ -6394,6 +6693,9 @@ async def main():
     app.add_handler(CommandHandler("oxirgi", recent_command))
     app.add_handler(CommandHandler("mcp_token", mcp_token_command))
     app.add_handler(CommandHandler("mcp_login", mcp_login_command))
+    app.add_handler(CommandHandler("mcp_ulash", mcp_ulash_command))
+    app.add_handler(CommandHandler("mcp_royxat", mcp_royxat_command))
+    app.add_handler(CommandHandler("mcp_ochirish", mcp_ochirish_command))
     app.add_handler(CommandHandler("testreminder", admin_test_reminder))
     app.add_handler(CommandHandler("adminstats", admin_stats))
     app.add_handler(CallbackQueryHandler(button_handler))
