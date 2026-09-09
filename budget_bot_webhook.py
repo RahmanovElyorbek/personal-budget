@@ -7562,6 +7562,156 @@ async def _mcp_delete_category(user_id: int, params: dict) -> dict:
     return {"success": True, "action": "deleted", "moved_to_category_id": move_to}
 
 
+# ===================== BOSQICH 6: SOZLAMALAR VA PDF HISOBOT =====================
+# get_budget alohida tool sifatida QO'SHILMADI — get_profile (Bosqich 1)
+# allaqachon monthly_budget qaytaradi, ikkinchi marta ayni narsani
+# qaytaradigan tool ortiqcha bo'lardi.
+#
+# set_language / set_timezone ATAYLAB QO'SHILMADI: bot butunlay bitta tilda
+# (o'zbek, barcha matnlar hardcoded) va bitta vaqt zonasida (Asia/Tashkent,
+# kod bo'ylab pytz.timezone("Asia/Tashkent") to'g'ridan-to'g'ri yozilgan)
+# ishlaydi — buni "o'zgartiradigan" tool qo'shish, aslida hech narsani
+# o'zgartirmaydigan soxta imkoniyat bo'lar edi (foydalanuvchi "ruscha
+# qildim" deb o'ylaydi, lekin bot baribir o'zbekcha javob beraveradi).
+# Haqiqiy i18n/tz infratuzilmasi yo'q holda bunday tool qo'shish
+# aldamchi bo'lgani uchun qoldirilmadi.
+
+REMINDER_ALLOWED_HOURS = (18, 20, 22)  # reminder_settings_keyboard bilan bir xil
+
+async def _mcp_get_notification_settings(user_id: int, params: dict) -> dict:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT reminder_hour FROM users WHERE telegram_id = $1", user_id)
+    hour = row["reminder_hour"] if row else None
+    return {"enabled": hour is not None, "hour": hour}
+
+async def _mcp_update_notification_settings(user_id: int, params: dict) -> dict:
+    enabled = params.get("enabled")
+    hour = params.get("hour")
+
+    if hour is not None:
+        try:
+            hour = int(hour)
+        except (TypeError, ValueError):
+            return {"error": "validation_error", "message": "hour butun son bo'lishi kerak.", "hint": ""}
+        if hour not in REMINDER_ALLOWED_HOURS:
+            return {"error": "validation_error",
+                    "message": f"hour faqat {', '.join(map(str, REMINDER_ALLOWED_HOURS))} bo'lishi mumkin.",
+                    "hint": "Bot bu uchtasidan boshqa vaqtni qo'llab-quvvatlamaydi."}
+        new_hour = hour
+    elif enabled is False:
+        new_hour = None
+    elif enabled is True:
+        new_hour = REMINDER_ALLOWED_HOURS[1]  # 20:00 — standart
+    else:
+        return {"error": "validation_error",
+                "message": "enabled yoki hour dan kamida bittasi berilishi kerak.", "hint": ""}
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET reminder_hour = $1, reminder_miss_streak = 0 WHERE telegram_id = $2",
+            new_hour, user_id)
+    return {"success": True, "enabled": new_hour is not None, "hour": new_hour}
+
+async def _mcp_set_budget(user_id: int, params: dict) -> dict:
+    try:
+        amount = float(params.get("amount"))
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "amount son bo'lishi kerak.", "hint": ""}
+    if amount < 0:
+        return {"error": "validation_error", "message": "amount manfiy bo'lishi mumkin emas.", "hint": ""}
+    if params.get("category_id") is not None:
+        # Hozirgi schema faqat YAGONA (umumiy) oylik budjetni qo'llab-quvvatlaydi
+        # (users.budget) — kategoriya bo'yicha alohida budjet jadvali yo'q.
+        return {"error": "validation_error",
+                "message": "Kategoriya bo'yicha alohida budjet hozircha qo'llab-quvvatlanmaydi — "
+                           "faqat umumiy oylik budjet bor.",
+                "hint": "category_id'siz chaqiring."}
+    await set_budget(user_id, amount)
+    return {"success": True, "monthly_budget": amount}
+
+# PDF hisobotlar xotirada saqlanadi (token -> (bytes, muddati)) — Render'da
+# WEB_CONCURRENCY=1 bo'lgani uchun xavfsiz (xuddi _mcp_rate_limit_state
+# uslubida). Fayl DB'ga yoki diskka yozilmaydi, jarayon qayta ishga
+# tushsa (deploy) yo'qoladi — bu 24 soatlik vaqtinchalik havola uchun
+# yetarli.
+_mcp_pdf_reports: dict = {}
+_MCP_PDF_TTL = timedelta(hours=24)
+
+async def _mcp_generate_pdf_report(user_id: int, params: dict) -> dict:
+    try:
+        from_d = date.fromisoformat(params["from_date"])
+        to_d   = date.fromisoformat(params["to_date"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "validation_error",
+                "message": "from_date va to_date (YYYY-MM-DD) majburiy.", "hint": ""}
+    if from_d > to_d:
+        return {"error": "validation_error", "message": "from_date to_date'dan katta bo'lishi mumkin emas.", "hint": ""}
+
+    async with db_pool.acquire() as conn:
+        user_row = await conn.fetchrow("SELECT name, budget FROM users WHERE telegram_id = $1", user_id)
+        totals = await conn.fetchrow("""
+            SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)  AS income,
+                   COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS expense
+            FROM transactions
+            WHERE telegram_id = $1 AND is_deleted = FALSE
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
+              AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
+        """, user_id, from_d, to_d)
+        cat_rows = await conn.fetch(f"""
+            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
+            FROM transactions t {_MCP_CATEGORY_JOIN}
+            WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = 'expense'
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2
+              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3
+            GROUP BY {_MCP_CATEGORY_GROUPBY}
+            ORDER BY amt DESC
+        """, user_id, from_d, to_d)
+
+    stats = {
+        "income": float(totals["income"]),
+        "expenses": float(totals["expense"]),
+        "balance": float(totals["income"]) - float(totals["expense"]),
+    }
+    cat_stats = {_mcp_category_display(r): float(r["amt"]) for r in cat_rows}
+    user_name = (user_row["name"] if user_row else "") or "Foydalanuvchi"
+    budget = float(user_row["budget"]) if user_row and user_row["budget"] else 0.0
+    period_str = f"{from_d.strftime('%d.%m.%Y')} — {to_d.strftime('%d.%m.%Y')}"
+
+    pdf_bytes = generate_stats_pdf(user_name, stats, cat_stats, budget, period_str)
+
+    token = secrets.token_urlsafe(24)
+    expires_at = datetime.now() + _MCP_PDF_TTL
+    _mcp_pdf_reports[token] = (pdf_bytes, expires_at)
+    # Har yangi hisobotda eskirganlarni tozalaymiz — xotira cheksiz o'smasin
+    # (hech kim havolani qayta ochmasa ham, muddati o'tgan yozuv qolib
+    # ketmaydi).
+    now = datetime.now()
+    for old_token, (_, old_expires) in list(_mcp_pdf_reports.items()):
+        if old_expires < now:
+            _mcp_pdf_reports.pop(old_token, None)
+
+    return {
+        "success": True,
+        "download_url": f"{WEBHOOK_URL}/reports/{token}.pdf",
+        "expires_at": expires_at.isoformat(),
+        "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
+    }
+
+async def mcp_pdf_report_handler(request: web.Request) -> web.Response:
+    token = request.match_info["token"]
+    entry = _mcp_pdf_reports.get(token)
+    if not entry:
+        return web.Response(status=404, text="Hisobot topilmadi yoki muddati tugagan.")
+    pdf_bytes, expires_at = entry
+    if datetime.now() > expires_at:
+        _mcp_pdf_reports.pop(token, None)
+        return web.Response(status=404, text="Hisobot muddati tugagan.")
+    return web.Response(
+        body=pdf_bytes, content_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=hisobot.pdf"},
+    )
+
+
 # ===================== P0: RATE LIMIT, AUDIT LOG, PREMIUM GATE =====================
 
 _MCP_RATE_LIMIT_WINDOW = 60.0   # soniya
@@ -7649,6 +7799,10 @@ _MCP_TOOLS = {
     "create_category":        _mcp_create_category,
     "update_category":        _mcp_update_category,
     "delete_category":        _mcp_delete_category,
+    "set_budget":                       _mcp_set_budget,
+    "get_notification_settings":        _mcp_get_notification_settings,
+    "update_notification_settings":     _mcp_update_notification_settings,
+    "generate_pdf_report":              _mcp_generate_pdf_report,
 }
 
 
@@ -8306,6 +8460,76 @@ _MCP_TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "name": "set_budget",
+        "description": (
+            "Oylik umumiy budjet limitini o'rnatadi.\n\n"
+            "✅ \"oyiga 2 million so'mdan ko'p sarflamayman\" kabi "
+            "xabarlarga ishlating.\n\n"
+            "❌ Joriy budjet qiymatini BILISH uchun BUNI chaqirmang — "
+            "get_profile allaqachon monthly_budget maydonini qaytaradi.\n\n"
+            "⚠️ Hozircha faqat YAGONA umumiy budjet bor — category_id "
+            "bilan chaqirilsa xato qaytaradi (kategoriya bo'yicha alohida "
+            "budjet hali qo'llab-quvvatlanmaydi)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["amount"],
+            "properties": {
+                "amount":      {"type": "number", "description": "Yangi oylik budjet (0 = budjetni o'chirish)"},
+                "category_id": {"type": "integer", "description": "QO'LLAB-QUVVATLANMAYDI — hozircha bermang"},
+            },
+        },
+    },
+    {
+        "name": "get_notification_settings",
+        "description": (
+            "Kunlik eslatma sozlamasi — yoqilganmi va qaysi soatda.\n\n"
+            "✅ \"eslatmam qachon keladi\" kabi savolga ishlating."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "update_notification_settings",
+        "description": (
+            "Kunlik eslatmani yoqadi/o'chiradi yoki vaqtini o'zgartiradi "
+            "(bugun yozuv kiritilmagan bo'lsa yuboriladigan eslatma).\n\n"
+            "✅ \"eslatmani o'chir\", \"eslatmani 22:00 ga o'tkaz\" kabi "
+            "so'rovlarga ishlating.\n\n"
+            "⚠️ hour FAQAT 18, 20 yoki 22 bo'lishi mumkin — bot boshqa "
+            "vaqtni qo'llab-quvvatlamaydi. enabled=false — eslatmani "
+            "o'chiradi. hour berilsa, u avtomatik yoqadi ham (enabled "
+            "alohida berish shart emas)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "false = o'chirish, true = 20:00 (standart) bilan yoqish"},
+                "hour":    {"type": "integer", "enum": [18, 20, 22], "description": "Aniq vaqt bersangiz, alohida enabled shart emas"},
+            },
+        },
+    },
+    {
+        "name": "generate_pdf_report",
+        "description": (
+            "Berilgan davr uchun PDF hisobot yaratadi va 24 soat amal "
+            "qiladigan yuklab olish havolasini qaytaradi.\n\n"
+            "✅ \"shu oy uchun PDF hisobot tayyorla\", \"hisobotni faylga "
+            "chiqarib ber\" kabi so'rovlarga ishlating.\n\n"
+            "⚠️ Bevosita fayl QAYTARMAYDI — faqat download_url (havola). "
+            "Foydalanuvchiga shu havolani yuboring, u brauzerda ochib "
+            "yoki yuklab olishi mumkin. 24 soatdan keyin havola ishlamay "
+            "qoladi."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["from_date", "to_date"],
+            "properties": {
+                "from_date": {"type": "string", "format": "date"},
+                "to_date":   {"type": "string", "format": "date"},
+            },
+        },
+    },
 ]
 
 
@@ -8627,6 +8851,7 @@ async def main():
     web_app.router.add_post("/register", oauth_register_handler)
     web_app.router.add_get("/authorize", oauth_authorize_get_handler)
     web_app.router.add_post("/authorize", oauth_authorize_post_handler)
+    web_app.router.add_get("/reports/{token}.pdf", mcp_pdf_report_handler)
     web_app.router.add_post("/token", oauth_token_handler)
 
     runner = web.AppRunner(web_app)
