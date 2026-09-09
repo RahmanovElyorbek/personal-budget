@@ -7893,15 +7893,37 @@ _MCP_TOOLS_SCHEMA = [
     },
     {
         "name": "add_transaction",
-        "description": "Add a new income or expense transaction",
+        "description": (
+            "Yangi kirim/chiqim tranzaksiyasi qo'shadi (v2 — category_id "
+            "tercih qilinadi), ixtiyoriy ravishda qarz sifatida ham "
+            "belgilash mumkin.\n\n"
+            "✅ SHU TOOL'NI ishlating: foydalanuvchi xarajat/daromad "
+            "haqida gapirganda (\"45 ming taksiga ketdi\", \"oylik "
+            "oldim\").\n\n"
+            "⚠️ MAJBURIY TARTIB: avval get_used_categories (yoki topilmasa "
+            "list_categories) chaqirib category_id oling — category_id "
+            "berilmasa yozuv \"Aniqlanmagan\"ga tushib statistikada "
+            "ko'rinmay qoladi. Eski category (matn) parametri DEPRECATED "
+            "— faqat 1 oy backward-compat uchun saqlangan, yangi "
+            "yozuvlarda ishlatmang.\n\n"
+            "is_debt=true bo'lsa (va debt_name berilsa), tranzaksiya bilan "
+            "BIRGA qarz yozuvi ham yaratiladi (add_debt chaqirishga hojat "
+            "yo'q)."
+        ),
         "inputSchema": {
             "type": "object",
-            "required": ["type", "amount", "category"],
+            "required": ["type", "amount"],
             "properties": {
-                "type":     {"type": "string", "enum": ["income", "expense"]},
-                "amount":   {"type": "number", "description": "Positive amount in UZS"},
-                "category": {"type": "string"},
-                "note":     {"type": "string"},
+                "type":        {"type": "string", "enum": ["income", "expense"]},
+                "amount":      {"type": "number", "description": "Musbat summa (UZS)"},
+                "category_id": {"type": "integer", "description": "Tercih qilinadi — get_used_categories/list_categories'dan"},
+                "category":    {"type": "string", "description": "DEPRECATED — faqat category_id berilmasa, 1 oy backward-compat"},
+                "comment":     {"type": "string", "description": "Izoh (eski 'note' bilan bir xil)"},
+                "date":        {"type": "string", "format": "date", "description": "YYYY-MM-DD, berilmasa hozirgi vaqt"},
+                "balance_id":  {"type": "integer", "description": "Qaysi hisob/balans, berilmasa birinchisi ishlatiladi"},
+                "is_debt":     {"type": "boolean", "description": "true bo'lsa, debt_name bilan birga qarz yozuvi ham yaratiladi"},
+                "debt_name":   {"type": "string", "description": "is_debt=true bo'lsa majburiy — qarzdor/qarz beruvchi ismi"},
+                "deadline":    {"type": "string", "format": "date", "description": "Qarz qaytarish muddati (ixtiyoriy, faqat is_debt=true)"},
             },
         },
     },
