@@ -823,24 +823,28 @@ async def set_budget(telegram_id: int, amount: float):
 
 async def add_transaction(telegram_id: int, txn_type: str,
                           amount: float, category: str, note: str,
-                          balance_id: int = None, date: "datetime | None" = None) -> int:
+                          balance_id: int = None, date: "datetime | None" = None,
+                          category_id: int = None) -> int:
     """Tranzaksiya qo'shish + balansni yangilash. id qaytaradi.
     date berilsa (masalan 'kecha' kabi nisbiy sana aniqlangan bo'lsa) —
-    tranzaksiya shu sana bilan yoziladi, aks holda hozirgi vaqt (NOW())."""
+    tranzaksiya shu sana bilan yoziladi, aks holda hozirgi vaqt (NOW()).
+    category_id — MCP Bosqich 2 (add_transaction v2) uchun; berilmasa
+    (eski chaqiruvchilar, hali category_id'ga o'tmagan) NULL qoladi,
+    transactions.category (matn) ustuni har doim to'ldiriladi."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             if date is not None:
                 tx_id = await conn.fetchval("""
-                    INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id, date)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    INSERT INTO transactions (telegram_id, type, amount, category, category_id, note, balance_id, date)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     RETURNING id
-                """, telegram_id, txn_type, amount, category, note, balance_id, date)
+                """, telegram_id, txn_type, amount, category, category_id, note, balance_id, date)
             else:
                 tx_id = await conn.fetchval("""
-                    INSERT INTO transactions (telegram_id, type, amount, category, note, balance_id)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    INSERT INTO transactions (telegram_id, type, amount, category, category_id, note, balance_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                     RETURNING id
-                """, telegram_id, txn_type, amount, category, note, balance_id)
+                """, telegram_id, txn_type, amount, category, category_id, note, balance_id)
 
             if balance_id:
                 # AND telegram_id = $3 — xavfsizlik: balance_id foydalanuvchi
@@ -862,8 +866,8 @@ async def add_transaction(telegram_id: int, txn_type: str,
 async def get_transaction(telegram_id: int, tx_id: int):
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT id, type, amount, category, note, balance_id, date, created_at "
-            "FROM transactions WHERE id = $1 AND telegram_id = $2",
+            "SELECT id, type, amount, category, category_id, note, balance_id, date, created_at "
+            "FROM transactions WHERE id = $1 AND telegram_id = $2 AND is_deleted = FALSE",
             tx_id, telegram_id)
 
 async def count_transactions(telegram_id: int) -> int:
@@ -906,19 +910,24 @@ async def delete_transaction(telegram_id: int, tx_id: int) -> bool:
             return True
 
 async def update_transaction(telegram_id: int, tx_id: int,
-                             new_amount=None, new_type=None, new_category=None) -> bool:
+                             new_amount=None, new_type=None, new_category=None,
+                             new_category_id=None, new_note=None, new_date=None) -> bool:
+    """Faqat berilgan maydonlar yangilanadi. Balans (balance_id) BU YERDA
+    o'zgartirilmaydi — balans/hisob almashtirish kerak bo'lsa
+    replace_transaction() dan foydalaning (MCP Bosqich 2)."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             tx = await conn.fetchrow(
-                "SELECT type, amount, category, balance_id FROM transactions "
-                "WHERE id = $1 AND telegram_id = $2", tx_id, telegram_id)
+                "SELECT type, amount, category, category_id, balance_id FROM transactions "
+                "WHERE id = $1 AND telegram_id = $2 AND is_deleted = FALSE", tx_id, telegram_id)
             if not tx:
                 return False
 
             old_type, old_amt, bal_id = tx["type"], float(tx["amount"]), tx["balance_id"]
-            f_type = new_type or old_type
-            f_amt  = float(new_amount) if new_amount is not None else old_amt
-            f_cat  = new_category if new_category is not None else tx["category"]
+            f_type    = new_type or old_type
+            f_amt     = float(new_amount) if new_amount is not None else old_amt
+            f_cat     = new_category if new_category is not None else tx["category"]
+            f_cat_id  = new_category_id if new_category_id is not None else tx["category_id"]
 
             if bal_id:
                 # eski effektni qaytar (AND telegram_id — pastga qarang)
@@ -940,12 +949,108 @@ async def update_transaction(telegram_id: int, tx_id: int,
                         "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
                         f_amt, bal_id, telegram_id)
 
-            await conn.execute(
-                "UPDATE transactions SET type = $1, amount = $2, category = $3 "
-                "WHERE id = $4 AND telegram_id = $5",
-                f_type, f_amt, f_cat, tx_id, telegram_id)
+            if new_note is not None and new_date is not None:
+                await conn.execute(
+                    "UPDATE transactions SET type = $1, amount = $2, category = $3, "
+                    "category_id = $4, note = $5, date = $6 WHERE id = $7 AND telegram_id = $8",
+                    f_type, f_amt, f_cat, f_cat_id, new_note, new_date, tx_id, telegram_id)
+            elif new_note is not None:
+                await conn.execute(
+                    "UPDATE transactions SET type = $1, amount = $2, category = $3, "
+                    "category_id = $4, note = $5 WHERE id = $6 AND telegram_id = $7",
+                    f_type, f_amt, f_cat, f_cat_id, new_note, tx_id, telegram_id)
+            elif new_date is not None:
+                await conn.execute(
+                    "UPDATE transactions SET type = $1, amount = $2, category = $3, "
+                    "category_id = $4, date = $5 WHERE id = $6 AND telegram_id = $7",
+                    f_type, f_amt, f_cat, f_cat_id, new_date, tx_id, telegram_id)
+            else:
+                await conn.execute(
+                    "UPDATE transactions SET type = $1, amount = $2, category = $3, "
+                    "category_id = $4 WHERE id = $5 AND telegram_id = $6",
+                    f_type, f_amt, f_cat, f_cat_id, tx_id, telegram_id)
             invalidate_start_cache(telegram_id)
             return True
+
+async def soft_delete_transaction(telegram_id: int, tx_id: int) -> bool:
+    """MCP delete_transaction uchun — qator FIZIK o'chirilmaydi
+    (is_deleted = TRUE), balans effekti esa qaytariladi. Telegram
+    botning o'z 'O'chirish' tugmasi hamon delete_transaction() (fizik
+    o'chirish + 15 soniyalik undo-kesh) orqali ishlaydi — bu yerga
+    tegishli emas."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            tx = await conn.fetchrow(
+                "SELECT type, amount, balance_id FROM transactions "
+                "WHERE id = $1 AND telegram_id = $2 AND is_deleted = FALSE", tx_id, telegram_id)
+            if not tx:
+                return False
+            if tx["balance_id"]:
+                if tx["type"] == "income":
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
+                        tx["amount"], tx["balance_id"], telegram_id)
+                else:
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                        tx["amount"], tx["balance_id"], telegram_id)
+            await conn.execute(
+                "UPDATE transactions SET is_deleted = TRUE WHERE id = $1 AND telegram_id = $2",
+                tx_id, telegram_id)
+            invalidate_start_cache(telegram_id)
+            return True
+
+async def replace_transaction(telegram_id: int, tx_id: int, txn_type: str, amount: float,
+                              category: str, category_id: "int | None", note: str,
+                              balance_id: "int | None", tx_date: "datetime | None" = None) -> "int | None":
+    """Eskisini soft-delete qiladi (balans effekti qaytariladi) va bitta
+    DB tranzaksiyasi ichida yangisini yaratadi (balans/hisob va boshqa
+    barcha maydonlar butunlay almashtiriladi). Yangi tranzaksiya id'sini
+    qaytaradi, eskisi topilmasa None."""
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            old = await conn.fetchrow(
+                "SELECT type, amount, balance_id FROM transactions "
+                "WHERE id = $1 AND telegram_id = $2 AND is_deleted = FALSE", tx_id, telegram_id)
+            if not old:
+                return None
+            if old["balance_id"]:
+                if old["type"] == "income":
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
+                        old["amount"], old["balance_id"], telegram_id)
+                else:
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                        old["amount"], old["balance_id"], telegram_id)
+            await conn.execute(
+                "UPDATE transactions SET is_deleted = TRUE WHERE id = $1 AND telegram_id = $2",
+                tx_id, telegram_id)
+
+            if tx_date is not None:
+                new_id = await conn.fetchval("""
+                    INSERT INTO transactions (telegram_id, type, amount, category, category_id, note, balance_id, date)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id
+                """, telegram_id, txn_type, amount, category, category_id, note, balance_id, tx_date)
+            else:
+                new_id = await conn.fetchval("""
+                    INSERT INTO transactions (telegram_id, type, amount, category, category_id, note, balance_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING id
+                """, telegram_id, txn_type, amount, category, category_id, note, balance_id)
+
+            if balance_id:
+                if txn_type == "income":
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                        amount, balance_id, telegram_id)
+                else:
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
+                        amount, balance_id, telegram_id)
+            invalidate_start_cache(telegram_id)
+            return new_id
 
 async def log_category_correction(telegram_id: int, original_text: str,
                                     ai_category: str, corrected_category: str):
@@ -980,16 +1085,18 @@ async def get_recent_transactions(telegram_id: int, limit: int = 8):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, type, amount, category, note, date FROM transactions "
-            "WHERE telegram_id = $1 ORDER BY date DESC LIMIT $2", telegram_id, limit)
+            "WHERE telegram_id = $1 AND is_deleted = FALSE ORDER BY date DESC LIMIT $2",
+            telegram_id, limit)
         return [dict(r) for r in rows]
 
 async def get_month_transactions(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT t.type, t.amount, t.category, t.note, t.date, b.name AS balance_name
+            SELECT t.id, t.type, t.amount, t.category, t.category_id, t.note, t.date, b.name AS balance_name
             FROM transactions t
             LEFT JOIN balances b ON t.balance_id = b.id
             WHERE t.telegram_id = $1
+              AND t.is_deleted = FALSE
               AND DATE_TRUNC('month', t.date) = DATE_TRUNC('month', NOW())
             ORDER BY t.date DESC
         """, telegram_id)
@@ -998,10 +1105,11 @@ async def get_month_transactions(telegram_id: int) -> list:
 async def get_transactions_by_month(telegram_id: int, year: int, month: int) -> list:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT t.type, t.amount, t.category, t.note, t.date, b.name AS balance_name
+            SELECT t.id, t.type, t.amount, t.category, t.category_id, t.note, t.date, b.name AS balance_name
             FROM transactions t
             LEFT JOIN balances b ON t.balance_id = b.id
             WHERE t.telegram_id = $1
+              AND t.is_deleted = FALSE
               AND EXTRACT(YEAR FROM t.date) = $2
               AND EXTRACT(MONTH FROM t.date) = $3
             ORDER BY t.date DESC
@@ -1024,10 +1132,11 @@ async def get_available_months(telegram_id: int) -> list:
 async def get_transactions_by_date_range(telegram_id: int, start_date, end_date) -> list:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT t.type, t.amount, t.category, t.note, t.date, b.name AS balance_name
+            SELECT t.id, t.type, t.amount, t.category, t.category_id, t.note, t.date, b.name AS balance_name
             FROM transactions t
             LEFT JOIN balances b ON t.balance_id = b.id
             WHERE t.telegram_id = $1
+              AND t.is_deleted = FALSE
               AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2
               AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3
             ORDER BY t.date DESC
@@ -6198,26 +6307,346 @@ async def _mcp_get_transactions(user_id: int, params: dict) -> dict:
     }
 
 
+async def _mcp_resolve_category(user_id: int, category_id, category_text: "str | None"):
+    """add_transaction/update_transaction/replace_transaction uchun umumiy:
+    category_id (tercih qilinadi) yoki eski category matn parametrini hal
+    qiladi. Qaytaradi: (category_id, category_text_db_uchun, xato_dict|None)."""
+    if category_id is not None:
+        try:
+            category_id = int(category_id)
+        except (TypeError, ValueError):
+            return None, "", {"error": "validation_error",
+                              "message": "category_id butun son bo'lishi kerak.", "hint": ""}
+        async with db_pool.acquire() as conn:
+            cat = await conn.fetchrow("""
+                SELECT name, emoji FROM categories
+                WHERE id = $1 AND (telegram_id IS NULL OR telegram_id = $2) AND is_hidden = FALSE
+            """, category_id, user_id)
+        if not cat:
+            return None, "", {
+                "error": "not_found", "message": "category_id topilmadi.",
+                "hint": "list_categories yoki get_used_categories orqali to'g'ri ID oling.",
+            }
+        text = f"{cat['emoji']} {cat['name']}".strip()
+        return category_id, text, None
+    # DEPRECATED: eski matn-based category — 1 oy backward-compat.
+    return None, (category_text or "📦 Boshqa").strip(), None
+
 async def _mcp_add_transaction(user_id: int, params: dict) -> dict:
+    """add_transaction v2: category_id (tercih qilinadi) yoki eski
+    deprecated category matn parametri, ixtiyoriy date/balance_id/qarz
+    integratsiyasi bilan."""
     txn_type = params.get("type")
-    amount   = params.get("amount")
-    category = params.get("category", "Boshqa")
-    note     = params.get("note", "")
-
     if txn_type not in ("income", "expense"):
-        return {"error": "type must be 'income' or 'expense'"}
+        return {"error": "validation_error",
+                "message": "type 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
     try:
-        amount = float(amount)
+        amount = float(params.get("amount"))
     except (TypeError, ValueError):
-        return {"error": "amount must be a positive number"}
+        return {"error": "validation_error", "message": "amount son bo'lishi kerak.", "hint": ""}
     if amount <= 0:
-        return {"error": "amount must be positive"}
+        return {"error": "validation_error", "message": "amount musbat bo'lishi kerak.", "hint": ""}
 
-    balances   = await get_balances(user_id)
-    balance_id = balances[0]["id"] if balances else None
+    category_id, category_text, err = await _mcp_resolve_category(
+        user_id, params.get("category_id"), params.get("category"))
+    if err:
+        return err
 
-    tx_id = await add_transaction(user_id, txn_type, amount, category, note, balance_id)
-    return {"success": True, "transaction_id": tx_id}
+    note = params.get("comment") or params.get("note", "")
+
+    tx_date = None
+    date_raw = params.get("date")
+    if date_raw:
+        try:
+            tx_date = _tashkent_datetime_for_date(date.fromisoformat(date_raw))
+        except ValueError:
+            return {"error": "validation_error",
+                    "message": "date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
+
+    bals = await get_balances(user_id)
+    balance_id = params.get("balance_id")
+    if balance_id is not None:
+        try:
+            balance_id = int(balance_id)
+        except (TypeError, ValueError):
+            return {"error": "validation_error", "message": "balance_id butun son bo'lishi kerak.", "hint": ""}
+        if not any(b["id"] == balance_id for b in bals):
+            return {"error": "not_found", "message": "balance_id topilmadi.",
+                    "hint": "Bot /balanslar menyusidan to'g'ri ID oling."}
+    else:
+        balance_id = bals[0]["id"] if bals else None
+
+    tx_id = await add_transaction(user_id, txn_type, amount, category_text, note,
+                                   balance_id, date=tx_date, category_id=category_id)
+
+    debt_created = False
+    if params.get("is_debt") and params.get("debt_name"):
+        deadline = None
+        if params.get("deadline"):
+            try:
+                deadline = date.fromisoformat(params["deadline"])
+            except ValueError:
+                deadline = None
+        direction = "gave" if txn_type == "expense" else "took"
+        await add_debt(user_id, params["debt_name"], amount, direction, deadline)
+        debt_created = True
+
+    return {
+        "success": True, "transaction_id": tx_id,
+        "category_id": category_id, "debt_created": debt_created,
+    }
+
+def _mcp_tx_out(tx) -> dict:
+    return {
+        "id":          tx["id"],
+        "type":        tx["type"],
+        "amount":      float(tx["amount"]),
+        "category":    tx.get("category", ""),
+        "category_id": tx.get("category_id"),
+        "note":        tx.get("note", ""),
+        "balance_id":  tx.get("balance_id"),
+        "date":        tx["date"].isoformat() if hasattr(tx["date"], "isoformat") else str(tx["date"]),
+    }
+
+async def _mcp_get_transaction(user_id: int, params: dict) -> dict:
+    tx_id = params.get("id")
+    if tx_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        tx_id = int(tx_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+
+    tx = await get_transaction(user_id, tx_id)
+    if not tx:
+        return {"error": "not_found", "message": "Tranzaksiya topilmadi.",
+                "hint": "list_transactions yoki get_reports orqali to'g'ri id oling."}
+    return _mcp_tx_out(tx)
+
+async def _mcp_update_transaction(user_id: int, params: dict) -> dict:
+    tx_id = params.get("id")
+    if tx_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        tx_id = int(tx_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+
+    new_amount = params.get("amount")
+    if new_amount is not None:
+        try:
+            new_amount = float(new_amount)
+        except (TypeError, ValueError):
+            return {"error": "validation_error", "message": "amount son bo'lishi kerak.", "hint": ""}
+        if new_amount <= 0:
+            return {"error": "validation_error", "message": "amount musbat bo'lishi kerak.", "hint": ""}
+
+    new_type = params.get("type")
+    if new_type is not None and new_type not in ("income", "expense"):
+        return {"error": "validation_error", "message": "type 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
+
+    new_category_id = None
+    if params.get("category_id") is not None:
+        new_category_id, _, err = await _mcp_resolve_category(user_id, params.get("category_id"), None)
+        if err:
+            return err
+
+    new_date = None
+    if params.get("date"):
+        try:
+            new_date = _tashkent_datetime_for_date(date.fromisoformat(params["date"]))
+        except ValueError:
+            return {"error": "validation_error",
+                    "message": "date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
+
+    ok = await update_transaction(
+        user_id, tx_id,
+        new_amount=new_amount, new_type=new_type,
+        new_category_id=new_category_id,
+        new_note=params.get("comment") if params.get("comment") is not None else params.get("note"),
+        new_date=new_date,
+    )
+    if not ok:
+        return {"error": "not_found", "message": "Tranzaksiya topilmadi.", "hint": ""}
+
+    tx = await get_transaction(user_id, tx_id)
+    return _mcp_tx_out(tx)
+
+async def _mcp_delete_transaction(user_id: int, params: dict) -> dict:
+    """⚠️ Foydalanuvchidan tasdiq so'ramasdan chaqirmang (tool description'ga
+    qarang). Soft-delete — yozuv fizik o'chirilmaydi (is_deleted=TRUE),
+    balans effekti qaytariladi."""
+    tx_id = params.get("id")
+    if tx_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        tx_id = int(tx_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+
+    ok = await soft_delete_transaction(user_id, tx_id)
+    if not ok:
+        return {"error": "not_found", "message": "Tranzaksiya topilmadi.", "hint": ""}
+    return {"success": True, "deleted_id": tx_id}
+
+async def _mcp_replace_transaction(user_id: int, params: dict) -> dict:
+    tx_id = params.get("id")
+    if tx_id is None:
+        return {"error": "validation_error", "message": "id majburiy.", "hint": ""}
+    try:
+        tx_id = int(tx_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "id butun son bo'lishi kerak.", "hint": ""}
+
+    txn_type = params.get("type")
+    if txn_type not in ("income", "expense"):
+        return {"error": "validation_error",
+                "message": "type 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
+    try:
+        amount = float(params.get("amount"))
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "amount son bo'lishi kerak.", "hint": ""}
+    if amount <= 0:
+        return {"error": "validation_error", "message": "amount musbat bo'lishi kerak.", "hint": ""}
+
+    category_id, category_text, err = await _mcp_resolve_category(
+        user_id, params.get("category_id"), params.get("category"))
+    if err:
+        return err
+
+    note = params.get("comment") or params.get("note", "")
+
+    tx_date = None
+    if params.get("date"):
+        try:
+            tx_date = _tashkent_datetime_for_date(date.fromisoformat(params["date"]))
+        except ValueError:
+            return {"error": "validation_error",
+                    "message": "date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
+
+    bals = await get_balances(user_id)
+    balance_id = params.get("balance_id")
+    if balance_id is not None:
+        try:
+            balance_id = int(balance_id)
+        except (TypeError, ValueError):
+            return {"error": "validation_error", "message": "balance_id butun son bo'lishi kerak.", "hint": ""}
+        if not any(b["id"] == balance_id for b in bals):
+            return {"error": "not_found", "message": "balance_id topilmadi.", "hint": ""}
+    else:
+        balance_id = bals[0]["id"] if bals else None
+
+    new_id = await replace_transaction(
+        user_id, tx_id, txn_type, amount, category_text, category_id, note, balance_id, tx_date)
+    if new_id is None:
+        return {"error": "not_found", "message": "Almashtiriladigan tranzaksiya topilmadi.", "hint": ""}
+
+    tx = await get_transaction(user_id, new_id)
+    return _mcp_tx_out(tx)
+
+async def _mcp_list_transactions(user_id: int, params: dict) -> dict:
+    limit = min(200, max(1, int(params.get("limit") or 20)))
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, type, amount, category, category_id, note, balance_id, date
+            FROM transactions
+            WHERE telegram_id = $1 AND is_deleted = FALSE
+            ORDER BY date DESC
+            LIMIT $2
+        """, user_id, limit)
+
+    grouped: dict = {}
+    order: list = []
+    total_income = total_expense = 0.0
+    for r in rows:
+        tz_date = r["date"].astimezone(pytz.timezone("Asia/Tashkent")).date().isoformat()
+        if tz_date not in grouped:
+            grouped[tz_date] = []
+            order.append(tz_date)
+        grouped[tz_date].append(_mcp_tx_out(r))
+        if r["type"] == "income":
+            total_income += float(r["amount"])
+        else:
+            total_expense += float(r["amount"])
+
+    return {
+        "items": [{"date": d, "transactions": grouped[d]} for d in order],
+        "summaries": {"income": total_income, "expense": total_expense, "count": len(rows)},
+        "meta": {"page": 1, "limit": limit, "hasMore": len(rows) >= limit},
+    }
+
+async def _mcp_get_reports(user_id: int, params: dict) -> dict:
+    where = "WHERE telegram_id = $1 AND is_deleted = FALSE"
+    args: list = [user_id]
+
+    if params.get("from_date"):
+        try:
+            where += f" AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= ${len(args) + 1}"
+            args.append(date.fromisoformat(params["from_date"]))
+        except ValueError:
+            return {"error": "validation_error", "message": "from_date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
+    if params.get("to_date"):
+        try:
+            where += f" AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= ${len(args) + 1}"
+            args.append(date.fromisoformat(params["to_date"]))
+        except ValueError:
+            return {"error": "validation_error", "message": "to_date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
+
+    tx_type = params.get("type")
+    if tx_type in ("income", "expense"):
+        where += f" AND type = ${len(args) + 1}"
+        args.append(tx_type)
+    elif tx_type == "debt":
+        # Qarzlar transactions jadvalida emas, alohida debts jadvalida
+        # saqlanadi — bu yerda filtrlash mumkin emas, chalkash noto'g'ri
+        # natija (masalan bo'sh ro'yxat) qaytarish o'rniga aniq xato beramiz.
+        return {"error": "validation_error",
+                "message": "type='debt' bu tool'da qo'llab-quvvatlanmaydi.",
+                "hint": "Qarzlar uchun get_debts (yoki Bosqich 4'dagi get_debts_detail) chaqiring."}
+    elif tx_type not in (None, "all"):
+        return {"error": "validation_error",
+                "message": "type 'income', 'expense' yoki 'all' bo'lishi kerak.", "hint": ""}
+
+    category_ids = params.get("category_ids")
+    if category_ids:
+        try:
+            category_ids = [int(c) for c in category_ids]
+        except (TypeError, ValueError):
+            return {"error": "validation_error", "message": "category_ids butun sonlar ro'yxati bo'lishi kerak.", "hint": ""}
+        where += f" AND category_id = ANY(${len(args) + 1}::int[])"
+        args.append(category_ids)
+
+    search = (params.get("search") or "").strip()
+    if search:
+        where += f" AND LOWER(note) LIKE ${len(args) + 1}"
+        args.append(f"%{search.lower()}%")
+
+    page, limit, offset = _mcp_pagination(params)
+
+    async with db_pool.acquire() as conn:
+        total_row = await conn.fetchrow(f"""
+            SELECT COUNT(*) AS cnt,
+                   COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0) AS income,
+                   COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS expense
+            FROM transactions {where}
+        """, *args)
+        rows = await conn.fetch(f"""
+            SELECT id, type, amount, category, category_id, note, balance_id, date
+            FROM transactions {where}
+            ORDER BY date DESC
+            LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}
+        """, *args, limit, offset)
+
+    items = [_mcp_tx_out(r) for r in rows]
+    return {
+        "items": items,
+        "summaries": {
+            "count": total_row["cnt"],
+            "income": float(total_row["income"]),
+            "expense": float(total_row["expense"]),
+        },
+        "meta": {"page": page, "limit": limit, "hasMore": offset + len(items) < total_row["cnt"]},
+    }
 
 
 async def _mcp_get_summary(user_id: int, params: dict) -> dict:
@@ -6450,6 +6879,12 @@ _MCP_TOOLS = {
     "list_categories":     _mcp_list_categories,
     "get_used_categories": _mcp_get_used_categories,
     "list_subcategories":  _mcp_list_subcategories,
+    "get_transaction":     _mcp_get_transaction,
+    "update_transaction":  _mcp_update_transaction,
+    "delete_transaction":  _mcp_delete_transaction,
+    "replace_transaction": _mcp_replace_transaction,
+    "list_transactions":   _mcp_list_transactions,
+    "get_reports":         _mcp_get_reports,
 }
 
 
@@ -6647,6 +7082,139 @@ _MCP_TOOLS_SCHEMA = [
             "required": ["category_id"],
             "properties": {
                 "category_id": {"type": "integer", "description": "list_categories/get_used_categories'dan olingan ID"},
+            },
+        },
+    },
+    {
+        "name": "get_transaction",
+        "description": (
+            "Bitta tranzaksiyaning to'liq maydonlari (tahrirlash/ko'rish uchun).\n\n"
+            "✅ update_transaction yoki replace_transaction'dan OLDIN, mavjud "
+            "qiymatlarni bilish uchun ishlating.\n\n"
+            "❌ Ro'yxat kerak bo'lsa list_transactions yoki get_reports chaqiring."
+        ),
+        "inputSchema": {
+            "type": "object", "required": ["id"],
+            "properties": {"id": {"type": "integer", "description": "Tranzaksiya ID"}},
+        },
+    },
+    {
+        "name": "update_transaction",
+        "description": (
+            "Tranzaksiyaning FAQAT berilgan maydonlarini yangilaydi (berilmagan "
+            "maydonlar o'zgarmay qoladi).\n\n"
+            "✅ Miqdor/tur/kategoriya/izoh/sanada xato bo'lsa — foydalanuvchi "
+            "\"summani tuzat\", \"kategoriyasini almashtir\" desa ishlating.\n\n"
+            "❌ balance_id (hisob/balans) BU YERDA o'zgartirilmaydi — agar "
+            "foydalanuvchi \"bu boshqa hisobdan edi\" desa, o'rniga "
+            "replace_transaction chaqiring.\n\n"
+            "⚠️ id majburiy, qolgan hammasi ixtiyoriy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id":          {"type": "integer"},
+                "amount":      {"type": "number", "description": "Yangi musbat summa (ixtiyoriy)"},
+                "type":        {"type": "string", "enum": ["income", "expense"], "description": "Yangi tur (ixtiyoriy)"},
+                "category_id": {"type": "integer", "description": "Yangi kategoriya ID (ixtiyoriy)"},
+                "comment":     {"type": "string", "description": "Yangi izoh (ixtiyoriy)"},
+                "date":        {"type": "string", "format": "date", "description": "Yangi sana YYYY-MM-DD (ixtiyoriy)"},
+            },
+        },
+    },
+    {
+        "name": "delete_transaction",
+        "description": (
+            "Tranzaksiyani o'chiradi (soft-delete — ma'lumot fizik yo'qolmaydi, "
+            "balans effekti qaytariladi).\n\n"
+            "✅ Foydalanuvchi aniq \"o'chir\" desa ishlating.\n\n"
+            "⚠️ FOYDALANUVCHIDAN TASDIQ SO'RAMASDAN CHAQIRMANG — bu qaytarib "
+            "bo'lmaydigan (foydalanuvchi nuqtai nazaridan) amal. Avval qaysi "
+            "tranzaksiya ekanini (summa, kategoriya, sana) aytib tasdiqlang."
+        ),
+        "inputSchema": {
+            "type": "object", "required": ["id"],
+            "properties": {"id": {"type": "integer", "description": "O'chiriladigan tranzaksiya ID"}},
+        },
+    },
+    {
+        "name": "replace_transaction",
+        "description": (
+            "Tranzaksiyani BUTUNLAY yangisiga almashtiradi (atomik: eskisi "
+            "o'chadi, yangisi yaratiladi) — barcha maydonlar (jumladan "
+            "balance_id/hisob) qayta beriladi.\n\n"
+            "✅ Hisob/balans yoki valyuta o'zgarganda, yoki foydalanuvchi "
+            "yozuvni butunlay boshqacha qilib qayta yozmoqchi bo'lganda "
+            "ishlating.\n\n"
+            "❌ Faqat summa/tur/kategoriya/izoh/sana o'zgarsa — bu tool ORTIQCHA, "
+            "o'rniga update_transaction chaqiring (u tezroq va balansni ikki "
+            "marta emas, bir marta yangilaydi).\n\n"
+            "⚠️ amount/type/category_id (yoki category) majburiy — bular "
+            "yangi tranzaksiyaning to'liq holati, faqat o'zgargan maydon emas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["id", "amount", "type"],
+            "properties": {
+                "id":          {"type": "integer"},
+                "amount":      {"type": "number"},
+                "type":        {"type": "string", "enum": ["income", "expense"]},
+                "category_id": {"type": "integer", "description": "Tercih qilinadi"},
+                "category":    {"type": "string", "description": "DEPRECATED — category_id o'rniga faqat 1 oy backward-compat uchun"},
+                "comment":     {"type": "string"},
+                "date":        {"type": "string", "format": "date"},
+                "balance_id":  {"type": "integer", "description": "Yangi hisob/balans (ixtiyoriy, berilmasa birinchi balans ishlatiladi)"},
+            },
+        },
+    },
+    {
+        "name": "list_transactions",
+        "description": (
+            "Oxirgi tranzaksiyalar, KUNLAR bo'yicha guruhlangan (eng yangi kun "
+            "birinchi).\n\n"
+            "✅ \"oxirgi tranzaksiyalarim\", \"so'nggi 20 ta yozuvim\" kabi "
+            "so'rovlarga ishlating.\n\n"
+            "❌ Sana oralig'i, kategoriya yoki matn bo'yicha filtr kerak bo'lsa "
+            "get_reports chaqiring — bu tool filtrlarsiz, faqat oxirgilarni "
+            "beradi.\n\n"
+            "⚠️ summaries — FAQAT shu chaqiruvda qaytgan yozuvlar bo'yicha jami, "
+            "butun oy/davr jami EMAS (buni get_summary/get_spending_overview beradi)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Nechta yozuv, default 20, maks 200"},
+            },
+        },
+    },
+    {
+        "name": "get_reports",
+        "description": (
+            "Filtrlangan (sana oralig'i, tur, kategoriyalar, izoh matni bo'yicha "
+            "qidiruv) XOM tranzaksiya ro'yxati, sahifalangan.\n\n"
+            "✅ Bir nechta filtrni birga qo'llash kerak bo'lganda (\"fevral "
+            "oyida Transport va Oziq-ovqatga nechta xarajat bo'lgan\") yoki "
+            "matn bo'yicha qidirishda ishlating.\n\n"
+            "❌ Oddiy \"shu oy qancha sarfladim\"/\"eng ko'p qaysi kategoriyaga "
+            "ketyapti\" turidagi savolga BUNI ISHLATMANG — bu XOM RO'YXAT "
+            "qaytaradi, siz uni sahifalab o'zingiz qo'shishingiz kerak bo'ladi "
+            "(token isrof va hisob xatosi xavfi). Bunday savollarga "
+            "get_spending_overview yoki get_category_stats mo'ljallangan "
+            "(Bosqich 3).\n\n"
+            "⚠️ summaries — FAQAT filtrlarga mos BUTUN natija bo'yicha jami "
+            "(income/expense/count), faqat qaytgan sahifa emas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_date":    {"type": "string", "format": "date"},
+                "to_date":      {"type": "string", "format": "date"},
+                "type":         {"type": "string", "enum": ["income", "expense", "all"]},
+                "category_ids": {"type": "array", "items": {"type": "integer"}},
+                "search":       {"type": "string", "description": "Izoh (note) matnida qidirish"},
+                "page":         {"type": "integer"},
+                "limit":        {"type": "integer", "description": "default 20, maks 200"},
             },
         },
     },
