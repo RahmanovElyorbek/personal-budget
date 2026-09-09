@@ -791,14 +791,19 @@ async def add_transaction(telegram_id: int, txn_type: str,
                 """, telegram_id, txn_type, amount, category, note, balance_id)
 
             if balance_id:
+                # AND telegram_id = $3 — xavfsizlik: balance_id foydalanuvchi
+                # terisidagi tugma callback_data'sidan keladi, u esa Telegram
+                # tomonidan hech qanday egalikka bog'lanmagan (soxta callback_data
+                # yuborib boshqa foydalanuvchining balansini o'zgartirib
+                # bo'lmasligi uchun filtr shart).
                 if txn_type == "income":
                     await conn.execute(
-                        "UPDATE balances SET amount = amount + $1 WHERE id = $2",
-                        amount, balance_id)
+                        "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                        amount, balance_id, telegram_id)
                 else:
                     await conn.execute(
-                        "UPDATE balances SET amount = amount - $1 WHERE id = $2",
-                        amount, balance_id)
+                        "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
+                        amount, balance_id, telegram_id)
             invalidate_start_cache(telegram_id)
             return tx_id
 
@@ -833,14 +838,16 @@ async def delete_transaction(telegram_id: int, tx_id: int) -> bool:
                 "WHERE id = $1 AND telegram_id = $2", tx_id, telegram_id)
             if not tx:
                 return False
-            # balans effektini orqaga qaytaramiz
+            # balans effektini orqaga qaytaramiz (AND telegram_id — pastga qarang)
             if tx["balance_id"]:
                 if tx["type"] == "income":
-                    await conn.execute("UPDATE balances SET amount = amount - $1 WHERE id = $2",
-                                       tx["amount"], tx["balance_id"])
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
+                        tx["amount"], tx["balance_id"], telegram_id)
                 else:
-                    await conn.execute("UPDATE balances SET amount = amount + $1 WHERE id = $2",
-                                       tx["amount"], tx["balance_id"])
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                        tx["amount"], tx["balance_id"], telegram_id)
             await conn.execute("DELETE FROM transactions WHERE id = $1 AND telegram_id = $2",
                                tx_id, telegram_id)
             invalidate_start_cache(telegram_id)
@@ -862,16 +869,24 @@ async def update_transaction(telegram_id: int, tx_id: int,
             f_cat  = new_category if new_category is not None else tx["category"]
 
             if bal_id:
-                # eski effektni qaytar
+                # eski effektni qaytar (AND telegram_id — pastga qarang)
                 if old_type == "income":
-                    await conn.execute("UPDATE balances SET amount = amount - $1 WHERE id = $2", old_amt, bal_id)
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
+                        old_amt, bal_id, telegram_id)
                 else:
-                    await conn.execute("UPDATE balances SET amount = amount + $1 WHERE id = $2", old_amt, bal_id)
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                        old_amt, bal_id, telegram_id)
                 # yangi effektni qo'lla
                 if f_type == "income":
-                    await conn.execute("UPDATE balances SET amount = amount + $1 WHERE id = $2", f_amt, bal_id)
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                        f_amt, bal_id, telegram_id)
                 else:
-                    await conn.execute("UPDATE balances SET amount = amount - $1 WHERE id = $2", f_amt, bal_id)
+                    await conn.execute(
+                        "UPDATE balances SET amount = amount - $1 WHERE id = $2 AND telegram_id = $3",
+                        f_amt, bal_id, telegram_id)
 
             await conn.execute(
                 "UPDATE transactions SET type = $1, amount = $2, category = $3 "
@@ -1056,20 +1071,33 @@ async def build_debts_report_section(telegram_id: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-async def mark_debt_paid(debt_id: int, return_balance_id: int = None):
+async def mark_debt_paid(telegram_id: int, debt_id: int, return_balance_id: int = None) -> bool:
+    """telegram_id majburiy — debt_id va return_balance_id ikkalasi ham
+    Telegram callback_data'dan keladi (egalikka bog'lanmagan, soxta
+    callback_data yuborish orqali boshqa foydalanuvchining qarzi/balansini
+    o'zgartirishning oldini olish uchun har ikkalasi ham shu user'ga tegishli
+    ekani SQL darajasida tekshiriladi). Qarz topilmasa/boshqaga tegishli
+    bo'lsa False qaytaradi."""
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             debt = await conn.fetchrow(
-                "SELECT amount, direction FROM debts WHERE id = $1", debt_id
+                "SELECT amount, direction FROM debts WHERE id = $1 AND telegram_id = $2",
+                debt_id, telegram_id
             )
-            await conn.execute("UPDATE debts SET is_paid = TRUE WHERE id = $1", debt_id)
-            if return_balance_id and debt:
+            if not debt:
+                return False
+            await conn.execute(
+                "UPDATE debts SET is_paid = TRUE WHERE id = $1 AND telegram_id = $2",
+                debt_id, telegram_id
+            )
+            if return_balance_id:
                 # "gave" → they return → I receive → add; "took" → I return → I pay → deduct
                 delta = float(debt["amount"]) if debt["direction"] == "gave" else -float(debt["amount"])
                 await conn.execute(
-                    "UPDATE balances SET amount = amount + $1 WHERE id = $2",
-                    delta, return_balance_id
+                    "UPDATE balances SET amount = amount + $1 WHERE id = $2 AND telegram_id = $3",
+                    delta, return_balance_id, telegram_id
                 )
+            return True
 
 def _match_debts_by_person(debts: list, person: "str | None") -> list:
     """Ism berilgan bo'lsa — FAQAT o'sha odamning ochiq qarzlarini qaytaradi
@@ -1477,15 +1505,20 @@ async def add_balance(telegram_id: int, name: str, bal_type: str, amount: float)
             VALUES ($1, $2, $3, $4)
         """, telegram_id, name, bal_type, amount)
 
-async def update_balance(balance_id: int, amount: float):
+async def update_balance(telegram_id: int, balance_id: int, amount: float) -> bool:
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE balances SET amount = $1 WHERE id = $2", amount, balance_id
+        result = await conn.execute(
+            "UPDATE balances SET amount = $1 WHERE id = $2 AND telegram_id = $3",
+            amount, balance_id, telegram_id
         )
+    return int(result.split()[-1]) > 0
 
-async def delete_balance(balance_id: int):
+async def delete_balance(telegram_id: int, balance_id: int) -> bool:
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM balances WHERE id = $1", balance_id)
+        result = await conn.execute(
+            "DELETE FROM balances WHERE id = $1 AND telegram_id = $2", balance_id, telegram_id
+        )
+    return int(result.split()[-1]) > 0
 
 async def create_mcp_token(telegram_id: int) -> str:
     token      = secrets.token_urlsafe(32)
@@ -4272,9 +4305,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts     = data.split("_")
         debt_id   = int(parts[3])
         bal_id    = int(parts[4])
-        await mark_debt_paid(debt_id, return_balance_id=bal_id)
+        ok = await mark_debt_paid(user_id, debt_id, return_balance_id=bal_id)
+        if not ok:
+            await query.answer("❌ Qarz topilmadi", show_alert=True)
+            return
         async with db_pool.acquire() as conn:
-            bal = await conn.fetchrow("SELECT name, amount FROM balances WHERE id = $1", bal_id)
+            bal = await conn.fetchrow(
+                "SELECT name, amount FROM balances WHERE id = $1 AND telegram_id = $2",
+                bal_id, user_id)
         bal_text = f"\n💳 Balans: <b>{bal['name']}</b> — {format_money(float(bal['amount']))}" if bal else ""
         await query.edit_message_text(
             f"✅ <b>Qarz to'landi!</b>{bal_text}",
@@ -4284,7 +4322,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("debt_ret_no_bal_"):
         debt_id = int(data.split("_")[4])
-        await mark_debt_paid(debt_id)
+        ok = await mark_debt_paid(user_id, debt_id)
+        if not ok:
+            await query.answer("❌ Qarz topilmadi", show_alert=True)
+            return
         await query.edit_message_text(
             "✅ <b>Qarz to'landi deb belgilandi!</b>",
             parse_mode="HTML",
@@ -4340,6 +4381,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("bal_edit_"):
         bal_id = int(data.split("_")[2])
+        bals = await get_balances(user_id)
+        if not any(b["id"] == bal_id for b in bals):
+            await query.answer("❌ Balans topilmadi", show_alert=True)
+            return
         context.user_data["editing_balance_id"] = bal_id
         context.user_data["awaiting_balance_update"] = True
         await query.edit_message_text(
@@ -4372,7 +4417,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("bal_delete_"):
         bal_id = int(data.split("_")[2])
-        await delete_balance(bal_id)
+        ok = await delete_balance(user_id, bal_id)
+        if not ok:
+            await query.answer("❌ Balans topilmadi", show_alert=True)
+            return
         await query.edit_message_text(
             "🗑️ <b>Balans o'chirildi!</b>",
             parse_mode="HTML",
@@ -4934,9 +4982,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if amount < 0:
                 raise ValueError
             bal_id = context.user_data.get("editing_balance_id")
-            await update_balance(bal_id, amount)
             context.user_data.pop("awaiting_balance_update", None)
             context.user_data.pop("editing_balance_id", None)
+            ok = await update_balance(user_id, bal_id, amount)
+            if not ok:
+                await update.message.reply_text("❌ Balans topilmadi.")
+                return
             await update.message.reply_text(
                 f"✅ <b>Balans yangilandi!</b>\n💵 {format_money(amount)}",
                 parse_mode="HTML",
@@ -5117,7 +5168,9 @@ async def _save_debt(user_id, context, balance_id=None, reply_fn=None, via_query
     bal_text = ""
     if balance_id:
         async with db_pool.acquire() as conn:
-            bal = await conn.fetchrow("SELECT name, amount FROM balances WHERE id = $1", balance_id)
+            bal = await conn.fetchrow(
+                "SELECT name, amount FROM balances WHERE id = $1 AND telegram_id = $2",
+                balance_id, user_id)
             if bal:
                 action = "yechildi" if direction == "gave" else "qo'shildi"
                 bal_text = f"\n💳 Balans: <b>{bal['name']}</b> — {format_money(float(bal['amount']))} ({action})"
