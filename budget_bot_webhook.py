@@ -535,6 +535,58 @@ async def init_db():
             """)
         except Exception as e:
             logger.warning(f"ALTER TABLE users (reply_kb_shown): {e}")
+        # ---- 003_add_categories_table migratsiyasi (MCP Bosqich 1: kategoriyalar
+        # endi ID'ga ega DB jadvali, hardcoded matn ro'yxati emas — batafsili va
+        # rollback migrations/003_add_categories_table.py faylida) ----
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id          SERIAL PRIMARY KEY,
+                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                emoji       TEXT DEFAULT '',
+                type        TEXT NOT NULL,
+                parent_id   INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+                is_hidden   BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_categories_telegram_id ON categories(telegram_id)
+        """)
+        # Tizim kategoriyalari (telegram_id IS NULL) — EXPENSE_CATEGORIES/
+        # INCOME_CATEGORIES ro'yxatlaridan bir martalik ko'chirish. Idempotent:
+        # NOT EXISTS tekshiruvi tufayli har deployda qayta ishga tushsa ham
+        # dublikat yaratmaydi.
+        for cat_type, cat_list in (("expense", EXPENSE_CATEGORIES), ("income", INCOME_CATEGORIES)):
+            for full_name in cat_list:
+                emoji, name = full_name.split(" ", 1) if " " in full_name else ("", full_name)
+                await conn.execute("""
+                    INSERT INTO categories (telegram_id, name, emoji, type)
+                    SELECT NULL, $1, $2, $3
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM categories
+                        WHERE telegram_id IS NULL AND name = $1 AND type = $3
+                    )
+                """, name, emoji, cat_type)
+        # transactions.category (matn) → category_id (FK) — eski ustun 1 oy
+        # backward-compat uchun saqlanadi (BOSQICH 2'da olib tashlanadi).
+        try:
+            await conn.execute("""
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS
+                    category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL
+            """)
+        except Exception as e:
+            logger.warning(f"ALTER TABLE transactions (category_id): {e}")
+        # Orqaga qarab to'ldirish — faqat category_id hali NULL bo'lgan
+        # qatorlarga tegadi, shuning uchun har startupda xavfsiz qayta ishlaydi.
+        await conn.execute("""
+            UPDATE transactions t
+            SET category_id = c.id
+            FROM categories c
+            WHERE t.category_id IS NULL
+              AND c.telegram_id IS NULL
+              AND t.category = (CASE WHEN c.emoji <> '' THEN c.emoji || ' ' || c.name ELSE c.name END)
+        """)
     logger.info("✅ Database tayyor!")
 
 async def is_new_user(telegram_id: int) -> bool:
@@ -6214,6 +6266,122 @@ async def _mcp_get_debts(user_id: int, params: dict) -> dict:
     }
 
 
+# ===================== BOSQICH 1: FUNDAMENT (whoami, profil, kategoriyalar) =====
+
+async def _mcp_whoami(user_id: int, params: dict) -> dict:
+    premium = await is_user_premium(user_id)
+    return {
+        "user_id": user_id,
+        "is_premium": premium,
+        "trial_days_left": await get_trial_days_left(user_id),
+        "scopes": [
+            "tx:read", "tx:write", "category:read", "category:write",
+            "balance:read", "balance:write", "debt:read", "debt:write",
+            "profile:read", "profile:write", "stats:read",
+        ],
+    }
+
+async def _mcp_get_profile(user_id: int, params: dict) -> dict:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT name, budget, registered_at FROM users WHERE telegram_id = $1",
+            user_id)
+    if not row:
+        return {"error": "not_found", "message": "Foydalanuvchi topilmadi.", "hint": "/start bosing."}
+    return {
+        "name": row["name"] or "",
+        # Hozircha bot bitta tilda (o'zbek), bitta valyutada (UZS) va bitta
+        # vaqt zonasida (Asia/Tashkent) ishlaydi — bu qiymatlar o'zgartirib
+        # bo'lmaydigan konstantalar, DB ustuni emas (Bosqich 6'da
+        # set_language/set_timezone qo'shilganda haqiqiy sozlamaga aylanadi).
+        "language": "uz",
+        "currency": "UZS",
+        "timezone": "Asia/Tashkent",
+        "monthly_budget": float(row["budget"]) if row["budget"] else 0.0,
+        "registered_at": row["registered_at"].isoformat() if row["registered_at"] else None,
+    }
+
+def _mcp_pagination(params: dict) -> "tuple[int, int, int]":
+    page  = max(1, int(params.get("page") or 1))
+    limit = min(200, max(1, int(params.get("limit") or 20)))
+    return page, limit, (page - 1) * limit
+
+async def _mcp_list_categories(user_id: int, params: dict) -> dict:
+    search = (params.get("search") or "").strip().lower()
+    page, limit, offset = _mcp_pagination(params)
+
+    where = "WHERE (telegram_id IS NULL OR telegram_id = $1) AND is_hidden = FALSE"
+    args: list = [user_id]
+    if search:
+        where += f" AND LOWER(name) LIKE ${len(args) + 1}"
+        args.append(f"%{search}%")
+
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM categories {where}", *args)
+        rows = await conn.fetch(
+            f"SELECT id, name, emoji, type, parent_id FROM categories {where} "
+            f"ORDER BY type, name LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}",
+            *args, limit, offset,
+        )
+    items = [
+        {"id": r["id"], "name": r["name"], "emoji": r["emoji"],
+         "type": r["type"], "parent_id": r["parent_id"]}
+        for r in rows
+    ]
+    return {
+        "items": items,
+        "summaries": {"count": total},
+        "meta": {"page": page, "limit": limit, "hasMore": offset + len(items) < total},
+    }
+
+async def _mcp_get_used_categories(user_id: int, params: dict) -> dict:
+    limit = min(50, max(1, int(params.get("limit") or 20)))
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT c.id, c.name, c.emoji, c.type, COUNT(*) AS usage_count
+            FROM transactions t
+            JOIN categories c ON c.id = t.category_id
+            WHERE t.telegram_id = $1 AND t.is_deleted = FALSE
+            GROUP BY c.id, c.name, c.emoji, c.type
+            ORDER BY usage_count DESC
+            LIMIT $2
+        """, user_id, limit)
+    items = [
+        {"id": r["id"], "name": r["name"], "emoji": r["emoji"],
+         "type": r["type"], "usage_count": r["usage_count"]}
+        for r in rows
+    ]
+    return {
+        "items": items,
+        "summaries": {"count": len(items)},
+        "meta": {"page": 1, "limit": limit, "hasMore": False},
+    }
+
+async def _mcp_list_subcategories(user_id: int, params: dict) -> dict:
+    category_id = params.get("category_id")
+    if category_id is None:
+        return {"error": "validation_error",
+                "message": "category_id majburiy.",
+                "hint": "Avval list_categories yoki get_used_categories orqali category_id oling."}
+    try:
+        category_id = int(category_id)
+    except (TypeError, ValueError):
+        return {"error": "validation_error", "message": "category_id butun son bo'lishi kerak.", "hint": ""}
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, name, emoji, type FROM categories
+            WHERE parent_id = $1 AND (telegram_id IS NULL OR telegram_id = $2) AND is_hidden = FALSE
+            ORDER BY name
+        """, category_id, user_id)
+    items = [{"id": r["id"], "name": r["name"], "emoji": r["emoji"], "type": r["type"]} for r in rows]
+    return {
+        "items": items,
+        "summaries": {"count": len(items)},
+        "meta": {"page": 1, "limit": len(items) or 1, "hasMore": False},
+    }
+
+
 # ===================== P0: RATE LIMIT, AUDIT LOG, PREMIUM GATE =====================
 
 _MCP_RATE_LIMIT_WINDOW = 60.0   # soniya
@@ -6254,11 +6422,15 @@ async def _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, param
     except Exception:
         logger.exception("mcp_audit_log yozib bo'lmadi")
 
-async def _mcp_premium_gate(user_id: int) -> "dict | None":
+_MCP_PREMIUM_EXEMPT_TOOLS = {"whoami", "get_profile"}
+
+async def _mcp_premium_gate(user_id: int, tool_name: "str | None" = None) -> "dict | None":
     """Section 5: MCP orqali haqiqiy tool chaqirish (whoami/get_profile
-    bundan mustasno — ular Bosqich 1'da qo'shiladi) premium obuna talab
-    qiladi. Ruxsat bo'lsa None, aks holda foydalanuvchiga ko'rsatiladigan
-    (sotuv matni vazifasini ham bajaradigan) xato qaytaradi."""
+    bundan mustasno) premium obuna talab qiladi. Ruxsat bo'lsa None, aks
+    holda foydalanuvchiga ko'rsatiladigan (sotuv matni vazifasini ham
+    bajaradigan) xato qaytaradi."""
+    if tool_name in _MCP_PREMIUM_EXEMPT_TOOLS:
+        return None
     if await is_user_premium(user_id):
         return None
     return {
@@ -6269,10 +6441,15 @@ async def _mcp_premium_gate(user_id: int) -> "dict | None":
 
 
 _MCP_TOOLS = {
-    "get_transactions": _mcp_get_transactions,
-    "add_transaction":  _mcp_add_transaction,
-    "get_summary":      _mcp_get_summary,
-    "get_debts":        _mcp_get_debts,
+    "get_transactions":    _mcp_get_transactions,
+    "add_transaction":     _mcp_add_transaction,
+    "get_summary":         _mcp_get_summary,
+    "get_debts":           _mcp_get_debts,
+    "whoami":              _mcp_whoami,
+    "get_profile":         _mcp_get_profile,
+    "list_categories":     _mcp_list_categories,
+    "get_used_categories": _mcp_get_used_categories,
+    "list_subcategories":  _mcp_list_subcategories,
 }
 
 
@@ -6310,7 +6487,7 @@ async def mcp_tool_handler(request: web.Request) -> web.Response:
             "hint": "Bitta token uchun daqiqasiga 60 tadan ko'p chaqiruvga ruxsat yo'q.",
         }, status=429)
 
-    gate_error = await _mcp_premium_gate(user_id)
+    gate_error = await _mcp_premium_gate(user_id, tool_name)
     if gate_error:
         await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
                                     "premium_required", int((time.monotonic() - t0) * 1000))
@@ -6384,6 +6561,94 @@ _MCP_TOOLS_SCHEMA = [
         "name": "get_debts",
         "description": "Get list of active (unpaid) debts",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "whoami",
+        "description": (
+            "Joriy MCP token qaysi foydalanuvchiga tegishli ekanini, premium "
+            "holatini va ruxsatlarini qaytaradi.\n\n"
+            "✅ SHU TOOL'NI ishlating: suhbat boshida bir marta, yoki foydalanuvchi "
+            "\"men premiummi\", \"necha kunlik sinov qoldi\" deb so'raganda.\n\n"
+            "❌ Boshqa hech qanday moliyaviy ma'lumot bermaydi — tranzaksiya/balans "
+            "uchun mos tool'ni chaqiring.\n\n"
+            "Premium talab qilmaydi — har doim ishlaydi."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_profile",
+        "description": (
+            "Foydalanuvchi profili: ism, valyuta (hozircha faqat UZS), vaqt zonasi "
+            "(Asia/Tashkent, hozircha o'zgartirib bo'lmaydi), oylik budget, "
+            "ro'yxatdan o'tgan sana.\n\n"
+            "✅ SHU TOOL'NI ishlating: \"mening profilim\", \"oylik budjetim qancha\" "
+            "kabi savollarga.\n\n"
+            "❌ Statistika uchun EMAS — get_summary chaqiring.\n\n"
+            "Premium talab qilmaydi — har doim ishlaydi."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_categories",
+        "description": (
+            "Barcha mavjud kategoriyalar (tizim + foydalanuvchi o'zi qo'shgan), "
+            "ID bilan.\n\n"
+            "✅ SHU TOOL'NI ishlating: add_transaction uchun category_id kerak "
+            "bo'lganda, lekin get_used_categories'da mos kelmagan yoki foydalanuvchi "
+            "noodatiy/kamdan-kam ishlatiladigan kategoriyani aytganda. Ko'p sonli "
+            "kategoriyalar orasidan qidirish uchun search parametridan foydalaning.\n\n"
+            "❌ Oddiy holatda BUNI CHAQIRMANG — avval get_used_categories'ni sinab "
+            "ko'ring, u tezroq va odam odatda ishlatadigan kategoriyalarni beradi.\n\n"
+            "⚠️ Natija sahifalangan (page/limit) — summaries.count BUTUN natija "
+            "bo'yicha jami, faqat shu sahifa emas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "Kategoriya nomi bo'yicha qidiruv (ixtiyoriy)"},
+                "page":   {"type": "integer", "description": "Sahifa raqami, default 1"},
+                "limit":  {"type": "integer", "description": "Sahifadagi son, default 20, maks 200"},
+            },
+        },
+    },
+    {
+        "name": "get_used_categories",
+        "description": (
+            "Foydalanuvchi ENG KO'P ishlatgan kategoriyalar, ishlatilish soni "
+            "bo'yicha kamayish tartibida (default 20 ta).\n\n"
+            "✅ SHU TOOL'NI ishlating: add_transaction'dan OLDIN, deyarli har doim "
+            "— to'liq ro'yxatni tortmasdan, odam odatda tanlaydigan kategoriyalardan "
+            "category_id oling.\n\n"
+            "❌ list_categories'ni faqat shu yerda kerakli kategoriya topilmasa "
+            "chaqiring.\n\n"
+            "⚠️ MAJBURIY TARTIB: yangi sessiyada birinchi add_transaction'dan oldin "
+            "shuni bir marta chaqiring va category_id'larni eslab qoling — har "
+            "yozuv uchun qayta chaqirish shart emas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Nechta kategoriya, default 20, maks 50"},
+            },
+        },
+    },
+    {
+        "name": "list_subcategories",
+        "description": (
+            "Berilgan category_id'ning bolalari (subkategoriyalari).\n\n"
+            "✅ Foydalanuvchi kategoriya ichida aniqroq bo'linish so'raganda "
+            "ishlating.\n\n"
+            "❌ Hozircha aksariyat kategoriyalarda subkategoriya yo'q — bo'sh "
+            "ro'yxat qaytsa, bu XATO EMAS, shunchaki subkategoriya hali "
+            "yaratilmagan."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["category_id"],
+            "properties": {
+                "category_id": {"type": "integer", "description": "list_categories/get_used_categories'dan olingan ID"},
+            },
+        },
     },
 ]
 
@@ -6467,7 +6732,7 @@ async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
                                         "rate_limited", int((time.monotonic() - t0) * 1000))
             return _jsonrpc_err(req_id, -32029, "rate_limited: 1 daqiqada 60 tadan ko'p chaqiruvga ruxsat yo'q")
 
-        gate_error = await _mcp_premium_gate(user_id)
+        gate_error = await _mcp_premium_gate(user_id, tool_name)
         if gate_error:
             await _mcp_write_audit_log(user_id, token_ref, auth_method, tool_name, None,
                                         "premium_required", int((time.monotonic() - t0) * 1000))
