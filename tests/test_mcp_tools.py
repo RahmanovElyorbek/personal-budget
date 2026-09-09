@@ -407,6 +407,58 @@ async def test_get_spending_overview_percentages_sum_to_100(db):
     assert 99.0 <= total_pct <= 100.1  # yaxlitlashdan kelib chiqadigan minimal farq
 
 
+@requires_db
+async def test_get_summary_and_spending_overview_totals_match_with_null_category(db):
+    """category_id ham, eski category matni ham bo'sh (haqiqiy eski/buzuq
+    yozuv) bo'lgan tranzaksiya bo'lsa ham, get_summary va
+    get_spending_overview BIR XIL jami qaytarishi kerak — ikkalasi ham
+    bitta umumiy SQL agregatsiya helper'idan (_mcp_stats_where +
+    _mcp_totals/_mcp_category_breakdown) foydalanadi."""
+    today = bot.datetime.now(bot.pytz.timezone("Asia/Tashkent")).date()
+    await bot._mcp_add_transaction(USER_A, {"type": "expense", "amount": 300000, "category_id":
+        (await bot._mcp_list_categories(USER_A, {"search": "Transport"}))["items"][0]["id"]})
+    # to'g'ridan-to'g'ri DB'ga category_id=NULL, category='' (matn ham bo'sh)
+    # yozuv qo'shamiz — bu haqiqiy "kategoriyasi umuman aniqlanmagan" holat.
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO transactions (telegram_id, type, amount, category, category_id, date, is_deleted)
+            VALUES ($1, 'expense', 400000, '', NULL, NOW(), FALSE)
+            """,
+            USER_A,
+        )
+
+    summary = await bot._mcp_get_summary(USER_A, {
+        "from_date": today.replace(day=1).isoformat(), "to_date": today.isoformat(),
+    })
+    overview = await bot._mcp_get_spending_overview(USER_A, {
+        "from_date": today.replace(day=1).isoformat(), "to_date": today.isoformat(), "side": "expense",
+    })
+
+    assert summary["expenses"] == 700000.0
+    assert overview["total"] == 700000.0
+    assert summary["expenses"] == overview["total"]
+
+    unassigned = next(c for c in overview["categories"] if c["category"] == "❓ Aniqlanmagan")
+    assert unassigned["amount"] == 400000.0
+    # kategoriyasiz summa jamidan tushib qolmaydi:
+    assert sum(c["amount"] for c in overview["categories"]) == overview["total"]
+
+
+@requires_db
+async def test_category_display_prefers_legacy_text_over_unassigned(db):
+    """Agar category_id NULL bo'lsa-yu, lekin eski matn ustuni bo'sh
+    bo'lmasa — bu haqiqatan kategoriyasiz emas (eski migratsiyadan oldingi
+    normal yozuv), shuning uchun "❓ Aniqlanmagan" emas, matnning o'zi
+    ko'rsatilishi kerak."""
+    await bot._mcp_add_transaction(USER_A, {"type": "expense", "amount": 100000, "category": "Eski matn"})
+    today = bot.datetime.now(bot.pytz.timezone("Asia/Tashkent")).date()
+    res = await bot._mcp_get_spending_overview(USER_A, {
+        "from_date": today.replace(day=1).isoformat(), "to_date": today.isoformat(), "side": "expense",
+    })
+    assert res["categories"][0]["category"] == "Eski matn"
+
+
 # ===================== SOZLAMALAR (Bosqich 6) =====================
 
 @requires_db
@@ -487,6 +539,33 @@ async def test_get_transactions_legacy_v1_tool(db):
     res = await bot._mcp_get_transactions(USER_A, {})
     assert res["count"] == 1
     assert "id" in res["transactions"][0]
+
+
+@requires_db
+async def test_list_balances_returns_id_and_total(db):
+    await bot.add_balance(USER_A, "Naqd", "cash", 100000)
+    await bot.add_balance(USER_A, "Karta", "card", 250000)
+    res = await bot._mcp_list_balances(USER_A, {})
+    assert res["summaries"]["count"] == 2
+    assert res["summaries"]["total_amount"] == 350000.0
+    names = {b["name"] for b in res["items"]}
+    assert names == {"Naqd", "Karta"}
+    assert all("id" in b for b in res["items"])
+
+
+@requires_db
+async def test_list_balances_empty_for_new_user(db):
+    res = await bot._mcp_list_balances(USER_A, {})
+    assert res["items"] == []
+    assert res["summaries"]["count"] == 0
+
+
+@requires_db
+async def test_list_balances_does_not_leak_other_users_balances(db):
+    await bot.add_balance(USER_A, "A hisobi", "cash", 1000)
+    await bot.add_balance(USER_B, "B hisobi", "cash", 2000)
+    res = await bot._mcp_list_balances(USER_A, {})
+    assert [b["name"] for b in res["items"]] == ["A hisobi"]
 
 
 @requires_db

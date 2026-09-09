@@ -3,9 +3,9 @@
 Bot bazasini AI (Claude va boshqa MCP mijozlar) bilan bevosita ulaydigan
 Model Context Protocol serveri. Manzil: `https://personal-budget-6mr0.onrender.com/mcp`.
 
-32 ta tool: tranzaksiyalar, statistika, qarzlar, kategoriyalar, sozlamalar,
-PDF hisobot. Barchasi premium obuna talab qiladi (`whoami` va `get_profile`
-bundan mustasno).
+33 ta tool: tranzaksiyalar, statistika, qarzlar, kategoriyalar, balanslar,
+sozlamalar, PDF hisobot. Barchasi premium obuna talab qiladi (`whoami` va
+`get_profile` bundan mustasno).
 
 ---
 
@@ -73,7 +73,7 @@ qo'shing (nomi boshqacha, `url` bir xil, `Authorization` boshqa token).
 
 ---
 
-## 2. Tool katalogi (32 ta)
+## 2. Tool katalogi (33 ta)
 
 ### Fundament
 
@@ -81,6 +81,7 @@ qo'shing (nomi boshqacha, `url` bir xil, `Authorization` boshqa token).
 |---|---|---|
 | `whoami` | Yo'q | Token qaysi user'ga tegishli, premium holati, ruxsatlar |
 | `get_profile` | Yo'q | Ism, valyuta (UZS), tz (Asia/Tashkent), oylik budjet |
+| `list_balances` | Ha | Barcha hisoblar/balanslar (naqd, karta, ...) — ID, nom, tur, summa |
 | `list_categories` | Ha | Barcha kategoriyalar (tizim + shaxsiy), qidiruv bilan, sahifalangan |
 | `get_used_categories` | Ha | Eng ko'p ishlatilgan kategoriyalar — `add_transaction`dan oldin chaqirish uchun |
 | `list_subcategories` | Ha | Berilgan kategoriyaning bolalari |
@@ -107,13 +108,22 @@ qo'shing (nomi boshqacha, `url` bir xil, `Authorization` boshqa token).
 | `get_balance_timeseries` | Ha | Kunlik/haftalik/oylik balans qatori (grafik uchun) |
 | `compare_periods` | Ha | Ikki davrni kategoriya kesimida solishtiradi (Hisobchi AI'da yo'q — ustunlik) |
 
+⚠️ `get_summary`, `get_spending_overview`, `get_category_stats`,
+`compare_periods` va `generate_pdf_report` — barchasi BITTA umumiy SQL
+agregatsiya helper'idan (`_mcp_stats_where`/`_mcp_totals`/
+`_mcp_category_breakdown`) foydalanadi, shuning uchun bir xil davr uchun
+jami hech qachon mos kelmay qolmaydi. `category_id` HAM, eski matnli
+`category` ustuni HAM bo'sh bo'lgan (haqiqatan kategoriyasiz) yozuvlar
+kategoriya kesimida `"❓ Aniqlanmagan"` nomi bilan alohida qator sifatida
+ko'rsatiladi — lekin umumiy jamidan HECH QACHON tushib qolmaydi.
+
 ### Qarzlar
 
 | Tool | Premium? | Nima qiladi |
 |---|---|---|
 | `get_debts_summary` | Ha | FAQAT umumiy jami — hech qanday shaxsiy summa yo'q |
 | `get_debts_detail` | Ha | Odam kesimida guruhlangan, har kishining barcha qarzlari |
-| `add_debt` | Ha | Yangi qarz (`direction`: `gave`/`took`) |
+| `add_debt` | Ha | Yangi qarz (`direction`: `gave`/`took`, `sync_to_balance=true` bo'lsa `balance_id` kerak — `list_balances`dan oling) |
 | `return_debt` | Ha | To'liq yopish |
 | `partial_return_debt` | Ha | Qisman yopish (ortiqcha to'lov avtomatik to'liq yopadi) |
 | `list_closed_debts` | Ha | Yopilgan qarzlar tarixi |
@@ -162,6 +172,8 @@ qo'shing (nomi boshqacha, `url` bir xil, `Authorization` boshqa token).
 | "Transport ichida taksi qancha" | `get_category_stats` |
 | "Yangi kategoriya qo'sh: Uy hayvonlari" | `create_category` |
 | "Eslatmani o'chir" | `update_notification_settings` |
+| "Qaysi hisoblarim bor?" / "Kartamda qancha pul bor?" | `list_balances` |
+| "Naqd pulda 500 ming qarz berdim" (balansdan yechilishi kerak) | `list_balances` (balance_id) → `add_debt(sync_to_balance=true)` |
 
 ---
 

@@ -6724,12 +6724,56 @@ _MCP_CATEGORY_GROUPBY = "t.category_id, c.name, c.emoji, t.category"
 def _mcp_category_display(row) -> str:
     if row["cat_name"]:
         return f"{row['cat_emoji']} {row['cat_name']}".strip()
-    return row["legacy_category"] or "📦 Boshqa"
+    if row["legacy_category"]:
+        return row["legacy_category"]
+    # category_id ham, eski matn ustuni ham bo'sh — bu haqiqatan
+    # kategoriyasiz yozuv, "📦 Boshqa" (haqiqiy kategoriya nomi) bilan
+    # aralashtirmaslik uchun alohida ko'rsatiladi.
+    return "❓ Aniqlanmagan"
 
 def _mcp_pct_change(cur: float, prev: float) -> "float | None":
     if prev == 0:
         return None if cur == 0 else 100.0
     return round((cur - prev) / prev * 100, 1)
+
+def _mcp_stats_where(user_id: int, from_d: date, to_d: date,
+                      side: "str | None" = None,
+                      category_ids: "list[int] | None" = None):
+    """get_summary/get_spending_overview/get_category_stats/compare_periods/
+    generate_pdf_report — BARCHASI shu bir xil filtrni ishlatadi. Totals va
+    category breakdown har doim AYNAN shu WHERE'dan hisoblanadi, shuning
+    uchun ular orasida jami hech qachon mos kelmay qolishi mumkin emas
+    (category_id IS NULL yozuvlar ham "❓ Aniqlanmagan" sifatida hisobga
+    kiradi — jamidan tushib qolmaydi)."""
+    where = ("WHERE t.telegram_id = $1 AND t.is_deleted = FALSE "
+             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2 "
+             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3")
+    args: list = [user_id, from_d, to_d]
+    if side is not None:
+        where += f" AND t.type = ${len(args) + 1}"
+        args.append(side)
+    if category_ids:
+        where += f" AND t.category_id = ANY(${len(args) + 1}::int[])"
+        args.append(category_ids)
+    return where, args
+
+async def _mcp_totals(conn, where: str, args: list) -> dict:
+    row = await conn.fetchrow(f"""
+        SELECT COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'income'), 0)  AS income,
+               COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'), 0) AS expense
+        FROM transactions t
+        {where}
+    """, *args)
+    return {"income": float(row["income"]), "expense": float(row["expense"])}
+
+async def _mcp_category_breakdown(conn, where: str, args: list):
+    return await conn.fetch(f"""
+        SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt, COUNT(*) AS cnt
+        FROM transactions t {_MCP_CATEGORY_JOIN}
+        {where}
+        GROUP BY {_MCP_CATEGORY_GROUPBY}
+        ORDER BY amt DESC
+    """, *args)
 
 async def _mcp_get_summary(user_id: int, params: dict) -> dict:
     """get_summary v2: from_date/to_date berilmasa joriy oy, + o'tgan
@@ -6751,31 +6795,22 @@ async def _mcp_get_summary(user_id: int, params: dict) -> dict:
     prev_to   = from_d - timedelta(days=1)
     prev_from = prev_to - timedelta(days=period_days - 1)
 
-    async def _period_totals(conn, f, t):
-        row = await conn.fetchrow("""
-            SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)  AS income,
-                   COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS expense
-            FROM transactions
-            WHERE telegram_id = $1 AND is_deleted = FALSE
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
-        """, user_id, f, t)
-        return float(row["income"]), float(row["expense"])
+    where_cur,  args_cur  = _mcp_stats_where(user_id, from_d, to_d)
+    where_prev, args_prev = _mcp_stats_where(user_id, prev_from, prev_to)
+    where_exp,  args_exp  = _mcp_stats_where(user_id, from_d, to_d, side="expense")
 
     async with db_pool.acquire() as conn:
-        income, expense = await _period_totals(conn, from_d, to_d)
-        prev_income, prev_expense = await _period_totals(conn, prev_from, prev_to)
-        top_rows = await conn.fetch(f"""
-            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
-            FROM transactions t {_MCP_CATEGORY_JOIN}
-            WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = 'expense'
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3
-            GROUP BY {_MCP_CATEGORY_GROUPBY}
-            ORDER BY amt DESC
-            LIMIT 5
-        """, user_id, from_d, to_d)
+        totals_cur  = await _mcp_totals(conn, where_cur, args_cur)
+        totals_prev = await _mcp_totals(conn, where_prev, args_prev)
+        # top_categories shu YAGONA SQL agregatsiyadan keladi (get_spending_overview
+        # bilan bir xil helper) — expense jami va kategoriya yig'indisi hech qachon
+        # mos kelmay qolmaydi (category_id IS NULL yozuvlar ham "❓ Aniqlanmagan"
+        # sifatida shu yerda hisoblanadi, tushib qolmaydi).
+        top_rows = (await _mcp_category_breakdown(conn, where_exp, args_exp))[:5]
         budget = await get_budget(user_id)
+
+    income, expense = totals_cur["income"], totals_cur["expense"]
+    prev_income, prev_expense = totals_prev["income"], totals_prev["expense"]
 
     return {
         "from_date": from_d.isoformat(), "to_date": to_d.isoformat(),
@@ -6808,11 +6843,6 @@ async def _mcp_get_spending_overview(user_id: int, params: dict) -> dict:
     if side not in ("income", "expense"):
         return {"error": "validation_error", "message": "side 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
 
-    where = ("WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = $2 "
-             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $3 "
-             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $4")
-    args: list = [user_id, side, from_d, to_d]
-
     category_ids = params.get("category_ids")
     if category_ids:
         try:
@@ -6820,20 +6850,17 @@ async def _mcp_get_spending_overview(user_id: int, params: dict) -> dict:
         except (TypeError, ValueError):
             return {"error": "validation_error",
                     "message": "category_ids butun sonlar ro'yxati bo'lishi kerak.", "hint": ""}
-        where += f" AND t.category_id = ANY(${len(args) + 1}::int[])"
-        args.append(category_ids)
+
+    # get_summary bilan BIR XIL where-builder — total (totals query) va
+    # categories (breakdown query) aynan shu bir predikatdan hisoblanadi,
+    # shuning uchun ular orasida jami mos kelmay qolishi mumkin emas.
+    where, args = _mcp_stats_where(user_id, from_d, to_d, side=side, category_ids=category_ids)
 
     async with db_pool.acquire() as conn:
-        total = await conn.fetchval(f"SELECT COALESCE(SUM(t.amount), 0) FROM transactions t {where}", *args)
-        rows = await conn.fetch(f"""
-            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt, COUNT(*) AS cnt
-            FROM transactions t {_MCP_CATEGORY_JOIN}
-            {where}
-            GROUP BY {_MCP_CATEGORY_GROUPBY}
-            ORDER BY amt DESC
-        """, *args)
+        totals = await _mcp_totals(conn, where, args)
+        rows = await _mcp_category_breakdown(conn, where, args)
 
-    total = float(total)
+    total = totals[side]
     return {
         "from_date": from_d.isoformat(), "to_date": to_d.isoformat(), "side": side,
         "total": total,
@@ -6863,11 +6890,6 @@ async def _mcp_get_category_stats(user_id: int, params: dict) -> dict:
     if side not in ("income", "expense"):
         return {"error": "validation_error", "message": "side 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
 
-    where = ("WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = $2 "
-             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $3 "
-             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $4")
-    args: list = [user_id, side, from_d, to_d]
-
     category_ids = params.get("category_ids")
     if category_ids:
         try:
@@ -6875,16 +6897,11 @@ async def _mcp_get_category_stats(user_id: int, params: dict) -> dict:
         except (TypeError, ValueError):
             return {"error": "validation_error",
                     "message": "category_ids butun sonlar ro'yxati bo'lishi kerak.", "hint": ""}
-        where += f" AND t.category_id = ANY(${len(args) + 1}::int[])"
-        args.append(category_ids)
+
+    where, args = _mcp_stats_where(user_id, from_d, to_d, side=side, category_ids=category_ids)
 
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(f"""
-            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
-            FROM transactions t {_MCP_CATEGORY_JOIN}
-            {where}
-            GROUP BY {_MCP_CATEGORY_GROUPBY}
-        """, *args)
+        rows = await _mcp_category_breakdown(conn, where, args)
         cat_rows = await conn.fetch(
             "SELECT id, name, emoji, parent_id FROM categories WHERE telegram_id IS NULL OR telegram_id = $1",
             user_id)
@@ -6897,7 +6914,7 @@ async def _mcp_get_category_stats(user_id: int, params: dict) -> dict:
         amt = float(r["amt"])
         cid = r["category_id"]
         if cid is None or cid not in cat_lookup:
-            key = ("legacy", r["legacy_category"] or "📦 Boshqa")
+            key = ("legacy", _mcp_category_display(r))
             node = roots.setdefault(key, {"category_id": None, "category": key[1],
                                            "amount": 0.0, "children": []})
             node["amount"] += amt
@@ -7011,14 +7028,8 @@ async def _mcp_compare_periods(user_id: int, params: dict) -> dict:
         return {"error": "validation_error", "message": "side 'income' yoki 'expense' bo'lishi kerak.", "hint": ""}
 
     async def _by_category(conn, f, t):
-        rows = await conn.fetch(f"""
-            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
-            FROM transactions t {_MCP_CATEGORY_JOIN}
-            WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = $2
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $3
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $4
-            GROUP BY {_MCP_CATEGORY_GROUPBY}
-        """, user_id, side, f, t)
+        where, args = _mcp_stats_where(user_id, f, t, side=side)
+        rows = await _mcp_category_breakdown(conn, where, args)
         out = {}
         for r in rows:
             key = r["category_id"] if r["category_id"] is not None else f"text:{r['legacy_category']}"
@@ -7331,6 +7342,18 @@ async def _mcp_get_profile(user_id: int, params: dict) -> dict:
         "timezone": "Asia/Tashkent",
         "monthly_budget": float(row["budget"]) if row["budget"] else 0.0,
         "registered_at": row["registered_at"].isoformat() if row["registered_at"] else None,
+    }
+
+async def _mcp_list_balances(user_id: int, params: dict) -> dict:
+    bals = await get_balances(user_id)
+    items = [
+        {"id": b["id"], "name": b["name"], "type": b["type"], "amount": float(b["amount"])}
+        for b in bals
+    ]
+    return {
+        "items": items,
+        "summaries": {"count": len(items), "total_amount": sum(i["amount"] for i in items)},
+        "meta": {"page": 1, "limit": len(items) or 1, "hasMore": False},
     }
 
 def _mcp_pagination(params: dict) -> "tuple[int, int, int]":
@@ -7647,30 +7670,18 @@ async def _mcp_generate_pdf_report(user_id: int, params: dict) -> dict:
     if from_d > to_d:
         return {"error": "validation_error", "message": "from_date to_date'dan katta bo'lishi mumkin emas.", "hint": ""}
 
+    where_all, args_all = _mcp_stats_where(user_id, from_d, to_d)
+    where_exp, args_exp = _mcp_stats_where(user_id, from_d, to_d, side="expense")
+
     async with db_pool.acquire() as conn:
         user_row = await conn.fetchrow("SELECT name, budget FROM users WHERE telegram_id = $1", user_id)
-        totals = await conn.fetchrow("""
-            SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)  AS income,
-                   COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS expense
-            FROM transactions
-            WHERE telegram_id = $1 AND is_deleted = FALSE
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
-        """, user_id, from_d, to_d)
-        cat_rows = await conn.fetch(f"""
-            SELECT {_MCP_CATEGORY_SELECT}, SUM(t.amount) AS amt
-            FROM transactions t {_MCP_CATEGORY_JOIN}
-            WHERE t.telegram_id = $1 AND t.is_deleted = FALSE AND t.type = 'expense'
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3
-            GROUP BY {_MCP_CATEGORY_GROUPBY}
-            ORDER BY amt DESC
-        """, user_id, from_d, to_d)
+        totals = await _mcp_totals(conn, where_all, args_all)
+        cat_rows = await _mcp_category_breakdown(conn, where_exp, args_exp)
 
     stats = {
-        "income": float(totals["income"]),
-        "expenses": float(totals["expense"]),
-        "balance": float(totals["income"]) - float(totals["expense"]),
+        "income": totals["income"],
+        "expenses": totals["expense"],
+        "balance": totals["income"] - totals["expense"],
     }
     cat_stats = {_mcp_category_display(r): float(r["amt"]) for r in cat_rows}
     user_name = (user_row["name"] if user_row else "") or "Foydalanuvchi"
@@ -7777,6 +7788,7 @@ _MCP_TOOLS = {
     "get_debts":           _mcp_get_debts,
     "whoami":              _mcp_whoami,
     "get_profile":         _mcp_get_profile,
+    "list_balances":       _mcp_list_balances,
     "list_categories":     _mcp_list_categories,
     "get_used_categories": _mcp_get_used_categories,
     "list_subcategories":  _mcp_list_subcategories,
@@ -7983,6 +7995,21 @@ _MCP_TOOLS_SCHEMA = [
             "kabi savollarga.\n\n"
             "❌ Statistika uchun EMAS — get_summary chaqiring.\n\n"
             "Premium talab qilmaydi — har doim ishlaydi."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_balances",
+        "description": (
+            "Foydalanuvchining barcha hisoblari/balanslari (naqd, karta, "
+            "hamyon va h.k.) — ID, nom, tur, joriy summa.\n\n"
+            "✅ SHU TOOL'NI ishlating: add_transaction/add_debt/return_debt/"
+            "partial_return_debt'da balance_id (sync_to_balance=true bo'lganda) "
+            "kerak bo'lganda — balance_id olishning BOSHQA yo'li yo'q. Shuningdek "
+            "\"qaysi hisoblarim bor\", \"kartamda qancha pul bor\" kabi savollarga.\n\n"
+            "❌ Umumiy jami balans uchun EMAS (garchi summaries.total_amount buni "
+            "ham beradi) — davr bo'yicha tahlil kerak bo'lsa get_balance_timeseries "
+            "chaqiring."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
