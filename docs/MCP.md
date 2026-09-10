@@ -11,9 +11,9 @@ sozlamalar, PDF hisobot. Barchasi premium obuna talab qiladi (`whoami` va
 
 ## 1. Ulanish
 
-Ikki xil ulanish usuli bor — ikkalasi ham bir vaqtda ishlaydi.
+Uch xil ulanish usuli bor — barchasi bir vaqtda ishlaydi.
 
-### A) OAuth (tavsiya etiladi — "bitta manzil joylashtirib ulash")
+### A) OAuth (Claude uchun tavsiya etiladi — "bitta manzil joylashtirib ulash")
 
 Claude ulanish oynasida faqat manzilni kiriting, qolganini Claude o'zi
 so'raydi:
@@ -43,10 +43,30 @@ https://personal-budget-6mr0.onrender.com/mcp/2
 qanday maxsus ma'noga ega emas — qaysi Telegram hisobiga ulanish
 `/mcp_login` kodi orqali aniqlanadi, URL'dagi raqam orqali emas.)
 
-### B) Doimiy token (Claude Desktop config uchun qulay)
+### B) Bitta URL (istalgan MCP mijoziga — Claude, ChatGPT va h.k.)
 
-Telegram botga `/mcp_ulash [nom]` yuboring — token va tayyor config bloki
-keladi:
+Sozlamalar → **"🔗 AI'ga ulash"** tugmasini bosing (yoki botga
+`/mcp_ulash [nom]` yuboring). Token **URL ichiga joylangan holda**
+qaytadi:
+
+```
+https://personal-budget-6mr0.onrender.com/mcp/TOKEN_BU_YERGA
+```
+
+Shu manzilni connector/MCP-server maydoniga joylashtirish kifoya —
+`Authorization` header sozlash yoki OAuth login qilish shart emas
+(Hisobchi AI'dagi "bitta tugma — bitta URL" tajribasi bilan bir xil).
+Bu — Authorization header'ni qo'llab-quvvatlamaydigan mijozlar (masalan,
+faqat oddiy URL qabul qiladigan connector maydonlari) uchun eng oson yo'l.
+
+⚠️ Bu URL **parol kabi maxfiy** — kimga bersangiz, o'sha odam sizning
+barcha moliyaviy ma'lumotlaringizga to'liq kirish huquqiga ega bo'ladi.
+Hech kimga yubormang, screenshot qilib tarqatmang.
+
+### C) Doimiy token + Claude Desktop config (header-based)
+
+Xuddi shu `/mcp_ulash [nom]` javobida (yoki "🔗 AI'ga ulash" tugmasida)
+tayyor config bloki ham keladi:
 
 ```json
 {
@@ -62,14 +82,16 @@ keladi:
 Bu faylni Claude Desktop'ning `claude_desktop_config.json` fayliga
 qo'shing va Claude Desktop'ni qayta ishga tushiring.
 
-Token **muddatsiz** — faqat qo'lda bekor qilinadi:
+B va C — **BIR XIL token'dan** foydalanadi (bitta so'rovda ikkalasi ham
+qaytadi), faqat auth usuli farq qiladi (URL segmenti vs header). Token
+**muddatsiz** — faqat qo'lda bekor qilinadi:
 
 - `/mcp_royxat` — faol tokenlar ro'yxati (label + oxirgi ishlatilgan sana)
 - `/mcp_ochirish <nom>` — tokenni bekor qilish
 
 Ikkinchi (uchinchi, ...) hisob uchun — o'sha hisobdan botga
-`/mcp_ulash Ikkinchi akkaunt` yuboring, config'ga yana bitta server
-qo'shing (nomi boshqacha, `url` bir xil, `Authorization` boshqa token).
+`/mcp_ulash Ikkinchi akkaunt` yuboring (yoki tugmani bosing), yangi
+token/URL keladi — bu avvalgisidan mustaqil, alohida bekor qilinadi.
 
 ---
 
@@ -219,6 +241,10 @@ Ro'yxat qaytaradigan tool'lar (`list_transactions`, `get_reports`,
 - Har chaqiruv `mcp_audit_log` jadvaliga yoziladi (summalar emas, faqat
   hash — maxfiylik uchun).
 - Token hash (SHA-256) saqlanadi, ochiq qiymat hech qayerda turmaydi.
+- URL ichiga joylangan token (1B usul) va PDF havolasi (`/reports/...`)
+  serverning HTTP access log'iga yozilmasligi uchun `access_log=None`
+  o'rnatilgan — server loglarida to'liq so'rov manzili (token bilan
+  birga) hech qachon saqlanmaydi.
 
 ---
 

@@ -17,6 +17,7 @@ kerak). DB yo'q bo'lsa bu fayldagi testlar SKIP qilinadi.
 
 import hashlib
 import hmac
+import json
 
 import pytest
 
@@ -79,6 +80,73 @@ async def test_revoke_wrong_label_returns_false(db):
     await bot.create_mcp_api_token(USER_A, "Asosiy")
     ok = await bot.revoke_mcp_api_token(USER_A, "Mavjud bo'lmagan nom")
     assert ok is False
+
+
+async def _mcp_http_client():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    app = bot.web.Application()
+    app.router.add_post("/mcp", bot.mcp_jsonrpc_handler)
+    app.router.add_post("/mcp/{account}", bot.mcp_jsonrpc_handler)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    return client
+
+
+@requires_db
+async def test_mcp_jsonrpc_accepts_token_embedded_in_url_path(db):
+    """"🔗 AI'ga ulash" — Authorization header talab qilmaydigan, bitta
+    URL bilan ulanish (token "/mcp/<token>" segmentida). Hisobchi AI'dagi
+    "bitta manzil, hech narsa sozlash shart emas" tajribasi bilan bir xil."""
+    token = await bot.create_mcp_api_token(USER_A, "Bitta URL testi")
+    client = await _mcp_http_client()
+    try:
+        resp = await client.post(f"/mcp/{token}", json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}},
+        })
+        assert resp.status == 200
+        body = await resp.json()
+        result = json.loads(body["result"]["content"][0]["text"])
+        assert result["user_id"] == USER_A
+    finally:
+        await client.close()
+
+
+@requires_db
+async def test_mcp_jsonrpc_header_auth_still_works_on_cosmetic_account_path(db):
+    """Eski "/mcp/2" (kosmetik, ikkinchi akkaunt uchun Claude'ga boshqa URL
+    ko'rsatish uchun) — header orqali auth hamon ishlashi kerak, path
+    segmenti ("2") shunchaki e'tiborsiz qoldiriladi."""
+    token = await bot.create_mcp_api_token(USER_A, "Header testi")
+    client = await _mcp_http_client()
+    try:
+        resp = await client.post(
+            "/mcp/2",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "whoami", "arguments": {}}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        result = json.loads(body["result"]["content"][0]["text"])
+        assert result["user_id"] == USER_A
+    finally:
+        await client.close()
+
+
+@requires_db
+async def test_mcp_jsonrpc_rejects_garbage_path_token(db):
+    client = await _mcp_http_client()
+    try:
+        resp = await client.post("/mcp/not-a-real-token", json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}},
+        })
+        body = await resp.json()
+        assert "error" in body
+    finally:
+        await client.close()
 
 
 # ===================== KATEGORIYALAR (Bosqich 1 + 5) =====================

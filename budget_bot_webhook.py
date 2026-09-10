@@ -2598,6 +2598,7 @@ def sozlamalar_keyboard(user_id=None):
     buttons = [
         [InlineKeyboardButton("💳 Balanslar", callback_data="balances")],
         [InlineKeyboardButton("⏰ Eslatma vaqti", callback_data="reminder_settings")],
+        [InlineKeyboardButton("🔗 AI'ga ulash", callback_data="mcp_connect_link")],
         [InlineKeyboardButton("📖 Qo'llanma", callback_data="guide")],
         [InlineKeyboardButton("🗑️ Ma'lumotlarni tozalash", callback_data="clear_month")],
     ]
@@ -3366,6 +3367,42 @@ def _mcp_config_slug(label: str) -> str:
         slug = slug.replace("--", "-")
     return slug or "oson-byudjet"
 
+def _mcp_token_message(label: str, token: str) -> str:
+    """/mcp_ulash buyrug'i va "🔗 AI'ga ulash" tugmasi UMUMIY foydalanadigan
+    xabar matni. Ikki usul ko'rsatiladi:
+    1) Bitta URL (token manzil ichida) — Authorization header'ni qo'llab-
+       quvvatlamaydigan har qanday MCP mijoziga (Hisobchi AI'dagi kabi)
+       shunchaki shu URL'ni joylashtirish kifoya.
+    2) Claude Desktop config bloki — header-based auth qo'llab-quvvatlagan
+       mijozlar uchun.
+    Ikkalasi ham BIR XIL tokendan foydalanadi (mcp_jsonrpc_handler ikkala
+    yo'ldan ham xuddi shu resolve_mcp_auth orqali tekshiradi)."""
+    slug = _mcp_config_slug(label)
+    one_click_url = f"{WEBHOOK_URL}/mcp/{token}"
+    config_snippet = (
+        "{\n"
+        '  "mcpServers": {\n'
+        f'    "{slug}": {{\n'
+        f'      "url": "{WEBHOOK_URL}/mcp",\n'
+        '      "headers": { "Authorization": "Bearer ' + token + '" }\n'
+        "    }\n"
+        "  }\n"
+        "}"
+    )
+    return (
+        "🔑 <b>Yangi MCP ulanish yaratildi</b>\n\n"
+        f"Nom: <b>{html.escape(label)}</b>\n\n"
+        "⚠️ Quyidagi manzil/token <b>faqat shu yerda, bir marta</b> ko'rsatiladi — "
+        "saqlab qo'ying, boshqa hech kimga yubormang.\n"
+        "⏰ Muddatsiz amal qiladi, faqat <code>/mcp_ochirish</code> orqali bekor qilinadi.\n\n"
+        "<b>1) Bitta manzil bilan ulash (istalgan AI'ga — Claude, ChatGPT va h.k.):</b>\n"
+        "Shu manzilni connector/MCP manzili sifatida joylashtiring, boshqa hech narsa "
+        "sozlash shart emas:\n"
+        f"<code>{html.escape(one_click_url)}</code>\n\n"
+        "<b>2) Claude Desktop config (claude_desktop_config.json):</b>\n"
+        f"<pre>{html.escape(config_snippet)}</pre>"
+    )
+
 async def mcp_ulash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/mcp_ulash [nom] — P0: bitta /mcp manzili uchun doimiy (muddatsiz,
     faqat qo'lda /mcp_ochirish bilan bekor qilinadigan) token yaratadi.
@@ -3385,27 +3422,7 @@ async def mcp_ulash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = f"Hisob {len(existing) + 1}"
 
     token = await create_mcp_api_token(user_id, label)
-    slug = _mcp_config_slug(label)
-    config_snippet = (
-        "{\n"
-        '  "mcpServers": {\n'
-        f'    "{slug}": {{\n'
-        f'      "url": "{WEBHOOK_URL}/mcp",\n'
-        '      "headers": { "Authorization": "Bearer ' + token + '" }\n'
-        "    }\n"
-        "  }\n"
-        "}"
-    )
-    await update.message.reply_text(
-        "🔑 <b>Yangi MCP token yaratildi</b>\n\n"
-        f"Nom: <b>{html.escape(label)}</b>\n\n"
-        f"<code>{token}</code>\n\n"
-        "⚠️ Bu token <b>faqat shu yerda, bir marta</b> ko'rsatiladi — saqlab qo'ying.\n"
-        "⏰ Muddatsiz amal qiladi, faqat <code>/mcp_ochirish</code> orqali bekor qilinadi.\n\n"
-        "<b>Claude Desktop config (claude_desktop_config.json):</b>\n"
-        f"<pre>{html.escape(config_snippet)}</pre>",
-        parse_mode="HTML",
-    )
+    await update.message.reply_text(_mcp_token_message(label, token), parse_mode="HTML")
 
 async def mcp_royxat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/mcp_royxat — faol (bekor qilinmagan) MCP tokenlar ro'yxati."""
@@ -4877,6 +4894,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Bekor qilish uchun /start bosing.",
             parse_mode="HTML"
         )
+
+    # ---------- AI'GA ULASH (MCP token, bitta URL) ----------
+    elif data == "mcp_connect_link":
+        if not await is_user_premium(user_id):
+            await safe_edit(
+                "❌ Bu funksiya faqat premium foydalanuvchilar uchun.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Sozlamalar", callback_data="back_main")
+                ]]),
+            )
+            return
+        existing = await list_mcp_api_tokens(user_id)
+        label = f"Hisob {len(existing) + 1}"
+        token = await create_mcp_api_token(user_id, label)
+        await query.message.reply_text(_mcp_token_message(label, token), parse_mode="HTML")
+        return
 
     # ---------- QO'LLANMA ----------
     elif data == "guide":
@@ -8608,7 +8642,16 @@ def _mcp_www_authenticate(request: "web.Request | None" = None) -> str:
 async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
     t0 = time.monotonic()
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+    else:
+        # Header yo'q — "/mcp/{account}" manzilidagi segment token bo'lishi
+        # mumkin ("🔗 AI'ga ulash" — bitta URL, header sozlash shart emas,
+        # Hisobchi AI'dagi kabi). Haqiqiy /mcp/2 kabi kosmetik qiymatlar
+        # resolve_mcp_auth'da shunchaki mos kelmay 401 qaytaradi.
+        token = request.match_info.get("account")
+
+    if not token:
         await _mcp_write_audit_log(None, None, None, None, None,
                                     "unauthorized", int((time.monotonic() - t0) * 1000))
         return web.Response(
@@ -8618,7 +8661,6 @@ async def mcp_jsonrpc_handler(request: web.Request) -> web.Response:
             headers={"WWW-Authenticate": _mcp_www_authenticate(request)},
         )
 
-    token = auth[7:]
     auth_info = await resolve_mcp_auth(token)
     if not auth_info:
         await _mcp_write_audit_log(None, None, None, None, None,
@@ -8903,7 +8945,14 @@ async def main():
     web_app.router.add_get("/reports/{token}.pdf", mcp_pdf_report_handler)
     web_app.router.add_post("/token", oauth_token_handler)
 
-    runner = web.AppRunner(web_app)
+    # access_log=None: MCP token endi URL segmenti sifatida ham keladi
+    # ("/mcp/<token>" — "🔗 AI'ga ulash", header shart emas) va
+    # "/reports/{token}.pdf" PDF havolasi ham shunday — standart aiohttp
+    # access log HAR SO'ROVNI to'liq manzili bilan log'ga yozadi, bu
+    # tokenlarni Render log'larida ochiq qoldiradi. Xato/audit log
+    # (logger.exception, mcp_audit_log jadvali) bundan mustasno — ular hash
+    # yoki xato matnigina yozadi, token emas.
+    runner = web.AppRunner(web_app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
