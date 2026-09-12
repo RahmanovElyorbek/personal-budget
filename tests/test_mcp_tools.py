@@ -101,6 +101,44 @@ async def test_late_night_tashkent_transaction_counted_on_correct_day(db):
 
     res = await bot._mcp_get_summary(USER_A, {"from_date": "2026-09-13", "to_date": "2026-09-13"})
     assert res["expenses"] == 33000.0
+
+
+# ===================== SANA ORALIG'I HISOBOTI — _chunk_telegram_text =====================
+# Bug: sana oralig'i hisoboti ko'p tranzaksiyada Telegram'ning 4096
+# (oddiy xabar) / 1024 (photo caption) belgi chegarasidan oshib, botning
+# javobsiz "qotib qolishiga" olib kelardi (send_photo/edit_message_text
+# BadRequest bilan yiqilib, bu blokda try/except yo'qligi sababli).
+
+def test_chunk_telegram_text_short_returns_single_chunk():
+    assert bot._chunk_telegram_text("qisqa matn") == ["qisqa matn"]
+
+
+def test_chunk_telegram_text_never_returns_empty_list():
+    assert bot._chunk_telegram_text("") == [""]
+
+
+def test_chunk_telegram_text_splits_long_text_preserving_content():
+    text = "".join(f"qator {i}\n" for i in range(500))  # ~4000+ belgidan uzun
+    chunks = bot._chunk_telegram_text(text, limit=200)
+    assert len(chunks) > 1
+    assert all(len(c) <= 200 for c in chunks)
+    assert "".join(chunks) == text
+
+
+def test_chunk_telegram_text_hard_splits_single_oversized_line():
+    line = "a" * 500
+    chunks = bot._chunk_telegram_text(line, limit=200)
+    assert all(len(c) <= 200 for c in chunks)
+    assert "".join(chunks) == line
+
+
+def test_chunk_telegram_text_respects_default_telegram_limit():
+    text = "x" * 10000
+    chunks = bot._chunk_telegram_text(text)
+    assert all(len(c) <= bot._TELEGRAM_TEXT_LIMIT for c in chunks)
+    assert "".join(chunks) == text
+
+
 # ===================== AUTH — DB bilan =====================
 
 @requires_db

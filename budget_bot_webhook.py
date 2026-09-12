@@ -2342,6 +2342,29 @@ def calc_stats(transactions: list) -> dict:
 def format_money(amount: float) -> str:
     return f"{amount:,.0f} so'm"
 
+_TELEGRAM_TEXT_LIMIT = 4096
+
+def _chunk_telegram_text(text: str, limit: int = _TELEGRAM_TEXT_LIMIT) -> list:
+    """Telegram xabar matni limitidan (4096 belgi) oshib ketmasligi uchun
+    qator chegaralarida bo'lib beradi (bitta qator o'zi limitdan uzun
+    bo'lmasa hech qachon o'rtasidan kesmaydi). Har doim kamida bitta element
+    qaytaradi, hatto text bo'sh bo'lsa ham."""
+    if len(text) <= limit:
+        return [text]
+    chunks, current = [], ""
+    for line in text.splitlines(keepends=True):
+        if len(current) + len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            while len(line) > limit:
+                chunks.append(line[:limit])
+                line = line[limit:]
+        current += line
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
 # ===================== TRANZAKSIYA KARTASI (VAZIFA 2) =====================
 
 def _card_money(amount: float, force_minus: bool = False) -> str:
@@ -4445,7 +4468,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cat_stats = {}
         for t in txns:
             if t["type"] == "expense":
-                cat = t.get("category", "Boshqa")
+                cat = t.get("category") or "📦 Boshqa"
                 cat_stats[cat] = cat_stats.get(cat, 0) + float(t["amount"])
 
         range_kb = InlineKeyboardMarkup([[
@@ -4453,13 +4476,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
         ]])
 
+        # ⚠️ category/note/balance_name — foydalanuvchi kiritgan ERKIN matn
+        # (ovozli/matnli kiritish orqali "<", ">", "&" kabi belgilar ham
+        # kelishi mumkin) — html.escape() qilinmasa, parse_mode="HTML"
+        # Telegram tomonidan rad etiladi (butun hisobot "javob bermay"
+        # qolib ketadi, chunki bu blokda try/except yo'q).
         txn_lines = ""
         for t in txns[:20]:
             emoji    = "📥" if t["type"] == "income" else "📤"
             date_str = t["date"].strftime("%d.%m") if hasattr(t["date"], "strftime") else str(t["date"])[:10]
-            bal      = f" | 💳 {t['balance_name']}" if t.get("balance_name") else ""
-            note     = f" — {t['note']}" if t.get("note") else ""
-            txn_lines += f"{emoji} <b>{format_money(float(t['amount']))}</b> · {t.get('category','Boshqa')}{bal} | {date_str}{note}\n"
+            bal      = f" | 💳 {html.escape(t['balance_name'])}" if t.get("balance_name") else ""
+            note     = f" — {html.escape(t['note'])}" if t.get("note") else ""
+            cat_name = html.escape(t.get("category") or "📦 Boshqa")
+            txn_lines += f"{emoji} <b>{format_money(float(t['amount']))}</b> · {cat_name}{bal} | {date_str}{note}\n"
         if len(txns) > 20:
             txn_lines += f"\n<i>...va yana {len(txns) - 20} ta amaliyot</i>\n"
 
@@ -4467,14 +4496,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cat_stats, expenses, income, f"{start_str} — {end_str}"
         )
         if chart_buf:
+            # ⚠️ Telegram photo caption'i 1024 belgigacha cheklangan (oddiy
+            # xabar 4096) — sana oralig'i ko'p tranzaksiyani qamrab olsa,
+            # to'liq ro'yxat bilan caption oson shu chegaradan oshib ketadi
+            # va send_photo BadRequest bilan yiqiladi (hisobot "javob
+            # bermay" qolib ketardi). Shuning uchun caption'ga FAQAT qisqa
+            # va doim xavfsiz jami kiradi, to'liq ro'yxat alohida xabar
+            # sifatida (4096 limit bilan) yuboriladi.
             caption = (
                 f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
                 f"📥 Daromad: <b>{format_money(income)}</b>\n"
                 f"📤 Xarajat: <b>{format_money(expenses)}</b>\n"
                 f"💵 Balans:  <b>{format_money(balance)}</b>"
             )
-            if txn_lines:
-                caption += f"\n\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n" + txn_lines
             try:
                 await query.message.delete()
             except Exception:
@@ -4484,8 +4518,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 photo=chart_buf,
                 caption=caption,
                 parse_mode="HTML",
-                reply_markup=range_kb,
+                reply_markup=range_kb if not txn_lines else None,
             )
+            if txn_lines:
+                chunks = _chunk_telegram_text(f"📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n" + txn_lines)
+                for chunk in chunks[:-1]:
+                    await context.bot.send_message(chat_id=user_id, text=chunk, parse_mode="HTML")
+                await context.bot.send_message(
+                    chat_id=user_id, text=chunks[-1], parse_mode="HTML", reply_markup=range_kb
+                )
         else:
             msg = (
                 f"📅 <b>Hisobot: {start_str} — {end_str}</b>\n\n"
@@ -4500,12 +4541,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += "─" * 28 + "\n"
                 for cat, amt in sorted(cat_stats.items(), key=lambda x: -x[1]):
                     pct = int(amt / expenses * 100) if expenses else 0
-                    msg += f"  {cat}: <b>{format_money(amt)}</b> ({pct}%)\n"
+                    msg += f"  {html.escape(cat)}: <b>{format_money(amt)}</b> ({pct}%)\n"
             msg += f"\n📋 <b>Amaliyotlar ({len(txns)} ta):</b>\n"
             msg += "─" * 28 + "\n" + txn_lines
+            # ⚠️ Oddiy xabar ham 4096 belgidan oshsa Telegram rad etadi —
+            # juda uzun sana oralig'ida (ko'p tranzaksiya) shu ham sodir
+            # bo'lishi mumkin, shuning uchun xavfsiz chegarada bo'laklarga
+            # bo'lib yuboramiz.
+            chunks = _chunk_telegram_text(msg)
             await query.edit_message_text(
-                msg, parse_mode="HTML", reply_markup=range_kb
+                chunks[0], parse_mode="HTML",
+                reply_markup=range_kb if len(chunks) == 1 else None,
             )
+            for chunk in chunks[1:-1]:
+                await context.bot.send_message(chat_id=user_id, text=chunk, parse_mode="HTML")
+            if len(chunks) > 1:
+                await context.bot.send_message(
+                    chat_id=user_id, text=chunks[-1], parse_mode="HTML", reply_markup=range_kb
+                )
 
     # ---------- QARZLAR ----------
     elif data == "debts":
