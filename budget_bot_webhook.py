@@ -896,11 +896,11 @@ async def count_transactions(telegram_id: int) -> int:
 
 async def get_today_transactions(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT type, amount, category, note, date
             FROM transactions
             WHERE telegram_id = $1
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') = DATE(NOW() AT TIME ZONE 'Asia/Tashkent')
+              AND DATE({_tz_col('date')}) = DATE(NOW() AT TIME ZONE 'Asia/Tashkent')
             ORDER BY date DESC
         """, telegram_id)
         return [dict(r) for r in rows]
@@ -1110,27 +1110,27 @@ async def get_recent_transactions(telegram_id: int, limit: int = 8):
 
 async def get_month_transactions(telegram_id: int) -> list:
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT t.id, t.type, t.amount, t.category, t.category_id, t.note, t.date, b.name AS balance_name
             FROM transactions t
             LEFT JOIN balances b ON t.balance_id = b.id
             WHERE t.telegram_id = $1
               AND t.is_deleted = FALSE
-              AND DATE_TRUNC('month', t.date) = DATE_TRUNC('month', NOW())
+              AND DATE_TRUNC('month', {_tz_col('t.date')}) = DATE_TRUNC('month', NOW() AT TIME ZONE 'Asia/Tashkent')
             ORDER BY t.date DESC
         """, telegram_id)
         return [dict(r) for r in rows]
 
 async def get_transactions_by_month(telegram_id: int, year: int, month: int) -> list:
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT t.id, t.type, t.amount, t.category, t.category_id, t.note, t.date, b.name AS balance_name
             FROM transactions t
             LEFT JOIN balances b ON t.balance_id = b.id
             WHERE t.telegram_id = $1
               AND t.is_deleted = FALSE
-              AND EXTRACT(YEAR FROM t.date) = $2
-              AND EXTRACT(MONTH FROM t.date) = $3
+              AND EXTRACT(YEAR FROM {_tz_col('t.date')}) = $2
+              AND EXTRACT(MONTH FROM {_tz_col('t.date')}) = $3
             ORDER BY t.date DESC
         """, telegram_id, year, month)
         return [dict(r) for r in rows]
@@ -1150,24 +1150,24 @@ async def get_available_months(telegram_id: int) -> list:
 
 async def get_transactions_by_date_range(telegram_id: int, start_date, end_date) -> list:
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(f"""
             SELECT t.id, t.type, t.amount, t.category, t.category_id, t.note, t.date, b.name AS balance_name
             FROM transactions t
             LEFT JOIN balances b ON t.balance_id = b.id
             WHERE t.telegram_id = $1
               AND t.is_deleted = FALSE
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2
-              AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3
+              AND DATE({_tz_col('t.date')}) >= $2
+              AND DATE({_tz_col('t.date')}) <= $3
             ORDER BY t.date DESC
         """, telegram_id, start_date, end_date)
         return [dict(r) for r in rows]
 
 async def clear_month_transactions(telegram_id: int):
     async with db_pool.acquire() as conn:
-        await conn.execute("""
+        await conn.execute(f"""
             DELETE FROM transactions
             WHERE telegram_id = $1
-              AND DATE_TRUNC('month', date) = DATE_TRUNC('month', NOW())
+              AND DATE_TRUNC('month', {_tz_col('date')}) = DATE_TRUNC('month', NOW() AT TIME ZONE 'Asia/Tashkent')
         """, telegram_id)
 
 async def add_debt(telegram_id: int, person_name: str, amount: float,
@@ -2385,6 +2385,23 @@ def _tashkent_datetime_for_date(target_date: date) -> datetime:
     target_local = tz.localize(datetime.combine(target_date, now_local.time()))
     return target_local.astimezone(pytz.utc).replace(tzinfo=None)
 
+def _tz_col(col: str) -> str:
+    """SQL ifoda: berilgan UTC-naive timestamp ustunini ("t.date" kabi)
+    Toshkent devor vaqtiga TO'G'RI o'giradi.
+
+    ⚠️ Faqat "col AT TIME ZONE 'Asia/Tashkent'" ishlatish XATO — bu col
+    qiymatini (aslida UTC) ALLAQACHON Toshkent mahalliy vaqti deb
+    hisoblab, yana -5 soat suradi (natijada soat Toshkentda ~19:00-05:00
+    oralig'ida bo'lganda taqvim kuni bir kun OLDINGA noto'g'ri hisoblanadi
+    — pytest orqali aniqlangan, real xato edi). To'g'ri yo'l: avval
+    qiymatni UTC deb "belgilash" (AT TIME ZONE 'UTC' — naive'dan
+    timestamptz'ga o'tadi, +0 soat), SO'NG Toshkentga o'girish (yana AT
+    TIME ZONE 'Asia/Tashkent' — timestamptz'dan naive'ga, +5 soat).
+
+    NOW() bilan solishtirilganda BU FUNKSIYA KERAK EMAS — NOW() allaqachon
+    timestamptz, "NOW() AT TIME ZONE 'Asia/Tashkent'" o'zi to'g'ri."""
+    return f"({col} AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Tashkent'"
+
 async def build_saved_card(telegram_id: int, txn_type: str, amount: float,
                             category: str, note: str, tx_date: date,
                             balance_id: int = None) -> str:
@@ -3314,9 +3331,9 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         premium_users = await conn.fetchval(
             "SELECT COUNT(*) FROM users WHERE is_premium = TRUE AND premium_until > NOW()"
         )
-        today_active = await conn.fetchval("""
+        today_active = await conn.fetchval(f"""
             SELECT COUNT(DISTINCT telegram_id) FROM transactions
-            WHERE DATE(date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
+            WHERE DATE({_tz_col('date')}) = (NOW() AT TIME ZONE 'Asia/Tashkent')::date
         """)
         week_active = await conn.fetchval("""
             SELECT COUNT(DISTINCT telegram_id) FROM transactions
@@ -4812,9 +4829,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             premium_users = await conn.fetchval(
                 "SELECT COUNT(*) FROM users WHERE is_premium = TRUE AND premium_until > NOW()"
             )
-            today_active = await conn.fetchval("""
+            today_active = await conn.fetchval(f"""
                 SELECT COUNT(DISTINCT telegram_id) FROM transactions
-                WHERE DATE(date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
+                WHERE DATE({_tz_col('date')}) = (NOW() AT TIME ZONE 'Asia/Tashkent')::date
             """)
             week_active = await conn.fetchval("""
                 SELECT COUNT(DISTINCT telegram_id) FROM transactions
@@ -5794,12 +5811,12 @@ async def send_weekly_reports(bot):
                 continue
 
             async with db_pool.acquire() as conn:
-                rows = await conn.fetch("""
+                rows = await conn.fetch(f"""
                     SELECT type, amount, category, note, date
                     FROM transactions
                     WHERE telegram_id = $1
-                      AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
-                      AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
+                      AND DATE({_tz_col('date')}) >= $2
+                      AND DATE({_tz_col('date')}) <= $3
                 """, user_id, last_monday, last_sunday)
 
             if not rows:
@@ -6163,11 +6180,12 @@ async def send_daily_reminders(bot, force=False):
             SELECT u.telegram_id, u.name, u.reminder_miss_streak
             FROM users u
             LEFT JOIN user_streaks s ON s.telegram_id = u.telegram_id
-            WHERE (s.last_closed_date IS NULL OR s.last_closed_date != CURRENT_DATE)
+            WHERE (s.last_closed_date IS NULL
+                   OR s.last_closed_date != (NOW() AT TIME ZONE 'Asia/Tashkent')::date)
               AND NOT EXISTS (
                   SELECT 1 FROM transactions t
                   WHERE t.telegram_id = u.telegram_id
-                    AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE
+                    AND DATE({_tz_col('t.date')}) = (NOW() AT TIME ZONE 'Asia/Tashkent')::date
               )
               {hour_filter}
         """
@@ -6213,13 +6231,13 @@ async def send_daily_reminders(bot, force=False):
                 continue
 
             async with db_pool.acquire() as conn:
-                week_row = await conn.fetchrow("""
+                week_row = await conn.fetchrow(f"""
                     SELECT
                         COALESCE(SUM(CASE WHEN type='income' THEN amount END), 0) AS income,
                         COALESCE(SUM(CASE WHEN type='expense' THEN amount END), 0) AS expense
                     FROM transactions
                     WHERE telegram_id = $1
-                      AND date >= DATE_TRUNC('week', NOW())
+                      AND {_tz_col('date')} >= DATE_TRUNC('week', NOW() AT TIME ZONE 'Asia/Tashkent')
                 """, user_id)
 
             income = float(week_row["income"])
@@ -6345,10 +6363,10 @@ async def send_smart_alerts(bot):
                 if remaining_this_week <= 0:
                     break
                 async with db_pool.acquire() as conn:
-                    month_count = await conn.fetchval("""
+                    month_count = await conn.fetchval(f"""
                         SELECT COUNT(*) FROM smart_alerts_log
                         WHERE telegram_id = $1 AND category = $2
-                          AND sent_at >= DATE_TRUNC('month', NOW())
+                          AND {_tz_col('sent_at')} >= DATE_TRUNC('month', NOW() AT TIME ZONE 'Asia/Tashkent')
                     """, user_id, cat)
                 if month_count >= SMART_ALERT_MAX_PER_CATEGORY_PER_MONTH:
                     continue
@@ -6729,13 +6747,13 @@ async def _mcp_get_reports(user_id: int, params: dict) -> dict:
 
     if params.get("from_date"):
         try:
-            where += f" AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= ${len(args) + 1}"
+            where += f" AND DATE({_tz_col('date')}) >= ${len(args) + 1}"
             args.append(date.fromisoformat(params["from_date"]))
         except ValueError:
             return {"error": "validation_error", "message": "from_date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
     if params.get("to_date"):
         try:
-            where += f" AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= ${len(args) + 1}"
+            where += f" AND DATE({_tz_col('date')}) <= ${len(args) + 1}"
             args.append(date.fromisoformat(params["to_date"]))
         except ValueError:
             return {"error": "validation_error", "message": "to_date YYYY-MM-DD formatida bo'lishi kerak.", "hint": ""}
@@ -6832,9 +6850,9 @@ def _mcp_stats_where(user_id: int, from_d: date, to_d: date,
     uchun ular orasida jami hech qachon mos kelmay qolishi mumkin emas
     (category_id IS NULL yozuvlar ham "❓ Aniqlanmagan" sifatida hisobga
     kiradi — jamidan tushib qolmaydi)."""
-    where = ("WHERE t.telegram_id = $1 AND t.is_deleted = FALSE "
-             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') >= $2 "
-             "AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') <= $3")
+    where = (f"WHERE t.telegram_id = $1 AND t.is_deleted = FALSE "
+             f"AND DATE({_tz_col('t.date')}) >= $2 "
+             f"AND DATE({_tz_col('t.date')}) <= $3")
     args: list = [user_id, from_d, to_d]
     if side is not None:
         where += f" AND t.type = ${len(args) + 1}"
@@ -7063,22 +7081,22 @@ async def _mcp_get_balance_timeseries(user_id: int, params: dict) -> dict:
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(f"""
-            SELECT DATE_TRUNC('{trunc_unit}', date AT TIME ZONE 'Asia/Tashkent')::date AS bucket,
+            SELECT DATE_TRUNC('{trunc_unit}', {_tz_col('date')})::date AS bucket,
                    COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)
                      - COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS net
             FROM transactions
             WHERE telegram_id = $1 AND is_deleted = FALSE
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') >= $2
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') <= $3
+              AND DATE({_tz_col('date')}) >= $2
+              AND DATE({_tz_col('date')}) <= $3
             GROUP BY bucket
             ORDER BY bucket ASC
         """, user_id, from_d, to_d)
-        after_row = await conn.fetchrow("""
+        after_row = await conn.fetchrow(f"""
             SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'income'), 0)
                      - COALESCE(SUM(amount) FILTER (WHERE type = 'expense'), 0) AS net
             FROM transactions
             WHERE telegram_id = $1 AND is_deleted = FALSE
-              AND DATE(date AT TIME ZONE 'Asia/Tashkent') > $2
+              AND DATE({_tz_col('date')}) > $2
         """, user_id, to_d)
 
     net_by_bucket = {r["bucket"]: float(r["net"]) for r in rows}

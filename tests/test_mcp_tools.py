@@ -50,6 +50,59 @@ def test_pct_change_helper():
     assert bot._mcp_pct_change(100, 0) == 100.0
 
 
+def test_tz_col_wraps_utc_then_tashkent_conversion():
+    assert bot._tz_col("t.date") == "(t.date AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Tashkent'"
+
+
+# ===================== TOSHKENT SANA XATOSI (DATE AT TIME ZONE bug) =====================
+# transactions.date UTC devor vaqti sifatida (naive) saqlanadi. Faqat
+# "col AT TIME ZONE 'Asia/Tashkent'" (UTC deb belgilanmasdan) ishlatilsa,
+# soat Toshkentda ~19:00-05:00 oralig'ida bo'lgan tranzaksiyalar bir kun
+# OLDINGI sanaga tushib qolardi — bu testlar aynan shu holatni tekshiradi.
+
+@requires_db
+async def test_early_morning_tashkent_transaction_counted_on_correct_day(db):
+    """06:00 Toshkent vaqti = 01:00 UTC — bu ANIQ eski xato ko'rinadigan
+    oyna (agar "col AT TIME ZONE 'Asia/Tashkent'" to'g'ridan-to'g'ri
+    ishlatilsa, sana bir kun oldinga — 11-sentabrga — surilib ketardi)."""
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO transactions (telegram_id, type, amount, category, category_id, date, is_deleted)
+            VALUES ($1, 'expense', 77000, '🍔 Oziq-ovqat', 1, '2026-09-12 01:00:00'::timestamp, FALSE)
+            """,
+            USER_A,
+        )
+
+    on_correct_day = await bot._mcp_get_summary(USER_A, {
+        "from_date": "2026-09-12", "to_date": "2026-09-12",
+    })
+    assert on_correct_day["expenses"] == 77000.0
+
+    on_previous_day = await bot._mcp_get_summary(USER_A, {
+        "from_date": "2026-09-11", "to_date": "2026-09-11",
+    })
+    assert on_previous_day["expenses"] == 0.0
+
+
+@requires_db
+async def test_late_night_tashkent_transaction_counted_on_correct_day(db):
+    """23:59 UTC = 2026-09-13 04:59 Toshkent — bu ham eski xato ko'rinadigan
+    oyna (bir kun OLDINGA emas, bu holatda haqiqiy Toshkent kuni O'ZI
+    ertangi kun bo'lgani uchun yozuv noto'g'ri "bugun"ga tushib qolardi)."""
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO transactions (telegram_id, type, amount, category, category_id, date, is_deleted)
+            VALUES ($1, 'expense', 33000, '🍔 Oziq-ovqat', 1, '2026-09-12 23:59:00'::timestamp, FALSE)
+            """,
+            USER_A,
+        )
+
+    res = await bot._mcp_get_summary(USER_A, {"from_date": "2026-09-13", "to_date": "2026-09-13"})
+    assert res["expenses"] == 33000.0
+
+
 # ===================== SANA ORALIG'I HISOBOTI — _chunk_telegram_text =====================
 # Bug: sana oralig'i hisoboti ko'p tranzaksiyada Telegram'ning 4096
 # (oddiy xabar) / 1024 (photo caption) belgi chegarasidan oshib, botning
