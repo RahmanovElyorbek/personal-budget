@@ -45,6 +45,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.error import Forbidden, BadRequest, RetryAfter
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -287,6 +288,15 @@ async def init_db():
         max_size=5,
         timeout=30,
         command_timeout=60,
+        # Sessiya vaqt zonasini aniq UTC qilib belgilaymiz — bu bazaning
+        # server-level sozlamasidan qat'i nazar, NOW() defaultidan
+        # to'ldiriladigan naive TIMESTAMP ustunlar (transactions.date,
+        # users.registered_at va h.k.) doim UTC devor vaqtini saqlashini
+        # kafolatlaydi. _tz_col() butun kod bazasida aynan shu konvensiyaga
+        # tayanadi (avval sessiya tz sozlanmagan edi — Supabase loyihasi
+        # UTC'dan boshqa tz'da bo'lsa, yozuvlar "kelajakdagi" vaqt bilan
+        # saqlanib qolishi mumkin edi).
+        server_settings={"timezone": "UTC"},
     )
     async with db_pool.acquire() as conn:
         # DDL migrations uchun server-side statement timeout o'chiriladi
@@ -481,6 +491,18 @@ async def init_db():
                 sent_at     TIMESTAMP DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS notification_log (
+                id          SERIAL PRIMARY KEY,
+                user_id     BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                type        TEXT NOT NULL,
+                sent_at     TIMESTAMP DEFAULT NOW(),
+                blocked     BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_log_user_id ON notification_log(user_id)"
+        )
         # ---- 001_add_classifier_fields migratsiyasi (klassifikator: source,
         # is_deleted, currency, category_corrections) — batafsili va rollback
         # migrations/001_add_classifier_fields.py faylida ----
@@ -900,6 +922,7 @@ async def get_today_transactions(telegram_id: int) -> list:
             SELECT type, amount, category, note, date
             FROM transactions
             WHERE telegram_id = $1
+              AND is_deleted = FALSE
               AND DATE({_tz_col('date')}) = DATE(NOW() AT TIME ZONE 'Asia/Tashkent')
             ORDER BY date DESC
         """, telegram_id)
@@ -6162,31 +6185,159 @@ async def send_debt_reminders(bot):
 
 REMINDER_MISS_LIMIT = 5
 
+NOTIF_TYPE_REMINDER = "no_transaction_reminder"
+NOTIF_TYPE_DIGEST   = "daily_digest"
+NOTIF_TYPE_PAUSED   = "reminders_paused"
+
+# ~20 xabar/soniyadan oshmaslik uchun ommaviy yuborishda urinishlar orasidagi
+# minimal interval (0.05s = 20/s).
+_BROADCAST_MIN_INTERVAL = 0.05
+
+async def _log_notification(user_id: int, notif_type: str, blocked: bool):
+    """notification_log — 2 haftadan keyin bloklanish darajasini
+    (blocked=TRUE ulushi) o'lchash uchun. Har bir yuborish URINISHI
+    (muvaffaqiyatli yoki yo'q) bitta qator — 429 qayta urinishlar
+    bundan mustasno (ular muvaffaqiyatli urinishga birlashtiriladi)."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO notification_log (user_id, type, blocked) VALUES ($1, $2, $3)",
+            user_id, notif_type, blocked,
+        )
+
+async def _send_logged_message(bot, user_id: int, notif_type: str, **send_kwargs) -> bool:
+    """bot.send_message'ni xatolarni to'g'ri tasniflab yuboradi va
+    notification_log'ga yozadi:
+      - RetryAfter (429) — retry_after soniya kutib QAYTA yuboriladi;
+        bu urinish muvaffaqiyatsiz deb HISOBLANMAYDI (statistika
+        buzilmasligi uchun) — faqat yakuniy natija yoziladi.
+      - Forbidden (403) yoki "chat not found" (BadRequest) — blocked=TRUE.
+      - Boshqa har qanday xato — blocked=FALSE, lekin baribir urinish
+        sifatida qayd etiladi.
+    Qaytaradi: True — muvaffaqiyatli yuborildi, False — yuborilmadi."""
+    while True:
+        try:
+            await bot.send_message(chat_id=user_id, **send_kwargs)
+            await _log_notification(user_id, notif_type, blocked=False)
+            return True
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            continue
+        except Forbidden:
+            await _log_notification(user_id, notif_type, blocked=True)
+            return False
+        except BadRequest as e:
+            blocked = "chat not found" in str(e).lower()
+            await _log_notification(user_id, notif_type, blocked=blocked)
+            return False
+        except Exception as e:
+            logger.warning(f"⚠️ Xabar yuborilmadi {user_id} ({notif_type}): {e}")
+            await _log_notification(user_id, notif_type, blocked=False)
+            return False
+
+async def _build_daily_digest_message(user_id: int, name: str, registered_at) -> str:
+    """"Kunlik yakun" xabari — faqat MAVJUD MCP tool funksiyalaridan
+    (get_spending_overview, list_balances) yig'iladi, alohida SQL
+    yozilmaydi — aks holda bot va MCP turli raqam aytishi mumkin edi
+    (get_summary/get_spending_overview mos kelmasligi bilan bir xil
+    sinf xato). Kunlik jamlar (_mcp_expense_daily_sums) esa
+    _mcp_stats_where orqali — statistikaning qolgan qismi bilan bir xil
+    filtr."""
+    tz = pytz.timezone("Asia/Tashkent")
+    today = datetime.now(tz).date()
+    window_start = today - timedelta(days=7)
+    window_end   = today - timedelta(days=1)
+
+    today_overview = await _mcp_get_spending_overview(user_id, {
+        "from_date": today.isoformat(), "to_date": today.isoformat(), "side": "expense",
+    })
+    today_total = today_overview.get("total", 0.0)
+    categories  = today_overview.get("categories", [])
+
+    lines = [
+        f"🌙 <b>Assalomu alaykum, {html.escape(name)}!</b>",
+        "",
+        f"📊 <b>Kunlik yakun — {today.strftime('%d.%m.%Y')}</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📤 Bugun xarajat: <b>{_card_money(today_total)}</b>",
+    ]
+
+    if categories:
+        top, rest = categories[:3], categories[3:]
+        for c in top:
+            lines.append(f"   {html.escape(c['category'])} — {_card_money(c['amount'])} ({round(c['pct'])}%)")
+        if rest:
+            rest_amount = sum(c["amount"] for c in rest)
+            rest_pct = round(rest_amount / today_total * 100) if today_total else 0
+            lines.append(f"   📦 Boshqalar — {_card_money(rest_amount)} ({rest_pct}%)")
+
+    # Taqqoslash qatori — FAQAT uchala shart bajarilsa:
+    # (1) ro'yxatdan o'tganiga >=7 kun, (2) bazaviy davr jami xarajati >0,
+    # (3) bazaviy 7 kunning kamida 4 tasida xarajat yozuvi bor. Aks holda
+    # qator butunlay tushib qoladi (noto'g'ri foizdan ko'ra yo'qligi yaxshi).
+    history_ok = registered_at is not None and (today - registered_at.date()) >= timedelta(days=7)
+    if history_ok:
+        daily_sums = await _mcp_expense_daily_sums(user_id, window_start, window_end)
+        if len(daily_sums) >= 4 and sum(daily_sums.values()) > 0:
+            typical = statistics.median(daily_sums.values())
+            if typical > 0:
+                diff_pct = (today_total - typical) / typical * 100
+                lines.append("")
+                lines.append(f"📈 Odatiy kunlik sarf: <b>{_card_money(typical)}</b>")
+                if abs(diff_pct) <= 15:
+                    lines.append("   (odatdagidek sarfladingiz)")
+                elif diff_pct > 0:
+                    lines.append(f"   (bugun odatdagidan {round(diff_pct)}% ko'p)")
+                else:
+                    lines.append(f"   (bugun odatdagidan {round(abs(diff_pct))}% kam)")
+
+    balances = await _mcp_list_balances(user_id, {})
+    items = balances.get("items", [])
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💳 <b>Balanslaringiz:</b>")
+    shown = items[:3]
+    for b in shown:
+        lines.append(f"   {html.escape(b['name'])} — {_card_money(b['amount'])}")
+    if len(items) > 3:
+        lines.append(f"   va yana {len(items) - 3} ta hisob")
+        lines.append(f"   Jami (barcha hisoblar): <b>{_card_money(balances['summaries']['total_amount'])}</b>")
+    else:
+        lines.append(f"   Jami: <b>{_card_money(sum(b['amount'] for b in shown))}</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    return "\n".join(lines)
+
 async def send_daily_reminders(bot, force=False):
     """Har soat boshida ishga tushadi (scheduler), lekin har bir foydalanuvchiga
-    faqat O'ZI TANLAGAN soatda (users.reminder_hour) yuboradi. Bugun kuni
-    allaqachon yopilgan (tranzaksiya YOKI "Bugun xarajat bo'lmadi") bo'lsa —
-    yuborilmaydi. Ketma-ket 5 marta javobsiz qolsa — avtomatik o'chiriladi.
+    faqat O'ZI TANLAGAN soatda (users.reminder_hour) yuboradi. Ikki tarmoq:
+      - Bugun tranzaksiya YO'Q — "hozirgi" eslatma matni (o'zgarishsiz).
+      - Bugun tranzaksiya BOR — "kunlik yakun" (daily digest).
+    "✅ Bugun xarajat bo'lmadi" tugmasi bilan (tranzaksiyasiz) yopilgan kun —
+    ikkalasi ham yuborilmaydi (avvalgidek). Ketma-ket 5 marta javobsiz
+    qolsa — avtomatik o'chiriladi.
 
     force=True — admin test uchun (/testreminder, admin_send_reminder):
-    soat mosligini tekshirmasdan, bugun yopilmagan barcha foydalanuvchilarga
-    darhol yuboradi (o'chirilgan reminder_hour'ga qaramasdan)."""
+    soat mosligini tekshirmasdan, bugun (tranzaksiyasiz) yopilmagan barcha
+    foydalanuvchilarga darhol yuboradi (o'chirilgan reminder_hour'ga
+    qaramasdan)."""
     try:
         tz = pytz.timezone("Asia/Tashkent")
         current_hour = datetime.now(tz).hour
 
         hour_filter = "" if force else "AND u.reminder_hour = $1"
         query_sql = f"""
-            SELECT u.telegram_id, u.name, u.reminder_miss_streak
+            SELECT u.telegram_id, u.name, u.reminder_miss_streak, u.registered_at
             FROM users u
             LEFT JOIN user_streaks s ON s.telegram_id = u.telegram_id
-            WHERE (s.last_closed_date IS NULL
-                   OR s.last_closed_date != (NOW() AT TIME ZONE 'Asia/Tashkent')::date)
-              AND NOT EXISTS (
-                  SELECT 1 FROM transactions t
-                  WHERE t.telegram_id = u.telegram_id
-                    AND DATE({_tz_col('t.date')}) = (NOW() AT TIME ZONE 'Asia/Tashkent')::date
-              )
+            WHERE (
+                s.last_closed_date IS NULL
+                OR s.last_closed_date != (NOW() AT TIME ZONE 'Asia/Tashkent')::date
+                OR EXISTS (
+                    SELECT 1 FROM transactions t
+                    WHERE t.telegram_id = u.telegram_id
+                      AND t.is_deleted = FALSE
+                      AND DATE({_tz_col('t.date')}) = (NOW() AT TIME ZONE 'Asia/Tashkent')::date
+                )
+            )
               {hour_filter}
         """
         async with db_pool.acquire() as conn:
@@ -6197,6 +6348,7 @@ async def send_daily_reminders(bot, force=False):
         logger.info(f"📬 Eslatma soati {current_hour}:00 (force={force}) — {len(rows)} foydalanuvchi")
 
         sent = 0
+        digests = 0
         paused = 0
         failed = 0
         for row in rows:
@@ -6214,22 +6366,42 @@ async def send_daily_reminders(bot, force=False):
                     await conn.execute(
                         "UPDATE users SET reminder_hour = NULL, reminder_miss_streak = 0 "
                         "WHERE telegram_id = $1", user_id)
-                try:
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=(
-                            "🔕 <b>Eslatmalar to'xtatildi.</b>\n\n"
-                            f"{REMINDER_MISS_LIMIT} kun ketma-ket javobsiz qoldi. "
-                            "Qayta yoqish: ⚙️ Sozlamalar → ⏰ Eslatma vaqti"
-                        ),
-                        parse_mode="HTML"
-                    )
+                ok = await _send_logged_message(
+                    bot, user_id, NOTIF_TYPE_PAUSED,
+                    text=(
+                        "🔕 <b>Eslatmalar to'xtatildi.</b>\n\n"
+                        f"{REMINDER_MISS_LIMIT} kun ketma-ket javobsiz qoldi. "
+                        "Qayta yoqish: ⚙️ Sozlamalar → ⏰ Eslatma vaqti"
+                    ),
+                    parse_mode="HTML",
+                )
+                if ok:
                     paused += 1
-                except Exception as e:
-                    logger.warning(f"⚠️ Pauza xabari yuborilmadi {user_id}: {e}")
-                await asyncio.sleep(0.1)
+                else:
+                    failed += 1
+                await asyncio.sleep(_BROADCAST_MIN_INTERVAL)
                 continue
 
+            today_txns = await get_today_transactions(user_id)
+
+            if today_txns:
+                # ---------- KUNLIK YAKUN (bugun tranzaksiya BOR) ----------
+                text = await _build_daily_digest_message(user_id, name, row["registered_at"])
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
+                ])
+                ok = await _send_logged_message(
+                    bot, user_id, NOTIF_TYPE_DIGEST,
+                    text=text, parse_mode="HTML", reply_markup=markup,
+                )
+                if ok:
+                    digests += 1
+                else:
+                    failed += 1
+                await asyncio.sleep(_BROADCAST_MIN_INTERVAL)
+                continue
+
+            # ---------- ESLATMA (bugun tranzaksiya YO'Q) — o'zgarishsiz ----------
             async with db_pool.acquire() as conn:
                 week_row = await conn.fetchrow(f"""
                     SELECT
@@ -6263,23 +6435,25 @@ async def send_daily_reminders(bot, force=False):
                 [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
             ])
 
-            try:
-                await bot.send_message(
-                    chat_id=user_id, text=msg,
-                    parse_mode="HTML", reply_markup=markup
-                )
+            ok = await _send_logged_message(
+                bot, user_id, NOTIF_TYPE_REMINDER,
+                text=msg, parse_mode="HTML", reply_markup=markup,
+            )
+            if ok:
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE users SET reminder_miss_streak = reminder_miss_streak + 1 "
                         "WHERE telegram_id = $1", user_id)
                 sent += 1
-            except Exception as e:
+            else:
                 failed += 1
-                logger.warning(f"⚠️ Eslatma yuborilmadi {user_id}: {e}")
 
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(_BROADCAST_MIN_INTERVAL)
 
-        logger.info(f"✅ Eslatmalar: {sent} ta | 🔕 Pauza: {paused} ta | ❌ Xato: {failed} ta")
+        logger.info(
+            f"✅ Eslatmalar: {sent} ta | 📊 Kunlik yakun: {digests} ta | "
+            f"🔕 Pauza: {paused} ta | ❌ Xato: {failed} ta"
+        )
 
     except Exception as e:
         logger.error(f"❌ Eslatma funksiyasida xato: {e}")
@@ -6544,6 +6718,13 @@ async def _mcp_add_transaction(user_id: int, params: dict) -> dict:
 
     tx_id = await add_transaction(user_id, txn_type, amount, category_text, note,
                                    balance_id, date=tx_date, category_id=category_id)
+    # Bot native yo'llari (masalan _save_transaction, ovoz/matn orqali ko'p
+    # tranzaksiya) tranzaksiya qo'shilgach doim close_streak_day()ni
+    # chaqiradi — bu MCP orqali yozilganda ham bir xil bo'lishi kerak,
+    # aks holda reminder_miss_streak MCP-only foydalanuvchilar uchun hech
+    # qachon nolga tushmaydi va ular bekorga "yozuv kiritmadingiz" degan
+    # kunlik eslatma oladi.
+    await close_streak_day(user_id)
 
     debt_created = False
     if params.get("is_debt") and params.get("debt_name"):
@@ -6879,6 +7060,25 @@ async def _mcp_category_breakdown(conn, where: str, args: list):
         GROUP BY {_MCP_CATEGORY_GROUPBY}
         ORDER BY amt DESC
     """, *args)
+
+async def _mcp_expense_daily_sums(user_id: int, from_d: date, to_d: date) -> dict:
+    """Berilgan davrdagi HAR BIR kun uchun xarajat jamini qaytaradi
+    ({kun: jami}) — faqat yozuv BOR kunlar kiradi (yozuv yo'q kun
+    natijada umuman ko'rinmaydi, 0 bilan to'ldirilmaydi). "Kunlik yakun"
+    xabaridagi mediana va "tarix yetarlimi" (kamida 4/7 kun) tekshiruvi
+    uchun. _mcp_stats_where — get_summary/get_spending_overview bilan
+    BIR XIL where-builder — shuning uchun bu yerdagi kunlik jamlar ham
+    boshqa statistika tool'lari bilan hech qachon mos kelmay qolmaydi."""
+    where, args = _mcp_stats_where(user_id, from_d, to_d, side="expense")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT DATE({_tz_col('t.date')}) AS day, SUM(t.amount) AS daily_total
+            FROM transactions t
+            {where}
+            GROUP BY day
+            ORDER BY day
+        """, *args)
+    return {r["day"]: float(r["daily_total"]) for r in rows}
 
 async def _mcp_get_summary(user_id: int, params: dict) -> dict:
     """get_summary v2: from_date/to_date berilmasa joriy oy, + o'tgan
