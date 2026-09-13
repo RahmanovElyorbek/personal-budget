@@ -41,7 +41,26 @@ PALETTE = ["#6C63FF", "#2ECC71", "#E74C3C", "#F39C12",
 
 # ─────────────────────────── DB ───────────────────────────────────────
 def _new_conn():
-    return psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL)
+    # Sessiya vaqt zonasini aniq UTC qilib belgilaymiz — botdagi asyncpg
+    # pool bilan bir xil konvensiya (budget_bot_webhook.py init_db()).
+    # transactions.date/users.registered_at kabi naive TIMESTAMP ustunlar
+    # UTC devor vaqti sifatida saqlanadi; sessiya tz UTC bo'lmasa NOW()
+    # defaultidan to'ldirilgan qiymatlar boshqa ma'noga ega bo'lib qoladi.
+    with conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'UTC'")
+    conn.commit()
+    return conn
+
+def _tz_col(col: str) -> str:
+    """SQL ifoda: UTC-naive timestamp ustunini Toshkent devor vaqtiga
+    TO'G'RI o'giradi (bot'dagi _tz_col() bilan bir xil formula).
+
+    ⚠️ Faqat "col AT TIME ZONE 'Asia/Tashkent'" ishlatish XATO — bu col
+    qiymatini (aslida UTC) ALLAQACHON Toshkent mahalliy vaqti deb
+    hisoblab, yana -5 soat suradi (soat Toshkentda ~19:00-05:00
+    oralig'ida taqvim kuni bir kun oldinga noto'g'ri hisoblanadi)."""
+    return f"({col} AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Tashkent'"
 
 def _conn():
     c = st.session_state.get("_db")
@@ -261,8 +280,8 @@ def page_overview():
     st.markdown("## 📊 Umumiy ko'rinish")
 
     months_rows = q(
-        "SELECT DISTINCT EXTRACT(YEAR FROM date)::int AS y, "
-        "EXTRACT(MONTH FROM date)::int AS m "
+        f"SELECT DISTINCT EXTRACT(YEAR FROM {_tz_col('date')})::int AS y, "
+        f"EXTRACT(MONTH FROM {_tz_col('date')})::int AS m "
         "FROM transactions WHERE telegram_id=%s "
         "ORDER BY y DESC, m DESC LIMIT 12",
         (uid,),
@@ -279,7 +298,8 @@ def page_overview():
     rows = q(
         "SELECT type, amount, category, date "
         "FROM transactions "
-        "WHERE telegram_id=%s AND EXTRACT(YEAR FROM date)=%s AND EXTRACT(MONTH FROM date)=%s "
+        f"WHERE telegram_id=%s AND EXTRACT(YEAR FROM {_tz_col('date')})=%s "
+        f"AND EXTRACT(MONTH FROM {_tz_col('date')})=%s "
         "ORDER BY date",
         (uid, sy, sm),
     )
@@ -299,7 +319,8 @@ def page_overview():
     py = sy if sm > 1 else sy - 1
     prev = q(
         "SELECT type, amount FROM transactions "
-        "WHERE telegram_id=%s AND EXTRACT(YEAR FROM date)=%s AND EXTRACT(MONTH FROM date)=%s",
+        f"WHERE telegram_id=%s AND EXTRACT(YEAR FROM {_tz_col('date')})=%s "
+        f"AND EXTRACT(MONTH FROM {_tz_col('date')})=%s",
         (uid, py, pm),
     )
     prev_exp = sum(float(r["amount"]) for r in prev if r["type"] == "expense") if prev else None
@@ -397,7 +418,7 @@ def page_transactions():
         "FROM transactions t "
         "LEFT JOIN balances b ON t.balance_id=b.id "
         "WHERE t.telegram_id=%s "
-        "  AND DATE(t.date AT TIME ZONE 'Asia/Tashkent') BETWEEN %s AND %s "
+        f"  AND DATE({_tz_col('t.date')}) BETWEEN %s AND %s "
         "ORDER BY t.date DESC",
         (uid, start, end),
     )
@@ -624,8 +645,8 @@ def page_admin():
         "FROM users"
     )
     today_act = q1(
-        "SELECT COUNT(DISTINCT telegram_id) AS n FROM transactions "
-        "WHERE DATE(date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE"
+        f"SELECT COUNT(DISTINCT telegram_id) AS n FROM transactions "
+        f"WHERE DATE({_tz_col('date')}) = (NOW() AT TIME ZONE 'Asia/Tashkent')::date"
     )
     week_act = q1(
         "SELECT COUNT(DISTINCT telegram_id) AS n FROM transactions "
@@ -653,7 +674,7 @@ def page_admin():
     with cl:
         sec("📈 Yangi foydalanuvchilar (30 kun)")
         ur = q(
-            "SELECT DATE(registered_at AT TIME ZONE 'Asia/Tashkent') AS dt, COUNT(*) AS n "
+            f"SELECT DATE({_tz_col('registered_at')}) AS dt, COUNT(*) AS n "
             "FROM users WHERE registered_at >= NOW() - INTERVAL '30 days' "
             "GROUP BY dt ORDER BY dt"
         )
@@ -669,7 +690,7 @@ def page_admin():
     with cr:
         sec("📊 Amaliyotlar dinamikasi (30 kun)")
         tr = q(
-            "SELECT DATE(date AT TIME ZONE 'Asia/Tashkent') AS dt, COUNT(*) AS n "
+            f"SELECT DATE({_tz_col('date')}) AS dt, COUNT(*) AS n "
             "FROM transactions WHERE date >= NOW() - INTERVAL '30 days' "
             "GROUP BY dt ORDER BY dt"
         )
@@ -725,7 +746,7 @@ def page_admin():
     today_rows = q(
         "SELECT type, COUNT(*) AS cnt, SUM(amount) AS vol "
         "FROM transactions "
-        "WHERE DATE(date AT TIME ZONE 'Asia/Tashkent') = CURRENT_DATE "
+        f"WHERE DATE({_tz_col('date')}) = (NOW() AT TIME ZONE 'Asia/Tashkent')::date "
         "GROUP BY type"
     )
     if today_rows:
