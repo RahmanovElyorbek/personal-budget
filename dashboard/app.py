@@ -30,10 +30,11 @@ MONTHS = {
 }
 
 BALANCE_TYPES = {
-    "cash":  ("💵", "#F39C12"),
-    "card":  ("💳", "#3498DB"),
-    "bank":  ("🏦", "#9B59B6"),
-    "other": ("📦", "#95A5A6"),
+    "cash":    ("💵", "#F39C12"),
+    "card":    ("💳", "#3498DB"),
+    "bank":    ("🏦", "#9B59B6"),
+    "savings": ("🎯", "#2ECC71"),
+    "other":   ("📦", "#95A5A6"),
 }
 
 PALETTE = ["#6C63FF", "#2ECC71", "#E74C3C", "#F39C12",
@@ -570,15 +571,16 @@ def page_balances():
     st.markdown("## 💳 Balanslar")
 
     rows = q(
-        "SELECT name, type, amount FROM balances WHERE telegram_id=%s ORDER BY created_at",
+        "SELECT name, type, amount, target_amount FROM balances "
+        "WHERE telegram_id=%s ORDER BY created_at",
         (uid,),
     )
     if not rows:
         st.info("Hali balans qo'shilmagan. Botdan balans yarating.")
         return
 
-    total = sum(float(r["amount"]) for r in rows)
-    kpi("💰 Umumiy balans", fmt(total), color="#6C63FF")
+    total = sum(float(r["amount"]) for r in rows if r["type"] != "savings")
+    kpi("💰 Umumiy balans (jamg'armasiz)", fmt(total), color="#6C63FF")
     st.markdown("---")
 
     # Balance cards
@@ -587,7 +589,13 @@ def page_balances():
     for i, b in enumerate(rows):
         with cols[i % 3]:
             emoji, color = BALANCE_TYPES.get(b["type"], ("📦", "#95A5A6"))
-            kpi(f"{emoji} {b['name']}", fmt(float(b["amount"])), color=color)
+            amount = float(b["amount"])
+            target = float(b["target_amount"]) if b["type"] == "savings" and b["target_amount"] else None
+            if target:
+                kpi(f"{emoji} {b['name']}", f"{fmt(amount)} / {fmt(target)}", color=color)
+                st.progress(min(amount / target, 1.0), text=f"{round(min(amount / target, 1.0) * 100)}%")
+            else:
+                kpi(f"{emoji} {b['name']}", fmt(amount), color=color)
 
     # Pie chart
     if n > 1:

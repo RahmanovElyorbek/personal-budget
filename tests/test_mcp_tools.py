@@ -726,6 +726,24 @@ async def test_list_balances_does_not_leak_other_users_balances(db):
 
 
 @requires_db
+async def test_list_balances_returns_target_amount_for_savings(db):
+    await bot.add_balance(USER_A, "Mashina uchun", "savings", 3200000, target_amount=20000000)
+    await bot.add_balance(USER_A, "Naqd", "cash", 50000)
+    res = await bot._mcp_list_balances(USER_A, {})
+    by_name = {b["name"]: b for b in res["items"]}
+    assert by_name["Mashina uchun"]["type"] == "savings"
+    assert by_name["Mashina uchun"]["target_amount"] == 20000000.0
+    assert by_name["Naqd"]["target_amount"] is None
+
+
+def test_savings_progress_bar_computes_percent_and_clamps():
+    assert bot._savings_progress_bar(5_000_000, 20_000_000) == "▓▓░░░░░░░░ 25%"
+    assert bot._savings_progress_bar(25_000_000, 20_000_000) == "▓▓▓▓▓▓▓▓▓▓ 100%"
+    assert bot._savings_progress_bar(1000, 0) == ""
+    assert bot._savings_progress_bar(1000, None) == ""
+
+
+@requires_db
 async def test_get_used_categories_orders_by_usage(db):
     cat = await bot._mcp_list_categories(USER_A, {"search": "Transport"})
     cat_id = cat["items"][0]["id"]
