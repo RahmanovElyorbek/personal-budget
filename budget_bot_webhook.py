@@ -5266,6 +5266,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get("awaiting_debt_person"),
         context.user_data.get("awaiting_debt_amount"),
         context.user_data.get("awaiting_balance_name"),
+        context.user_data.get("awaiting_balance_target"),
         context.user_data.get("awaiting_balance_amount"),
         context.user_data.get("awaiting_balance_update"),
         context.user_data.get("awaiting_broadcast"),
