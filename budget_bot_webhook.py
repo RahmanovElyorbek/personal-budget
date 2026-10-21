@@ -3365,7 +3365,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 <b>Yordam — Oson Byudjet</b>\n\n"
-        "/start — Bosh menyu\n/menu — Bosh menyu\n/help — Yordam\n/oxirgi — Oxirgi amaliyotlar (tahrirlash)\n\n"
+        "/start — Bosh menyu\n/menu — Bosh menyu\n/help — Yordam\n/tour — Botni tanishtirish turi\n/oxirgi — Oxirgi amaliyotlar (tahrirlash)\n\n"
         "➕ Daromad/Xarajat kiritish\n"
         "🎤 Ovoz orqali kiritish (bir nechta amaliyot ham)\n"
         "📸 Chek rasm orqali kiritish\n"
@@ -3376,6 +3376,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 Byudjet belgilash\n\n"
         "📖 Qo'llanma videosi — menyudan",
         parse_mode="HTML"
+    )
+
+async def tour_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Botni tanishtirish turini istalgan vaqt qayta ko'rsatadi (test uchun
+    ham qulay — yangi foydalanuvchi bo'lish shart emas)."""
+    await update.message.reply_text(
+        _tour_text(0), parse_mode="HTML", reply_markup=_tour_keyboard(0)
     )
 
 async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9430,6 +9437,7 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("tour", tour_command))
     app.add_handler(CommandHandler("oxirgi", recent_command))
     app.add_handler(CommandHandler("mcp_token", mcp_token_command))
     app.add_handler(CommandHandler("mcp_login", mcp_login_command))
