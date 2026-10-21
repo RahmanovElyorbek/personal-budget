@@ -2536,6 +2536,71 @@ ONBOARDING_TIP = (
     "Sinab ko'ring 👇"
 )
 
+TOUR_SLIDES = [
+    {
+        "emoji": "🎤",
+        "title": "Ovozli yoki matnli tezkor kiritish",
+        "body": (
+            "Menyuni bosishingiz shart emas — shunchaki yozing yoki ovozli "
+            "xabar yuboring:\n\n"
+            "   \"20 ming taksi\"\n"
+            "   \"150000 oziq-ovqat\"\n\n"
+            "Bot o'zi tushunadi va saqlaydi ✨"
+        ),
+    },
+    {
+        "emoji": "💳",
+        "title": "Bir nechta balans",
+        "body": (
+            "Naqd pul, Karta — bir nechta balansingizni alohida kuzatib "
+            "boring. Har bir amaliyotda qaysi balansdan ekanini tanlaysiz, "
+            "bot avtomatik hisoblab boradi."
+        ),
+    },
+    {
+        "emoji": "💸",
+        "title": "Qarzlar",
+        "body": (
+            "Kimdir sizdan qarz oldimi yoki siz berdingizmi — botga "
+            "shunchaki ayting: \"Alisherga 100 ming qarz berdim\".\n\n"
+            "Muddatini belgilang — bot o'z vaqtida eslatadi."
+        ),
+    },
+    {
+        "emoji": "📊",
+        "title": "Statistika va byudjet",
+        "body": (
+            "Har oy qayerga qancha sarflaganingizni ko'ring, kategoriyalar "
+            "bo'yicha byudjet belgilang, PDF hisobot oling — barchasi bosh "
+            "menyuda."
+        ),
+    },
+]
+
+
+def _tour_text(idx: int) -> str:
+    slide = TOUR_SLIDES[idx]
+    return (
+        f"{slide['emoji']} <b>{slide['title']}</b>  ({idx + 1}/{len(TOUR_SLIDES)})\n\n"
+        f"{slide['body']}"
+    )
+
+
+def _tour_keyboard(idx: int) -> InlineKeyboardMarkup:
+    last = len(TOUR_SLIDES) - 1
+    nav_row = []
+    if idx > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Orqaga", callback_data=f"tour_{idx - 1}"))
+    if idx < last:
+        nav_row.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"tour_{idx + 1}"))
+    else:
+        nav_row.append(InlineKeyboardButton("🚀 Boshlash", callback_data="add_expense"))
+    rows = [nav_row]
+    if idx < last:
+        rows.append([InlineKeyboardButton("⏭ O'tkazib yuborish", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def maybe_send_onboarding_tip(bot, telegram_id: int, batch_count: int = 1, context=None):
     """Foydalanuvchining ENG BIRINCHI tranzaksiyasidan keyin bir martalik
     maslahat xabarini yuboradi (matnli/ovozli tez kiritish haqida) va
@@ -2972,6 +3037,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             onboarding_text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📖 Qanday ishlaydi?", callback_data="tour_0")],
                 [InlineKeyboardButton("💸 Xarajat qo'shish", callback_data="add_expense")],
                 [InlineKeyboardButton("⏭ Keyinroq", callback_data="back_main")]
             ])
@@ -3789,6 +3855,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "recent":
         await _show_recent(user_id, query=query)
+
+    # ---------- TANISHTIRUV TURI (yangi foydalanuvchi, "Qanday ishlaydi?") ----------
+    elif data.startswith("tour_"):
+        idx = int(data.split("_", 1)[1])
+        await safe_edit(_tour_text(idx), parse_mode="HTML", reply_markup=_tour_keyboard(idx))
 
     # ---------- ASOSIY HANDLERLAR ----------
     elif data == "add_income":
