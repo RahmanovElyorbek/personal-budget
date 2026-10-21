@@ -2486,9 +2486,10 @@ async def _handle_debt_repay(user_id, item, context, bot, chat_id):
 
 async def _process_parsed_text(user_id, context, text, status_msg, label="Tanildi", emoji_prefix="🎤"):
     """Ovozdan yoki erkin matndan (masalan '20 ming taksi') ajratilgan
-    amaliyotlarni qayta ishlaydi: qarzlarni darhol saqlaydi, pul
-    amaliyotlarini balans tanlashga yuboradi. voice_handler va matnli
-    tez-kiritish (message_handler) uchun umumiy."""
+    amaliyotlarni qayta ishlaydi: pul amaliyotlari VA yangi qarzlar bir xil
+    balans tanlash bosqichidan o'tadi (shuning uchun 'qarz berdim' balansdan
+    to'g'ri ayriladi) — voice_handler va matnli tez-kiritish (message_handler)
+    uchun umumiy."""
     transactions = await parse_voice_transactions(text)
 
     if not transactions:
@@ -2500,7 +2501,8 @@ async def _process_parsed_text(user_id, context, text, status_msg, label="Tanild
         )
         return
 
-    # YANGI qarzlarni darhol saqlaymiz (balans talab qilmaydi)
+    # YANGI qarzlar — balans tanlangandan keyin saqlanadi (pastda, selbal_
+    # handlerida), aks holda asosiy balansdan summa ayrilmay qoladi.
     debts_new   = [t for t in transactions if t["type"] in ("debt_gave", "debt_took")]
     # MAVJUD qarzni yopish so'rovlari — alohida xabar(lar)da, chunki foydalanuvchi
     # tasdiqi/tanlovi kerak bo'lishi mumkin (VAZIFA 4)
@@ -2510,16 +2512,8 @@ async def _process_parsed_text(user_id, context, text, status_msg, label="Tanild
     debt_summary = ""
     for d in debts_new:
         direction = "gave" if d["type"] == "debt_gave" else "took"
-        await add_debt(
-            user_id,
-            person_name=d.get("person") or "Noma'lum",
-            amount=d["amount"],
-            direction=direction,
-            due_date=None,
-            note=d.get("note", "")
-        )
         emoji = "🔴" if direction == "gave" else "🟢"
-        action = "berdim" if direction == "gave" else "oldim"
+        action = "beriladi" if direction == "gave" else "olinadi"
         debt_summary += f"{emoji} Qarz {action}: {d.get('person') or '—'} — {format_money(d['amount'])}\n"
 
     for r in debt_repays:
@@ -2527,13 +2521,12 @@ async def _process_parsed_text(user_id, context, text, status_msg, label="Tanild
     if debt_repays:
         debt_summary += f"🤝 {len(debt_repays)} ta qarz-hisob so'rovi yuqoridagi xabar(lar)da — tasdiqlang\n"
 
-    # Agar faqat qarz(lar) bo'lsa (pul amaliyoti yo'q)
-    if not money_txns:
-        header = "✅ <b>Qarz(lar) saqlandi!</b>\n\n" if debts_new else ""
+    # Agar na yangi qarz, na pul amaliyoti bo'lmasa (faqat repay so'rovi bo'lgan holat)
+    if not money_txns and not debts_new:
         await status_msg.edit_text(
             f"{emoji_prefix} <b>{label}:</b> {text}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{header}{debt_summary}",
+            f"{debt_summary}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
@@ -2542,18 +2535,22 @@ async def _process_parsed_text(user_id, context, text, status_msg, label="Tanild
         )
         return
 
-    # Pul amaliyotlarini balans tanlashga saqlaymiz
-    context.user_data["pending_txns"] = money_txns
+    # Qarz(lar) va pul amaliyot(lar)ini balans tanlashga saqlaymiz
+    if debts_new:
+        context.user_data["pending_debts"] = debts_new
+    if money_txns:
+        context.user_data["pending_txns"] = money_txns
     context.user_data["pending_text"] = text
 
     # Xulosa ko'rsatish
     summary = f"{emoji_prefix} <b>{label}:</b> {text}\n\n━━━━━━━━━━━━━━━━━━━━\n"
     if debt_summary:
         summary += debt_summary + "\n"
-    summary += f"📋 <b>{len(money_txns)} ta amaliyot topildi:</b>\n\n"
-    for i, t in enumerate(money_txns, 1):
-        emoji = "📥" if t["type"] == "income" else "📤"
-        summary += f"{i}. {emoji} {format_money(t['amount'])} — {t['category']}\n   <i>{t['note']}</i>\n"
+    if money_txns:
+        summary += f"📋 <b>{len(money_txns)} ta amaliyot topildi:</b>\n\n"
+        for i, t in enumerate(money_txns, 1):
+            emoji = "📥" if t["type"] == "income" else "📤"
+            summary += f"{i}. {emoji} {format_money(t['amount'])} — {t['category']}\n   <i>{t['note']}</i>\n"
     summary += "\nHammasi qaysi balansga?"
 
     bals = await get_balances(user_id)
@@ -3078,15 +3075,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balance_id = int(data.split("_")[1])
 
         # 1) Multi-transaction (ovozdan/matndan kelgan bir yoki bir nechta
-        # amaliyot). VAZIFA 2: birlashtirilgan "N ta amaliyot saqlandi"
+        # amaliyot/qarz). VAZIFA 2: birlashtirilgan "N ta amaliyot saqlandi"
         # xabari olib tashlandi — har biri o'z boyitilgan kartasini oladi
-        # (sana, oylik kategoriya jami, oylik balans bilan).
-        if context.user_data.get("pending_txns"):
-            pending = context.user_data.pop("pending_txns")
+        # (sana, oylik kategoriya jami, oylik balans bilan). Qarzlar ham
+        # shu yerda — tanlangan balansga ta'sir qilishi uchun (bal.summasi
+        # "berdim"da kamayadi, "oldim"da ortadi) add_debt balance_id bilan
+        # chaqiriladi.
+        pending_debts = context.user_data.pop("pending_debts", None)
+        pending_txns = context.user_data.pop("pending_txns", None)
+        if pending_debts or pending_txns:
             context.user_data.pop("pending_text", None)
             tz = pytz.timezone("Asia/Tashkent")
+            first_card_sent = False
 
-            for i, t in enumerate(pending):
+            for d in (pending_debts or []):
+                direction = "gave" if d["type"] == "debt_gave" else "took"
+                await add_debt(
+                    user_id,
+                    person_name=d.get("person") or "Noma'lum",
+                    amount=d["amount"],
+                    direction=direction,
+                    due_date=None,
+                    note=d.get("note", ""),
+                    balance_id=balance_id,
+                )
+                emoji = "🔴" if direction == "gave" else "🟢"
+                action = "berdim" if direction == "gave" else "oldim"
+                card_text = (
+                    f"✅ <b>Qarz {action}!</b>\n\n"
+                    f"{emoji} 👤 {d.get('person') or '—'}\n"
+                    f"💰 {format_money(d['amount'])}"
+                )
+                markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💸 Qarzlar", callback_data="debts"),
+                    InlineKeyboardButton("🏠 Menyu", callback_data="back_main")
+                ]])
+                if not first_card_sent:
+                    await query.edit_message_text(card_text, parse_mode="HTML", reply_markup=markup)
+                    first_card_sent = True
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id, text=card_text,
+                        parse_mode="HTML", reply_markup=markup)
+
+            for t in (pending_txns or []):
                 tx_date = t.get("date") or datetime.now(tz).date()
                 tx_id = await add_transaction(
                     user_id, t["type"], t["amount"], t["category"],
@@ -3097,16 +3129,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user_id, t["type"], float(t["amount"]),
                     t["category"], t.get("note", ""), tx_date)
                 markup = tx_confirm_keyboard(tx_id, fresh=True)
-                if i == 0:
+                if not first_card_sent:
                     await query.edit_message_text(card_text, parse_mode="HTML", reply_markup=markup)
+                    first_card_sent = True
                 else:
                     await context.bot.send_message(
                         chat_id=user_id, text=card_text,
                         parse_mode="HTML", reply_markup=markup)
 
-            await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending), context=context)
-            streak_result = await close_streak_day(user_id)
-            await notify_streak_result(context.bot, user_id, streak_result)
+            if pending_txns:
+                await maybe_send_onboarding_tip(context.bot, user_id, batch_count=len(pending_txns), context=context)
+                streak_result = await close_streak_day(user_id)
+                await notify_streak_result(context.bot, user_id, streak_result)
             return
 
         # 2) Bitta amaliyot (voice_parsed — chek tasdiqi ham shu yerga
