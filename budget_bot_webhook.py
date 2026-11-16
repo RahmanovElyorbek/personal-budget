@@ -98,6 +98,11 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger(__name__)
+# httpx har bir Telegram so'rovini INFO darajasida TO'LIQ URL bilan yozadi —
+# URL ichida BOT_TOKEN bor ("api.telegram.org/bot<TOKEN>/getMe"), ya'ni token
+# hosting log'larida ochiq qoladi. WARNING'gacha ko'taramiz.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ===================== KATEGORIYALAR =====================
 EXPENSE_CATEGORIES = [
