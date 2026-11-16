@@ -771,7 +771,7 @@ def main():
     if not DATABASE_URL:
         st.error(
             "⚠️ **DATABASE_URL** muhit o'zgaruvchisi sozlanmagan.\n\n"
-            "Render.com'da Environment → Add Environment Variable'dan qo'shing."
+            "Railway'da servis → Variables → New Variable orqali qo'shing."
         )
         return
 

@@ -27,27 +27,23 @@ streamlit run app.py
 
 Then open http://localhost:8501 in the browser.
 
-## Deploy on Render.com
+## Deploy on Railway
 
-1. Go to https://dashboard.render.com → **New** → **Web Service**
-2. Connect your GitHub repo (`rahmanovelyorbek/personal-budget`)
-3. Set the following fields:
+1. Railway project (the same one as the bot) → **+ Create** → **GitHub Repo** → `rahmanovelyorbek/personal-budget`
+2. Service **Settings**:
 
 | Field | Value |
 |---|---|
-| **Name** | `oson-budget-dashboard` (or any name) |
-| **Root Directory** | `dashboard` |
-| **Runtime** | `Python 3` |
-| **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `streamlit run app.py --server.port $PORT --server.address 0.0.0.0` |
+| **Root Directory** | `/dashboard` |
+| **Config file path** | `/dashboard/railway.json` |
 
-4. Under **Environment** → **Add Environment Variable**, add:
-   - `DATABASE_URL` = your Supabase connection string
-   - `ADMIN_ID` = your Telegram ID
+   Start command and healthcheck (`/_stcore/health`) come from `dashboard/railway.json`.
 
-5. Click **Deploy**. After deploy completes, copy the service URL (e.g. `https://oson-budget-dashboard.onrender.com`).
+3. **Variables**: `DATABASE_URL` (Supabase connection string), `ADMIN_ID` (your Telegram ID)
+4. **Settings → Networking → Generate Domain**, copy the URL.
+5. Set `DASHBOARD_URL` in the **bot's** Railway service variables to this URL so the "🌐 Web-kabinet" button sends the correct link.
 
-6. Set `DASHBOARD_URL` in the **bot's** Render service environment to this URL so the "🌐 Web-kabinet" button sends the correct link.
+Full migration guide (Uzbek): [`docs/RAILWAY.md`](../docs/RAILWAY.md)
 
 ## Login Flow
 

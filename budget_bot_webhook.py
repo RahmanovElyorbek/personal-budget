@@ -64,7 +64,21 @@ except ImportError:
 
 # ===================== SOZLAMALAR =====================
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_URL    = os.environ.get("WEBHOOK_URL", "")
+# Ochiq (public) manzil. Ustuvorlik: WEBHOOK_URL qo'lda berilgan bo'lsa — shu;
+# aks holda Railway avtomatik beradigan RAILWAY_PUBLIC_DOMAIN (sxemasiz domen)
+# yoki Render'ning RENDER_EXTERNAL_URL'i ishlatiladi. Oxiridagi "/" olib
+# tashlanadi — aks holda "{WEBHOOK_URL}/mcp" kabi manzillarda "//" paydo bo'ladi.
+def _resolve_public_url() -> str:
+    url = os.environ.get("WEBHOOK_URL", "").strip()
+    if not url:
+        domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+        if domain:
+            url = f"https://{domain}"
+    if not url:
+        url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    return url.rstrip("/")
+
+WEBHOOK_URL    = _resolve_public_url()
 PORT           = int(os.environ.get("PORT", 8080))
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 ADMIN_ID       = int(os.environ.get("ADMIN_ID", "8008645253"))
@@ -3405,8 +3419,8 @@ async def video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💾 Hajmi: <b>{file_size / 1024 / 1024:.1f} MB</b>\n\n"
         f"🔑 <b>file_id:</b>\n"
         f"<code>{file_id}</code>\n\n"
-        f"📋 <i>Yuqoridagi file_id ni nusxalab, Render'da\n"
-        f"GUIDE_VIDEO_FILE_ID environment variable'ga qo'ying.</i>",
+        f"📋 <i>Yuqoridagi file_id ni nusxalab, Railway'da\n"
+        f"(Variables bo'limi) GUIDE_VIDEO_FILE_ID environment variable'ga qo'ying.</i>",
         parse_mode="HTML"
     )
 
@@ -3427,7 +3441,7 @@ async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text(
         "✅ <b>Test tugadi!</b>\n\n"
-        "Natijalarni Render logs'dan ko'ring:\n"
+        "Natijalarni Railway logs'dan ko'ring:\n"
         "<code>✅ Eslatmalar yuborildi: X ta</code>",
         parse_mode="HTML"
     )
@@ -5032,7 +5046,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_daily_reminders(context.bot, force=True)
         await context.bot.send_message(
             chat_id=user_id,
-            text="✅ <b>Eslatmalar yuborildi!</b>\n\nNatijani Render logs'dan ko'ring.",
+            text="✅ <b>Eslatmalar yuborildi!</b>\n\nNatijani Railway logs'dan ko'ring.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")
@@ -5069,7 +5083,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_weekly_reports(context.bot)
         await context.bot.send_message(
             chat_id=user_id,
-            text="✅ <b>Haftalik hisobotlar yuborildi!</b>\n\nNatijani Render logs'dan ko'ring.",
+            text="✅ <b>Haftalik hisobotlar yuborildi!</b>\n\nNatijani Railway logs'dan ko'ring.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")
@@ -9377,7 +9391,7 @@ async def main():
             return web.Response(status=503, text="Bot initializing, retry shortly")
         return await webhook_handler(request, bot_ref["app"])
 
-    # 1. Portni BIRINCHI ochamiz — Render shu yerda portni aniqlaydi
+    # 1. Portni BIRINCHI ochamiz — hosting (Railway) healthcheck shu portni tekshiradi
     web_app = web.Application()
     web_app.router.add_get("/", health)
     web_app.router.add_post(webhook_path, dynamic_webhook)
@@ -9413,7 +9427,7 @@ async def main():
     # ko'rsatsa ham birinchi ulanish 45s dan oshishi mumkin. Bitta muvaffaqiyatsiz
     # urinishda butunlay to'xtab qolish o'rniga (avval shunday edi — faqat qo'lda
     # qayta deploy qilish orqali tuzalardi), endi cheksiz qayta urinadi.
-    # Port allaqachon ochiq bo'lgani uchun Render health-check bunga xalaqit bermaydi.
+    # Port allaqachon ochiq bo'lgani uchun Railway health-check bunga xalaqit bermaydi.
     attempt = 0
     while True:
         attempt += 1
@@ -9470,6 +9484,9 @@ async def main():
     bot_ref["app"] = app  # endi 200 qaytariladi
 
     # 5. Webhook va scheduler
+    if not WEBHOOK_URL:
+        print("⚠️ WEBHOOK_URL aniqlanmadi (WEBHOOK_URL yoki RAILWAY_PUBLIC_DOMAIN yo'q) — "
+              "Railway'da Settings → Networking → Generate Domain qiling.", flush=True)
     try:
         await app.bot.set_webhook(url=f"{WEBHOOK_URL}{webhook_path}")
         print(f"✅ [5/5] Webhook set: {WEBHOOK_URL}{webhook_path}", flush=True)
