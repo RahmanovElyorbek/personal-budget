@@ -83,7 +83,16 @@ PORT           = int(os.environ.get("PORT", 8080))
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 ADMIN_ID       = int(os.environ.get("ADMIN_ID", "8008645253"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-DASHBOARD_URL  = os.environ.get("DASHBOARD_URL", "")
+# Web-kabinet manzili. "https://" yozilmay qolgan yoki oxirida "/" bo'lsa ham
+# to'g'ri ishlashi uchun normallashtiramiz (aks holda Telegram URL tugmasi
+# "Button_url_invalid" xatosini beradi).
+def _normalize_url(url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+DASHBOARD_URL  = _normalize_url(os.environ.get("DASHBOARD_URL", ""))
 
 # Qo'llanma videosi (file_id /getfile komandasi orqali olinadi)
 GUIDE_VIDEO_FILE_ID = os.environ.get("GUIDE_VIDEO_FILE_ID", "")
@@ -5245,15 +5254,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return
+        # Bir bosishda kirish: ID va bir martalik kod havolaning o'zida —
+        # dashboard ularni o'qib, avtomatik kiritadi va URL'dan tozalaydi.
+        login_url = f"{DASHBOARD_URL}/?uid={user_id}&code={code}"
         await safe_edit(
             f"🌐 <b>Web Kabinet</b>\n\n"
-            f"Quyidagi ma'lumotlar bilan kiring:\n\n"
-            f"🔗 <b>Havola:</b> {DASHBOARD_URL}\n\n"
+            f"👇 <b>«Kabinetga kirish»</b> tugmasini bosing — avtomatik kirasiz.\n\n"
+            f"Agar qo'lda kirmoqchi bo'lsangiz:\n"
+            f"🔗 <b>Havola:</b> {DASHBOARD_URL}\n"
             f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
             f"🔑 <b>Kirish kodi:</b> <code>{code}</code>\n\n"
             f"⏱ Kod <b>10 daqiqa</b> amal qiladi va faqat bir marta ishlatiladi.",
             parse_mode="HTML",
+            disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 Kabinetga kirish", url=login_url)],
                 [InlineKeyboardButton("🔄 Yangi kod", callback_data="web_cabinet")],
                 [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_main")],
             ])

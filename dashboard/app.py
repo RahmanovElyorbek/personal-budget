@@ -213,6 +213,40 @@ def try_login(uid: int, code: str) -> str:
     st.session_state["budget"]    = float(user.get("budget") or 0)
     return "ok"
 
+def auto_login_from_link() -> bool:
+    """
+    Botdagi «🚀 Kabinetga kirish» tugmasi: ?uid=...&code=... bilan ochiladi.
+    Parametrlar darhol URL'dan o'chiriladi (brauzer tarixida/ulashilgan
+    havolada kod qolmasligi uchun). Muvaffaqiyatsiz bo'lsa — sababi
+    session_state orqali login sahifasida ko'rsatiladi.
+    """
+    params = st.query_params
+    uid  = (params.get("uid") or "").strip()
+    code = (params.get("code") or "").strip()
+    if not uid and not code:
+        return False
+    st.query_params.clear()
+    if not (uid.isdigit() and len(code) == 6 and code.isdigit()):
+        st.session_state["login_error"] = "invalid_code"
+        return False
+    res = try_login(int(uid), code)
+    if res == "ok":
+        return True
+    st.session_state["login_error"] = res
+    return False
+
+def show_login_error(res: str):
+    if res == "invalid_code":
+        st.error("❌ Kod noto'g'ri, muddati o'tgan yoki allaqachon ishlatilgan. "
+                 "Botdan **🔄 Yangi kod** oling.")
+    elif res == "not_premium":
+        st.warning(
+            "⚠️ Web kabinet faqat **premium** foydalanuvchilar uchun.\n\n"
+            "Botdan premium obuna rasmiylashtiring."
+        )
+    else:
+        st.error("❌ Foydalanuvchi topilmadi")
+
 # ─────────────────────────── Login page ──────────────────────────────
 def page_login():
     st.markdown(CSS, unsafe_allow_html=True)
@@ -221,6 +255,10 @@ def page_login():
         st.markdown("## 💰 Oson Budget")
         st.markdown("### Web Kabinet")
         st.markdown("---")
+
+        link_err = st.session_state.pop("login_error", None)
+        if link_err:
+            show_login_error(link_err)
 
         with st.form("lf"):
             tg_id = st.text_input("🆔 Telegram ID", placeholder="1234567890")
@@ -238,15 +276,8 @@ def page_login():
                 res = try_login(int(tid), c)
                 if res == "ok":
                     st.rerun()
-                elif res == "invalid_code":
-                    st.error("❌ Kod noto'g'ri, muddati o'tgan yoki allaqachon ishlatilgan")
-                elif res == "not_premium":
-                    st.warning(
-                        "⚠️ Web kabinet faqat **premium** foydalanuvchilar uchun.\n\n"
-                        "Botdan premium obuna rasmiylashtiring."
-                    )
                 else:
-                    st.error("❌ Foydalanuvchi topilmadi")
+                    show_login_error(res)
 
         st.markdown("---")
         st.info("Botdan **🌐 Web-kabinet** tugmasini bosib, ID va kodni oling.", icon="ℹ️")
@@ -776,6 +807,8 @@ def main():
         return
 
     if "user_id" not in st.session_state:
+        if auto_login_from_link():
+            st.rerun()
         page_login()
         return
 
