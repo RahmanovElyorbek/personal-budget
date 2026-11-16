@@ -9,7 +9,7 @@ Repo'da tayyor turgan fayllar:
 |---|---|
 | `railway.json` | Bot servisi: start buyrug'i, healthcheck `/`, 1 ta replica, qulasa qayta ishga tushirish |
 | `dashboard/railway.json` | Web-kabinet (Streamlit): healthcheck `/_stcore/health` |
-| `.python-version`, `dashboard/.python-version` | Python 3.11.9 |
+| `.python-version`, `dashboard/.python-version` | Python 3.11 (eng oxirgi patch) |
 
 Kodda: `WEBHOOK_URL` berilmasa, bot Railway'ning `RAILWAY_PUBLIC_DOMAIN`
 o'zgaruvchisidan manzilni o'zi oladi.
